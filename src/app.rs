@@ -1,8 +1,10 @@
 //! Main application state and UI.
 
 use crate::api::ApiClient;
+use crate::graph::types::PartialSummaryData;
 use crate::graph::{ForceLayout, GraphState};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
 /// Time range options for filtering
@@ -13,6 +15,9 @@ enum TimeRange {
     Hour24,
     Day3,
     Week1,
+    Week2,
+    Month1,
+    Month3,
 }
 
 impl TimeRange {
@@ -23,6 +28,9 @@ impl TimeRange {
             TimeRange::Hour24 => 24.0,
             TimeRange::Day3 => 72.0,
             TimeRange::Week1 => 168.0,
+            TimeRange::Week2 => 336.0,
+            TimeRange::Month1 => 720.0,
+            TimeRange::Month3 => 2160.0,
         }
     }
 
@@ -33,6 +41,9 @@ impl TimeRange {
             TimeRange::Hour24 => "Past 24 hours",
             TimeRange::Day3 => "Past 3 days",
             TimeRange::Week1 => "Past week",
+            TimeRange::Week2 => "Past 2 weeks",
+            TimeRange::Month1 => "Past month",
+            TimeRange::Month3 => "Past 3 months",
         }
     }
 }
@@ -73,6 +84,19 @@ pub struct DashboardApp {
     last_frame: Instant,
     frame_times: Vec<f32>,
     fps: f32,
+
+    // Summary panel state
+    summary_node_id: Option<String>,
+    summary_session_id: Option<String>,
+    summary_timestamp: Option<String>,
+    summary_loading: bool,
+    summary_data: Option<PartialSummaryData>,
+    summary_error: Option<String>,
+    summary_receiver: Option<Receiver<Result<PartialSummaryData, String>>>,
+
+    // Double-click detection
+    last_click_time: Instant,
+    last_click_node: Option<String>,
 }
 
 impl DashboardApp {
@@ -99,6 +123,19 @@ impl DashboardApp {
             last_frame: Instant::now(),
             frame_times: Vec::with_capacity(60),
             fps: 0.0,
+
+            // Summary panel state
+            summary_node_id: None,
+            summary_session_id: None,
+            summary_timestamp: None,
+            summary_loading: false,
+            summary_data: None,
+            summary_error: None,
+            summary_receiver: None,
+
+            // Double-click detection
+            last_click_time: Instant::now(),
+            last_click_node: None,
         };
 
         // Check API connection and load initial data
@@ -186,6 +223,39 @@ impl DashboardApp {
         closest_node.cloned()
     }
 
+    /// Trigger summary generation for a double-clicked node
+    fn trigger_summary_for_node(&mut self, node_id: String) {
+        if let Some(node) = self.graph.get_node(&node_id) {
+            let session_id = node.session_id.clone();
+            let timestamp = match &node.timestamp {
+                Some(ts) => ts.clone(),
+                None => {
+                    self.summary_error = Some("Node has no timestamp".to_string());
+                    return;
+                }
+            };
+
+            // Store state
+            self.summary_node_id = Some(node_id);
+            self.summary_session_id = Some(session_id.clone());
+            self.summary_timestamp = Some(timestamp.clone());
+            self.summary_loading = true;
+            self.summary_data = None;
+            self.summary_error = None;
+
+            // Create channel for async result
+            let (tx, rx) = mpsc::channel();
+            self.summary_receiver = Some(rx);
+
+            // Spawn thread to fetch summary
+            let api = ApiClient::new();
+            std::thread::spawn(move || {
+                let result = api.fetch_partial_summary(&session_id, &timestamp);
+                let _ = tx.send(result);
+            });
+        }
+    }
+
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("Graph Controls");
         ui.add_space(10.0);
@@ -224,6 +294,9 @@ impl DashboardApp {
                     TimeRange::Hour24,
                     TimeRange::Day3,
                     TimeRange::Week1,
+                    TimeRange::Week2,
+                    TimeRange::Month1,
+                    TimeRange::Month3,
                 ] {
                     ui.selectable_value(&mut self.time_range, range, range.label());
                 }
@@ -244,11 +317,11 @@ impl DashboardApp {
                 self.show_arrows = true;
                 self.graph.physics_enabled = true;
                 self.timeline_enabled = true;
-                self.recency_min_scale = 0.3;
+                self.recency_min_scale = 0.01;
                 self.recency_decay_rate = 3.0;
-                self.layout.repulsion = 5000.0;
-                self.layout.attraction = 0.01;
-                self.layout.centering = 0.001;
+                self.layout.repulsion = 10000.0;
+                self.layout.attraction = 0.1;
+                self.layout.centering = 0.0001;
                 self.pan_offset = Vec2::ZERO;
                 self.zoom = 1.0;
                 self.load_graph();
@@ -265,22 +338,33 @@ impl DashboardApp {
         ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled");
         ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber");
 
+        ui.add_space(5.0);
+        ui.label("Color by:");
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
+                self.graph.color_by_project = true;
+            }
+            if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
+                self.graph.color_by_project = false;
+            }
+        });
+
         ui.add_space(10.0);
         ui.separator();
 
         // Recency scaling
         ui.label("Recency Scaling");
-        ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.01..=1.0).text("Min scale"));
-        ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.5..=10.0).text("Decay rate"));
+        ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
+        ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
 
         ui.add_space(10.0);
         ui.separator();
 
         // Physics controls
         ui.label("Physics");
-        ui.add(egui::Slider::new(&mut self.layout.repulsion, 1000.0..=20000.0).text("Repulsion"));
-        ui.add(egui::Slider::new(&mut self.layout.attraction, 0.001..=0.1).text("Attraction"));
-        ui.add(egui::Slider::new(&mut self.layout.centering, 0.0001..=0.01).text("Centering"));
+        ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion"));
+        ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction"));
+        ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering"));
 
         ui.add_space(10.0);
         ui.separator();
@@ -321,7 +405,7 @@ impl DashboardApp {
         ui.label("Node at Scrubber");
         if let Some(closest_node) = self.find_node_at_scrubber() {
             ui.horizontal(|ui| {
-                let role_color = closest_node.role.color();
+                let role_color = self.graph.node_color(&closest_node);
                 ui.colored_label(role_color, "●");
                 ui.label(closest_node.role.label());
             });
@@ -340,11 +424,15 @@ impl DashboardApp {
                 ui.label(format!("Time: {}", time_display));
             }
             ui.label(format!("Session: {}", closest_node.session_short));
+            if !closest_node.project.is_empty() {
+                ui.label(format!("Project: {}", closest_node.project));
+            }
 
             // Content preview with word wrap
             ui.add_space(5.0);
-            let preview = if closest_node.content_preview.len() > 100 {
-                format!("{}...", &closest_node.content_preview[..100])
+            let preview = if closest_node.content_preview.chars().count() > 100 {
+                let truncated: String = closest_node.content_preview.chars().take(100).collect();
+                format!("{}...", truncated)
             } else {
                 closest_node.content_preview.clone()
             };
@@ -358,18 +446,119 @@ impl DashboardApp {
         }
 
         ui.add_space(10.0);
+        ui.separator();
+
+        // Point-in-Time Summary Panel
+        ui.collapsing("Point-in-Time Summary", |ui| {
+            if self.summary_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Generating summary...");
+                });
+            } else if let Some(ref error) = self.summary_error {
+                ui.colored_label(Color32::RED, format!("Error: {}", error));
+                if ui.button("Dismiss").clicked() {
+                    self.summary_error = None;
+                    self.summary_node_id = None;
+                }
+            } else if let Some(ref data) = self.summary_data {
+                // Message counts
+                ui.horizontal(|ui| {
+                    ui.label(format!("Messages: {} you / {} Claude",
+                        data.user_count, data.assistant_count));
+                });
+                ui.add_space(5.0);
+
+                // Summary
+                ui.label(egui::RichText::new("Summary").strong());
+                egui::ScrollArea::vertical()
+                    .max_height(80.0)
+                    .id_salt("summary_scroll")
+                    .show(ui, |ui| {
+                        ui.label(&data.summary);
+                    });
+                ui.add_space(5.0);
+
+                // Current Focus
+                if !data.current_focus.is_empty() {
+                    ui.label(egui::RichText::new("Working On").strong());
+                    ui.label(&data.current_focus);
+                    ui.add_space(5.0);
+                }
+
+                // Completed Work
+                if !data.completed_work.is_empty() {
+                    ui.label(egui::RichText::new("Completed").strong().color(Color32::GREEN));
+                    egui::ScrollArea::vertical()
+                        .max_height(60.0)
+                        .id_salt("completed_scroll")
+                        .show(ui, |ui| {
+                            for line in data.completed_work.split('\n').filter(|l| !l.is_empty()) {
+                                ui.label(line);
+                            }
+                        });
+                    ui.add_space(5.0);
+                }
+
+                // Unsuccessful Attempts
+                if !data.unsuccessful_attempts.is_empty() {
+                    ui.label(egui::RichText::new("Tried but Failed").strong().color(Color32::from_rgb(255, 100, 100)));
+                    egui::ScrollArea::vertical()
+                        .max_height(60.0)
+                        .id_salt("failed_scroll")
+                        .show(ui, |ui| {
+                            for line in data.unsuccessful_attempts.split('\n').filter(|l| !l.is_empty()) {
+                                ui.label(line);
+                            }
+                        });
+                }
+
+                ui.add_space(5.0);
+                if ui.button("Clear").clicked() {
+                    self.summary_data = None;
+                    self.summary_node_id = None;
+                }
+            } else {
+                ui.label("Double-click a node to generate");
+                ui.label("a summary up to that point.");
+            }
+        });
+
+        ui.add_space(10.0);
 
         // Legend
         ui.separator();
-        ui.label("Legend");
-        ui.horizontal(|ui| {
-            ui.colored_label(Color32::WHITE, "●");
-            ui.label("You");
-        });
-        ui.horizontal(|ui| {
-            ui.colored_label(Color32::from_rgb(255, 149, 0), "●");
-            ui.label("Claude");
-        });
+        if self.graph.color_by_project {
+            ui.label("Projects");
+            // Show top projects by color
+            let mut projects: Vec<_> = self.graph.project_colors.iter().collect();
+            projects.sort_by(|a, b| a.0.cmp(b.0));
+            for (project, &hue) in projects.iter().take(8) {
+                ui.horizontal(|ui| {
+                    let color = crate::graph::types::hsl_to_rgb(hue, 0.7, 0.55);
+                    ui.colored_label(color, "●");
+                    let label = if project.len() > 15 {
+                        format!("{}…", &project[..14])
+                    } else {
+                        project.to_string()
+                    };
+                    ui.label(label);
+                });
+            }
+            if projects.len() > 8 {
+                ui.label(format!("  +{} more", projects.len() - 8));
+            }
+        } else {
+            ui.label("Legend");
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::WHITE, "●");
+                ui.label("You");
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_rgb(255, 149, 0), "●");
+                ui.label("Claude");
+            });
+        }
     }
 
     fn render_graph(&mut self, ui: &mut egui::Ui) {
@@ -377,34 +566,43 @@ impl DashboardApp {
         let rect = response.rect;
         let center = rect.center();
 
-        // Handle pan
+        // Handle click-drag pan (for mouse users)
         if response.dragged_by(egui::PointerButton::Primary) {
             self.pan_offset += response.drag_delta();
         }
 
-        // Handle zoom with scroll
-        if let Some(hover_pos) = response.hover_pos() {
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
-                let zoom_factor = 1.0 + scroll * 0.001;
-                let new_zoom = (self.zoom * zoom_factor).clamp(0.1, 5.0);
+        // Handle two-finger scroll pan (for trackpad users)
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        if scroll_delta != egui::Vec2::ZERO && response.hovered() {
+            self.pan_offset += scroll_delta;
+        }
 
-                // Zoom toward mouse position
-                let mouse_offset = hover_pos - center;
-                self.pan_offset = self.pan_offset * (new_zoom / self.zoom)
-                    + mouse_offset * (1.0 - new_zoom / self.zoom);
+        // Handle pinch-to-zoom and Ctrl+scroll
+        if let Some(hover_pos) = response.hover_pos() {
+            let zoom_delta = ui.input(|i| i.zoom_delta());
+            if zoom_delta != 1.0 {
+                let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
+
+                // Adjust pan to keep point under cursor fixed
+                let cursor_offset = hover_pos - center - self.pan_offset;
+                self.pan_offset += cursor_offset * (1.0 - new_zoom / self.zoom);
 
                 self.zoom = new_zoom;
             }
         }
 
-        // Run physics simulation
-        self.layout.step(&mut self.graph, center + self.pan_offset);
+        // Run physics simulation (uses graph-space center, unaffected by viewport pan)
+        self.layout.step(&mut self.graph, center);
 
-        // Transform helper
+        // Cache values for transform closure to avoid borrowing self
+        let pan_offset = self.pan_offset;
+        let zoom = self.zoom;
+
+        // Transform helper: graph space -> screen space
+        // Pan is in screen space (applied after zoom) for 1:1 movement at any zoom level
         let transform = |pos: Pos2| -> Pos2 {
             let centered = pos.to_vec2() - center.to_vec2();
-            center + (centered + self.pan_offset) * self.zoom
+            center + centered * zoom + pan_offset
         };
 
         // Draw edges first (behind nodes)
@@ -447,9 +645,11 @@ impl DashboardApp {
             }
         }
 
-        // Detect hover (only for visible nodes)
+        // Detect hover - always select closest visible node to cursor
         let mut new_hovered = None;
         if let Some(hover_pos) = response.hover_pos() {
+            let mut closest: Option<(String, f32)> = None; // (node_id, distance)
+
             for node in &self.graph.data.nodes {
                 // Skip hidden nodes when timeline is enabled
                 if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
@@ -457,25 +657,15 @@ impl DashboardApp {
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
-                    // Use same recency scaling for hit detection (based on distance from scrubber)
-                    let min_s = self.recency_min_scale;
-                    let decay = self.recency_decay_rate;
-                    let recency_scale = if self.graph.timeline.max_time > self.graph.timeline.min_time {
-                        if let Some(node_time) = node.timestamp_secs() {
-                            let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
-                            let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
-                            let distance = (scrubber_time - node_time).abs();
-                            let normalized_distance = (distance / time_range).clamp(0.0, 1.0);
-                            min_s + (1.0 - min_s) * (-decay * normalized_distance as f32).exp()
-                        } else { 0.5 }
-                    } else { 1.0 };
-                    let node_radius = self.node_size * self.zoom * recency_scale;
-                    if screen_pos.distance(hover_pos) < node_radius {
-                        new_hovered = Some(node.id.clone());
-                        break;
+                    let distance = screen_pos.distance(hover_pos);
+
+                    if closest.is_none() || distance < closest.as_ref().unwrap().1 {
+                        closest = Some((node.id.clone(), distance));
                     }
                 }
             }
+
+            new_hovered = closest.map(|(id, _)| id);
         }
         self.graph.hovered_node = new_hovered;
 
@@ -515,55 +705,57 @@ impl DashboardApp {
                     base_size
                 };
 
-                let color = node.role.color();
+                // Use project or session color based on mode
+                let color = self.graph.node_color(node);
 
                 // Draw node
                 painter.circle_filled(screen_pos, size, color);
 
-                // Draw border
-                let border_color = if is_selected {
+                // Draw inner black circle for Claude responses
+                if node.role == crate::graph::types::Role::Assistant {
+                    let inner_size = size * 0.4;
+                    painter.circle_filled(screen_pos, inner_size, Color32::BLACK);
+                }
+
+                // Draw border - cyan for summary node, yellow for selected, white for hovered
+                let is_summary_node = self.summary_node_id.as_ref() == Some(&node.id);
+                let border_color = if is_summary_node {
+                    Color32::from_rgb(0, 255, 255) // Cyan for summary node
+                } else if is_selected {
                     Color32::YELLOW
                 } else if is_hovered {
                     Color32::WHITE
                 } else {
                     color.gamma_multiply(0.7)
                 };
-                painter.circle_stroke(screen_pos, size, Stroke::new(2.0, border_color));
+                let border_width = if is_summary_node { 4.0 } else { 2.0 };
+                painter.circle_stroke(screen_pos, size, Stroke::new(border_width, border_color));
             }
         }
 
-        // Handle click selection (only for visible nodes)
+        // Handle click selection with double-click detection
+        // Use the already-computed closest node from hover detection
         if response.clicked() {
-            if let Some(hover_pos) = response.interact_pointer_pos() {
-                let mut clicked_node = None;
-                for node in &self.graph.data.nodes {
-                    // Skip hidden nodes when timeline is enabled
-                    if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
-                        continue;
-                    }
-                    if let Some(pos) = self.graph.get_pos(&node.id) {
-                        let screen_pos = transform(pos);
-                        // Use same recency scaling for hit detection (based on distance from scrubber)
-                        let min_s = self.recency_min_scale;
-                        let decay = self.recency_decay_rate;
-                        let recency_scale = if self.graph.timeline.max_time > self.graph.timeline.min_time {
-                            if let Some(node_time) = node.timestamp_secs() {
-                                let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
-                                let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
-                                let distance = (scrubber_time - node_time).abs();
-                                let normalized_distance = (distance / time_range).clamp(0.0, 1.0);
-                                min_s + (1.0 - min_s) * (-decay * normalized_distance as f32).exp()
-                            } else { 0.5 }
-                        } else { 1.0 };
-                        let node_radius = self.node_size * self.zoom * recency_scale;
-                        if screen_pos.distance(hover_pos) < node_radius {
-                            clicked_node = Some(node.id.clone());
-                            break;
-                        }
-                    }
+            let clicked_node = self.graph.hovered_node.clone();
+
+            // Check for double-click (same node within 500ms)
+            if let Some(ref node_id) = clicked_node {
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.last_click_time).as_millis();
+                let same_node = self.last_click_node.as_ref() == Some(node_id);
+                let is_double_click = same_node && elapsed < 500;
+
+                if is_double_click {
+                    self.trigger_summary_for_node(node_id.clone());
                 }
-                self.graph.selected_node = clicked_node;
+
+                self.last_click_time = now;
+                self.last_click_node = clicked_node.clone();
+            } else {
+                self.last_click_node = None;
             }
+
+            self.graph.selected_node = clicked_node;
         }
 
         // Draw tooltip for hovered node
@@ -792,6 +984,31 @@ impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_fps();
 
+        // Check for summary result from background thread
+        if let Some(ref rx) = self.summary_receiver {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.summary_data = Some(data);
+                    self.summary_loading = false;
+                    self.summary_receiver = None;
+                }
+                Ok(Err(e)) => {
+                    self.summary_error = Some(e);
+                    self.summary_loading = false;
+                    self.summary_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still loading, request repaint to check again
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.summary_error = Some("Summary request cancelled".to_string());
+                    self.summary_loading = false;
+                    self.summary_receiver = None;
+                }
+            }
+        }
+
         // Handle playback
         if self.graph.timeline.playing && !self.timeline_dragging {
             let now = Instant::now();
@@ -849,9 +1066,10 @@ impl eframe::App for DashboardApp {
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     } else {
         s.to_string()
     }
