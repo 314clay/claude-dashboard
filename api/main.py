@@ -19,6 +19,19 @@ from components.queries import (
     get_overview_metrics,
     get_session_messages,
     get_tool_usage,
+    get_project_session_graph_data,
+)
+from components.summarizer import generate_partial_summary
+from components.importance_scorer import (
+    backfill_importance_scores,
+    get_importance_stats,
+    score_session,
+)
+
+from project_detection import (
+    get_project_summary,
+    detect_project_for_session,
+    backfill_detected_projects,
 )
 
 app = FastAPI(
@@ -31,7 +44,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -104,6 +117,22 @@ def session_messages(session_id: str):
     return {"messages": records}
 
 
+@app.get("/session/{session_id}/summary/partial")
+def partial_summary(
+    session_id: str,
+    before_timestamp: str = Query(..., description="Generate summary up to this ISO timestamp"),
+):
+    """Generate a Gemini summary of the conversation up to a specific timestamp.
+
+    Returns summary, completed work, unsuccessful attempts, and message counts.
+    This call may take 2-5 seconds as it invokes Gemini.
+    """
+    result = generate_partial_summary(session_id, before_timestamp)
+    if result is None:
+        return {"error": "Failed to generate summary - no messages found"}
+    return result
+
+
 @app.get("/tools")
 def tools(
     hours: float = Query(default=24, description="Hours to look back"),
@@ -114,6 +143,74 @@ def tools(
         return {"tools": []}
 
     return {"tools": df.to_dict(orient="records")}
+
+
+@app.get("/projects")
+def projects():
+    """Get list of detected projects with session counts."""
+    return {"projects": get_project_summary()}
+
+
+@app.get("/projects/graph")
+def project_graph(
+    hours: float = Query(default=720, description="Hours to look back (default 30 days)"),
+):
+    """Get hierarchical graph with projects as parent nodes.
+
+    Returns project nodes connected to their session nodes.
+    Projects come from detected_project or fallback to topics[0].
+    """
+    nodes, edges = get_project_session_graph_data(hours)
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
+@app.post("/projects/detect")
+def detect_projects(
+    dry_run: bool = Query(default=True, description="If true, don't update database"),
+):
+    """Run project detection on all sessions.
+
+    Extracts project names from file paths in tool_usages.
+    """
+    return backfill_detected_projects(dry_run=dry_run)
+
+
+# ==== Importance Scoring Endpoints ====
+
+@app.get("/importance/stats")
+def importance_stats():
+    """Get statistics about importance scoring coverage."""
+    return get_importance_stats()
+
+
+@app.post("/importance/backfill")
+def importance_backfill(
+    max_sessions: int = Query(default=50, description="Max sessions to process"),
+    batch_size: int = Query(default=25, description="Messages per LLM call"),
+):
+    """Backfill importance scores for unscored messages.
+
+    Calls Gemini to score messages on importance (0.0-1.0).
+    This may take 2-5 seconds per session.
+    """
+    return backfill_importance_scores(max_sessions, batch_size)
+
+
+@app.post("/importance/session/{session_id}")
+def importance_score_session(
+    session_id: str,
+    batch_size: int = Query(default=25, description="Messages per LLM call"),
+):
+    """Score messages in a specific session.
+
+    Calls Gemini to score unscored messages in the session.
+    """
+    return score_session(session_id, batch_size)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,10 @@ pub struct DashboardApp {
     recency_min_scale: f32,
     recency_decay_rate: f32,
 
+    // Importance filtering
+    importance_threshold: f32,
+    importance_filter_enabled: bool,
+
     // Viewport state
     pan_offset: Vec2,
     zoom: f32,
@@ -114,6 +118,8 @@ impl DashboardApp {
             timeline_enabled: true,
             recency_min_scale: 0.01,
             recency_decay_rate: 3.0,
+            importance_threshold: 0.0,
+            importance_filter_enabled: false,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
@@ -280,97 +286,115 @@ impl DashboardApp {
         }
 
         ui.add_space(10.0);
-        ui.separator();
 
-        // Time range selector
-        ui.label("Time Range");
-        let prev_range = self.time_range;
-        egui::ComboBox::from_id_salt("time_range")
-            .selected_text(self.time_range.label())
-            .show_ui(ui, |ui| {
-                for range in [
-                    TimeRange::Hour1,
-                    TimeRange::Hour6,
-                    TimeRange::Hour24,
-                    TimeRange::Day3,
-                    TimeRange::Week1,
-                    TimeRange::Week2,
-                    TimeRange::Month1,
-                    TimeRange::Month3,
-                ] {
-                    ui.selectable_value(&mut self.time_range, range, range.label());
+        // Data Selection section
+        egui::CollapsingHeader::new("Data Selection")
+            .default_open(true)
+            .show(ui, |ui| {
+                let prev_range = self.time_range;
+                egui::ComboBox::from_id_salt("time_range")
+                    .selected_text(self.time_range.label())
+                    .show_ui(ui, |ui| {
+                        for range in [
+                            TimeRange::Hour1,
+                            TimeRange::Hour6,
+                            TimeRange::Hour24,
+                            TimeRange::Day3,
+                            TimeRange::Week1,
+                            TimeRange::Week2,
+                            TimeRange::Month1,
+                            TimeRange::Month3,
+                        ] {
+                            ui.selectable_value(&mut self.time_range, range, range.label());
+                        }
+                    });
+
+                if self.time_range != prev_range {
+                    self.load_graph();
+                }
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.button("⟳ Reload").clicked() {
+                        self.load_graph();
+                    }
+                    if ui.button("↺ Reset All").clicked() {
+                        // Reset all UI state to defaults
+                        self.node_size = 15.0;
+                        self.show_arrows = true;
+                        self.graph.physics_enabled = true;
+                        self.timeline_enabled = true;
+                        self.recency_min_scale = 0.01;
+                        self.recency_decay_rate = 3.0;
+                        self.layout.repulsion = 10000.0;
+                        self.layout.attraction = 0.1;
+                        self.layout.centering = 0.0001;
+                        self.pan_offset = Vec2::ZERO;
+                        self.zoom = 1.0;
+                        self.load_graph();
+                    }
+                });
+            });
+
+        // Display section
+        egui::CollapsingHeader::new("Display")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size"));
+                ui.checkbox(&mut self.show_arrows, "Show arrows");
+                ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber");
+
+                ui.add_space(5.0);
+                ui.label("Color by:");
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
+                        self.graph.color_by_project = true;
+                    }
+                    if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
+                        self.graph.color_by_project = false;
+                    }
+                });
+            });
+
+        // Filtering section
+        egui::CollapsingHeader::new("Filtering")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance");
+                if self.importance_filter_enabled {
+                    ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
+                        .text("Min importance")
+                        .fixed_decimals(2));
+                    // Show count
+                    let visible = self.graph.data.nodes.iter()
+                        .filter(|n| n.importance_score.map_or(true, |s| s >= self.importance_threshold))
+                        .count();
+                    ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
                 }
             });
 
-        if self.time_range != prev_range {
-            self.load_graph();
-        }
+        // Advanced section (collapsed by default)
+        egui::CollapsingHeader::new("Advanced")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled");
+                ui.add_space(5.0);
+                ui.label("Physics Tuning");
+                ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion"));
+                ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction"));
+                ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering"));
 
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            if ui.button("⟳ Reload").clicked() {
-                self.load_graph();
-            }
-            if ui.button("↺ Reset All").clicked() {
-                // Reset all UI state to defaults
-                self.node_size = 15.0;
-                self.show_arrows = true;
-                self.graph.physics_enabled = true;
-                self.timeline_enabled = true;
-                self.recency_min_scale = 0.01;
-                self.recency_decay_rate = 3.0;
-                self.layout.repulsion = 10000.0;
-                self.layout.attraction = 0.1;
-                self.layout.centering = 0.0001;
-                self.pan_offset = Vec2::ZERO;
-                self.zoom = 1.0;
-                self.load_graph();
-            }
-        });
+                ui.add_space(10.0);
+                ui.label("Recency Scaling");
+                ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
+                ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
+            });
 
         ui.add_space(10.0);
         ui.separator();
 
-        // Display options
-        ui.label("Display Options");
-        ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size"));
-        ui.checkbox(&mut self.show_arrows, "Show arrows");
-        ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled");
-        ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber");
-
-        ui.add_space(5.0);
-        ui.label("Color by:");
-        ui.horizontal(|ui| {
-            if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
-                self.graph.color_by_project = true;
-            }
-            if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
-                self.graph.color_by_project = false;
-            }
-        });
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        // Recency scaling
-        ui.label("Recency Scaling");
-        ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
-        ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        // Physics controls
-        ui.label("Physics");
-        ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion"));
-        ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction"));
-        ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering"));
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        // Stats
-        ui.label("Statistics");
+        // Info section (always visible)
+        ui.label("Info");
         let visible_count = self.graph.timeline.visible_nodes.len();
         let total_count = self.graph.data.nodes.len();
         if self.timeline_enabled && visible_count < total_count {
@@ -385,7 +409,7 @@ impl DashboardApp {
         let assistant_count = self.graph.data.nodes.iter().filter(|n| n.role == crate::graph::types::Role::Assistant).count();
         ui.label(format!("You: {} | Claude: {}", user_count, assistant_count));
 
-        ui.add_space(10.0);
+        ui.add_space(5.0);
         ui.separator();
 
         // Zoom controls
@@ -566,26 +590,31 @@ impl DashboardApp {
         let rect = response.rect;
         let center = rect.center();
 
+        // Gather all input deltas first (allows simultaneous pan+zoom on trackpad)
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        let zoom_delta = ui.input(|i| i.zoom_delta());
+        let hover_pos = response.hover_pos();
+
         // Handle click-drag pan (for mouse users)
         if response.dragged_by(egui::PointerButton::Primary) {
             self.pan_offset += response.drag_delta();
         }
 
         // Handle two-finger scroll pan (for trackpad users)
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
+        // Apply before zoom so cursor-anchored zoom works correctly
         if scroll_delta != egui::Vec2::ZERO && response.hovered() {
             self.pan_offset += scroll_delta;
         }
 
-        // Handle pinch-to-zoom and Ctrl+scroll
-        if let Some(hover_pos) = response.hover_pos() {
-            let zoom_delta = ui.input(|i| i.zoom_delta());
+        // Handle pinch-to-zoom and Ctrl+scroll (cursor-anchored)
+        if let Some(cursor_pos) = hover_pos {
             if zoom_delta != 1.0 {
                 let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
 
-                // Adjust pan to keep point under cursor fixed
-                let cursor_offset = hover_pos - center - self.pan_offset;
-                self.pan_offset += cursor_offset * (1.0 - new_zoom / self.zoom);
+                // Zoom toward cursor: adjust pan so point under cursor stays fixed
+                let cursor_offset = cursor_pos - center - self.pan_offset;
+                let zoom_factor = 1.0 - new_zoom / self.zoom;
+                self.pan_offset += cursor_offset * zoom_factor;
 
                 self.zoom = new_zoom;
             }
@@ -610,6 +639,19 @@ impl DashboardApp {
             // Skip edges for hidden nodes when timeline is enabled
             if self.timeline_enabled && !self.graph.is_edge_visible(edge) {
                 continue;
+            }
+
+            // Skip edges where either endpoint is below importance threshold
+            if self.importance_filter_enabled {
+                let source_below = self.graph.get_node(&edge.source)
+                    .and_then(|n| n.importance_score)
+                    .map_or(false, |s| s < self.importance_threshold);
+                let target_below = self.graph.get_node(&edge.target)
+                    .and_then(|n| n.importance_score)
+                    .map_or(false, |s| s < self.importance_threshold);
+                if source_below || target_below {
+                    continue;
+                }
             }
 
             let source_pos = match self.graph.get_pos(&edge.source) {
@@ -655,6 +697,14 @@ impl DashboardApp {
                 if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
                     continue;
                 }
+                // Skip nodes below importance threshold when filter is enabled
+                if self.importance_filter_enabled {
+                    if let Some(score) = node.importance_score {
+                        if score < self.importance_threshold {
+                            continue;
+                        }
+                    }
+                }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
                     let distance = screen_pos.distance(hover_pos);
@@ -674,6 +724,15 @@ impl DashboardApp {
             // Skip hidden nodes when timeline is enabled
             if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
                 continue;
+            }
+
+            // Skip nodes below importance threshold when filter is enabled
+            if self.importance_filter_enabled {
+                if let Some(score) = node.importance_score {
+                    if score < self.importance_threshold {
+                        continue;
+                    }
+                }
             }
 
             if let Some(pos) = self.graph.get_pos(&node.id) {
@@ -766,12 +825,17 @@ impl DashboardApp {
                     let tooltip_pos = screen_pos + Vec2::new(self.node_size * self.zoom + 10.0, 0.0);
 
                     // Draw tooltip background
+                    let importance_str = match node.importance_score {
+                        Some(score) => format!("{:.0}%", score * 100.0),
+                        None => "—".to_string(),
+                    };
                     let tooltip_text = format!(
-                        "{}\n{}\n\nSession: {}\nProject: {}",
+                        "{}\n{}\n\nSession: {}\nProject: {}\nImportance: {}",
                         node.role.label(),
                         truncate(&node.content_preview, 80),
                         node.session_short,
-                        node.project
+                        node.project,
+                        importance_str
                     );
 
                     let galley = painter.layout_no_wrap(

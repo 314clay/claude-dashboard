@@ -1,8 +1,9 @@
 //! HTTP client for the dashboard API.
 
-use crate::graph::types::{GraphData, GraphEdge, GraphNode};
+use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 const API_BASE: &str = "http://127.0.0.1:8000";
 
@@ -72,6 +73,41 @@ impl ApiClient {
             nodes: graph_resp.nodes,
             edges: graph_resp.edges,
         })
+    }
+
+    /// Fetch partial summary for a session up to a specific timestamp
+    pub fn fetch_partial_summary(
+        &self,
+        session_id: &str,
+        before_timestamp: &str,
+    ) -> Result<PartialSummaryData, String> {
+        let encoded_ts = urlencoding::encode(before_timestamp);
+        let url = format!(
+            "{}/session/{}/summary/partial?before_timestamp={}",
+            self.base_url, session_id, encoded_ts
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(30)) // Longer timeout for AI generation
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let summary: PartialSummaryData = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Check for API-level errors
+        if let Some(ref err) = summary.error {
+            return Err(err.clone());
+        }
+
+        Ok(summary)
     }
 }
 

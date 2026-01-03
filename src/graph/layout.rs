@@ -30,9 +30,9 @@ pub struct ForceLayout {
 impl Default for ForceLayout {
     fn default() -> Self {
         Self {
-            repulsion: 5000.0,
-            attraction: 0.01,
-            centering: 0.001,
+            repulsion: 10000.0,
+            attraction: 0.1,
+            centering: 0.0001,
             damping: 0.85,
             min_distance: 30.0,
             max_velocity: 50.0,

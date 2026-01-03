@@ -17,6 +17,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_title("Claude Activity Dashboard"),
+        persist_window: true, // Persist window state and egui memory between sessions
         ..Default::default()
     };
 
