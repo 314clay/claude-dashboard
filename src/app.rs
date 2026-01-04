@@ -1,11 +1,9 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, ImportanceStats};
-use crate::graph::types::{PartialSummaryData, RoleFilter};
+use crate::api::ApiClient;
+use crate::graph::types::PartialSummaryData;
 use crate::graph::{ForceLayout, GraphState};
-use crate::settings::Settings;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
-use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
@@ -48,29 +46,10 @@ impl TimeRange {
             TimeRange::Month3 => "Past 3 months",
         }
     }
-
-    /// Find the TimeRange that matches the given hours value
-    fn from_hours(hours: f32) -> Self {
-        match hours as i32 {
-            1 => TimeRange::Hour1,
-            6 => TimeRange::Hour6,
-            24 => TimeRange::Hour24,
-            72 => TimeRange::Day3,
-            168 => TimeRange::Week1,
-            336 => TimeRange::Week2,
-            720 => TimeRange::Month1,
-            2160 => TimeRange::Month3,
-            _ => TimeRange::Hour24, // Default fallback
-        }
-    }
 }
 
 /// Main dashboard application
 pub struct DashboardApp {
-    // Persistent settings
-    settings: Settings,
-    settings_dirty: bool,
-
     // API client
     api: ApiClient,
     api_connected: bool,
@@ -94,25 +73,6 @@ pub struct DashboardApp {
     // Importance filtering
     importance_threshold: f32,
     importance_filter_enabled: bool,
-
-    // Role filtering (hide Claude/User messages)
-    role_filter: RoleFilter,
-
-    // Importance scoring (async backfill)
-    importance_scoring: bool,
-    importance_result: Option<String>,
-    importance_receiver: Option<Receiver<Result<serde_json::Value, String>>>,
-    importance_start_time: Option<Instant>,
-    importance_initial_unscored: i64,
-    importance_last_poll: Option<Instant>,
-    importance_progress: Option<(i64, i64)>, // (scored, total)
-    importance_since_days: f32, // Days filter for "Score Recent" button
-
-    // Node sizing mode
-    size_by_importance: bool,
-
-    // Temporal edge opacity
-    temporal_edge_opacity: f32,
 
     // Viewport state
     pan_offset: Vec2,
@@ -145,59 +105,21 @@ pub struct DashboardApp {
 
 impl DashboardApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Load persisted settings
-        let settings = Settings::load();
-
-        // Create layout with settings applied
-        let mut layout = ForceLayout::default();
-        layout.repulsion = settings.repulsion;
-        layout.attraction = settings.attraction;
-        layout.centering = settings.centering;
-        layout.size_repulsion_weight = settings.size_repulsion_weight;
-        layout.temporal_strength = settings.temporal_strength;
-
-        // Create graph state with settings applied
-        let mut graph = GraphState::new();
-        graph.physics_enabled = settings.physics_enabled;
-        graph.color_by_project = settings.color_by_project;
-        graph.temporal_attraction_enabled = settings.temporal_attraction_enabled;
-        graph.temporal_window_secs = settings.temporal_window_mins as f64 * 60.0;
-        graph.timeline.speed = settings.timeline_speed;
-        graph.timeline.spacing_mode = if settings.timeline_spacing_even {
-            crate::graph::types::TimelineSpacingMode::EvenSpacing
-        } else {
-            crate::graph::types::TimelineSpacingMode::TimeBased
-        };
-
         let mut app = Self {
-            settings: settings.clone(),
-            settings_dirty: false,
-
             api: ApiClient::new(),
             api_connected: false,
             api_error: None,
-            graph,
-            layout,
-            time_range: TimeRange::from_hours(settings.time_range_hours),
-            node_size: settings.node_size,
-            show_arrows: settings.show_arrows,
+            graph: GraphState::new(),
+            layout: ForceLayout::default(),
+            time_range: TimeRange::Hour24,
+            node_size: 15.0,
+            show_arrows: true,
             loading: false,
-            timeline_enabled: settings.timeline_enabled,
-            recency_min_scale: settings.recency_min_scale,
-            recency_decay_rate: settings.recency_decay_rate,
-            importance_threshold: settings.importance_threshold,
-            importance_filter_enabled: settings.importance_filter_enabled,
-            role_filter: settings.role_filter,
-            importance_scoring: false,
-            importance_result: None,
-            importance_receiver: None,
-            importance_start_time: None,
-            importance_initial_unscored: 0,
-            importance_last_poll: None,
-            importance_progress: None,
-            importance_since_days: 7.0,
-            size_by_importance: settings.size_by_importance,
-            temporal_edge_opacity: settings.temporal_edge_opacity,
+            timeline_enabled: true,
+            recency_min_scale: 0.01,
+            recency_decay_rate: 3.0,
+            importance_threshold: 0.0,
+            importance_filter_enabled: false,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
@@ -281,43 +203,6 @@ impl DashboardApp {
         if !self.frame_times.is_empty() {
             let avg_frame_time: f32 = self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32;
             self.fps = 1.0 / avg_frame_time;
-        }
-    }
-
-    /// Sync current app state to settings and mark as needing save
-    fn mark_settings_dirty(&mut self) {
-        // Sync all current values to settings
-        self.settings.time_range_hours = self.time_range.hours();
-        self.settings.node_size = self.node_size;
-        self.settings.show_arrows = self.show_arrows;
-        self.settings.timeline_enabled = self.timeline_enabled;
-        self.settings.size_by_importance = self.size_by_importance;
-        self.settings.color_by_project = self.graph.color_by_project;
-        self.settings.timeline_spacing_even = self.graph.timeline.spacing_mode == crate::graph::types::TimelineSpacingMode::EvenSpacing;
-        self.settings.timeline_speed = self.graph.timeline.speed;
-        self.settings.importance_threshold = self.importance_threshold;
-        self.settings.importance_filter_enabled = self.importance_filter_enabled;
-        self.settings.role_filter = self.role_filter;
-        self.settings.physics_enabled = self.graph.physics_enabled;
-        self.settings.repulsion = self.layout.repulsion;
-        self.settings.attraction = self.layout.attraction;
-        self.settings.centering = self.layout.centering;
-        self.settings.size_repulsion_weight = self.layout.size_repulsion_weight;
-        self.settings.temporal_strength = self.layout.temporal_strength;
-        self.settings.temporal_attraction_enabled = self.graph.temporal_attraction_enabled;
-        self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
-        self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
-        self.settings.recency_min_scale = self.recency_min_scale;
-        self.settings.recency_decay_rate = self.recency_decay_rate;
-
-        self.settings_dirty = true;
-    }
-
-    /// Save settings if dirty
-    fn save_settings_if_dirty(&mut self) {
-        if self.settings_dirty {
-            self.settings.save();
-            self.settings_dirty = false;
         }
     }
 
@@ -425,7 +310,6 @@ impl DashboardApp {
                     });
 
                 if self.time_range != prev_range {
-                    self.mark_settings_dirty();
                     self.load_graph();
                 }
 
@@ -436,36 +320,17 @@ impl DashboardApp {
                     }
                     if ui.button("↺ Reset All").clicked() {
                         // Reset all UI state to defaults
-                        let defaults = Settings::default();
-                        self.time_range = TimeRange::from_hours(defaults.time_range_hours);
-                        self.node_size = defaults.node_size;
-                        self.show_arrows = defaults.show_arrows;
-                        self.timeline_enabled = defaults.timeline_enabled;
-                        self.size_by_importance = defaults.size_by_importance;
-                        self.graph.color_by_project = defaults.color_by_project;
-                        self.graph.physics_enabled = defaults.physics_enabled;
-                        self.recency_min_scale = defaults.recency_min_scale;
-                        self.recency_decay_rate = defaults.recency_decay_rate;
-                        self.importance_threshold = defaults.importance_threshold;
-                        self.importance_filter_enabled = defaults.importance_filter_enabled;
-                        self.role_filter = defaults.role_filter;
-                        self.layout.repulsion = defaults.repulsion;
-                        self.layout.attraction = defaults.attraction;
-                        self.layout.centering = defaults.centering;
-                        self.layout.size_repulsion_weight = defaults.size_repulsion_weight;
-                        self.layout.temporal_strength = defaults.temporal_strength;
-                        self.graph.temporal_attraction_enabled = defaults.temporal_attraction_enabled;
-                        self.graph.temporal_window_secs = defaults.temporal_window_mins as f64 * 60.0;
-                        self.temporal_edge_opacity = defaults.temporal_edge_opacity;
-                        self.graph.timeline.speed = defaults.timeline_speed;
-                        self.graph.timeline.spacing_mode = if defaults.timeline_spacing_even {
-                            crate::graph::types::TimelineSpacingMode::EvenSpacing
-                        } else {
-                            crate::graph::types::TimelineSpacingMode::TimeBased
-                        };
+                        self.node_size = 15.0;
+                        self.show_arrows = true;
+                        self.graph.physics_enabled = true;
+                        self.timeline_enabled = true;
+                        self.recency_min_scale = 0.01;
+                        self.recency_decay_rate = 3.0;
+                        self.layout.repulsion = 10000.0;
+                        self.layout.attraction = 0.1;
+                        self.layout.centering = 0.0001;
                         self.pan_offset = Vec2::ZERO;
                         self.zoom = 1.0;
-                        self.mark_settings_dirty();
                         self.load_graph();
                     }
                 });
@@ -475,57 +340,12 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Display")
             .default_open(true)
             .show(ui, |ui| {
-                let prev_node_size = self.node_size;
                 ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size"));
-                if (self.node_size - prev_node_size).abs() > 0.01 {
-                    self.mark_settings_dirty();
-                }
-
-                ui.add_space(5.0);
-                ui.label("Size by:");
-                let prev_size_by_importance = self.size_by_importance;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(!self.size_by_importance, "Recency").clicked() {
-                        self.size_by_importance = false;
-                    }
-                    if ui.selectable_label(self.size_by_importance, "Importance").clicked() {
-                        self.size_by_importance = true;
-                    }
-                });
-                if self.size_by_importance != prev_size_by_importance {
-                    self.mark_settings_dirty();
-                }
-
-                ui.add_space(5.0);
-                let prev_show_arrows = self.show_arrows;
-                let prev_timeline_enabled = self.timeline_enabled;
                 ui.checkbox(&mut self.show_arrows, "Show arrows");
                 ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber");
-                if self.show_arrows != prev_show_arrows || self.timeline_enabled != prev_timeline_enabled {
-                    self.mark_settings_dirty();
-                }
-
-                // Spacing mode toggle (only show when timeline is enabled)
-                if self.timeline_enabled {
-                    ui.horizontal(|ui| {
-                        ui.label("Spacing:");
-                        let is_even = self.graph.timeline.spacing_mode == crate::graph::types::TimelineSpacingMode::EvenSpacing;
-                        if ui.selectable_label(!is_even, "Time").clicked() {
-                            self.graph.timeline.spacing_mode = crate::graph::types::TimelineSpacingMode::TimeBased;
-                            self.graph.update_visible_nodes();
-                            self.mark_settings_dirty();
-                        }
-                        if ui.selectable_label(is_even, "Even").clicked() {
-                            self.graph.timeline.spacing_mode = crate::graph::types::TimelineSpacingMode::EvenSpacing;
-                            self.graph.update_visible_nodes();
-                            self.mark_settings_dirty();
-                        }
-                    });
-                }
 
                 ui.add_space(5.0);
                 ui.label("Color by:");
-                let prev_color_by_project = self.graph.color_by_project;
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
                         self.graph.color_by_project = true;
@@ -534,143 +354,22 @@ impl DashboardApp {
                         self.graph.color_by_project = false;
                     }
                 });
-                if self.graph.color_by_project != prev_color_by_project {
-                    self.mark_settings_dirty();
-                }
             });
 
         // Filtering section
         egui::CollapsingHeader::new("Filtering")
             .default_open(true)
             .show(ui, |ui| {
-                let prev_filter_enabled = self.importance_filter_enabled;
                 ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance");
-                if self.importance_filter_enabled != prev_filter_enabled {
-                    self.mark_settings_dirty();
-                }
                 if self.importance_filter_enabled {
-                    let prev_threshold = self.importance_threshold;
                     ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
                         .text("Min importance")
                         .fixed_decimals(2));
-                    if (self.importance_threshold - prev_threshold).abs() > 0.001 {
-                        self.mark_settings_dirty();
-                    }
                     // Show count
                     let visible = self.graph.data.nodes.iter()
                         .filter(|n| n.importance_score.map_or(true, |s| s >= self.importance_threshold))
                         .count();
                     ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
-                }
-
-                ui.add_space(5.0);
-
-                // Role filter toggle
-                ui.label("Show messages:");
-                let prev_role_filter = self.role_filter;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.role_filter == RoleFilter::ShowAll, "All").clicked() {
-                        self.role_filter = RoleFilter::ShowAll;
-                    }
-                    if ui.selectable_label(self.role_filter == RoleFilter::HideClaude, "You only").clicked() {
-                        self.role_filter = RoleFilter::HideClaude;
-                    }
-                    if ui.selectable_label(self.role_filter == RoleFilter::HideUser, "Claude only").clicked() {
-                        self.role_filter = RoleFilter::HideUser;
-                    }
-                });
-                if self.role_filter != prev_role_filter {
-                    self.mark_settings_dirty();
-                }
-
-                ui.add_space(5.0);
-                ui.separator();
-
-                // Helper to start scoring with optional since_days filter
-                let start_scoring = |app: &mut DashboardApp, since_days: Option<f32>| {
-                    app.importance_scoring = true;
-                    app.importance_result = None;
-                    app.importance_start_time = Some(Instant::now());
-                    app.importance_last_poll = Some(Instant::now());
-                    app.importance_progress = None;
-
-                    // Fetch initial stats to track progress
-                    if let Ok(stats) = app.api.fetch_importance_stats() {
-                        app.importance_initial_unscored = stats.unscored_messages;
-                        app.importance_progress = Some((0, stats.unscored_messages));
-                    }
-
-                    // Create channel for async result
-                    let (tx, rx) = mpsc::channel();
-                    app.importance_receiver = Some(rx);
-
-                    // Spawn thread to trigger backfill
-                    let api = ApiClient::new();
-                    std::thread::spawn(move || {
-                        let result = api.trigger_importance_backfill(since_days);
-                        let _ = tx.send(result);
-                    });
-                };
-
-                // Score All button - scores all unprocessed messages
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.importance_scoring, egui::Button::new("Score All")).clicked() {
-                        start_scoring(self, None);
-                    }
-                    if self.importance_scoring {
-                        ui.spinner();
-                        if ui.button("Cancel").clicked() {
-                            self.importance_scoring = false;
-                            self.importance_receiver = None;
-                            self.importance_start_time = None;
-                            self.importance_last_poll = None;
-                            self.importance_progress = None;
-                            self.importance_result = Some("Cancelled".to_string());
-                        }
-                    }
-                });
-
-                // Score Recent - days input + button
-                ui.horizontal(|ui| {
-                    ui.label("Past");
-                    ui.add(egui::DragValue::new(&mut self.importance_since_days)
-                        .range(1.0..=365.0)
-                        .speed(0.5)
-                        .suffix(" days"));
-                    if ui.add_enabled(!self.importance_scoring, egui::Button::new("Score")).clicked() {
-                        let days = self.importance_since_days;
-                        start_scoring(self, Some(days));
-                    }
-                });
-
-                // Show progress or result
-                if self.importance_scoring {
-                    if let Some((scored, total)) = self.importance_progress {
-                        let pct = if total > 0 { (scored as f64 / total as f64 * 100.0) as i64 } else { 0 };
-                        let remaining = total - scored;
-
-                        // Calculate time estimate based on rate
-                        let time_str = if let Some(start) = self.importance_start_time {
-                            let elapsed = start.elapsed().as_secs_f64();
-                            if scored > 0 && elapsed > 0.0 {
-                                let rate = scored as f64 / elapsed;
-                                let eta_secs = remaining as f64 / rate;
-                                if eta_secs < 60.0 {
-                                    format!("~{}s", eta_secs as i64)
-                                } else {
-                                    format!("~{}m", (eta_secs / 60.0) as i64)
-                                }
-                            } else {
-                                "calculating...".to_string()
-                            }
-                        } else {
-                            "".to_string()
-                        };
-
-                        ui.label(format!("{}/{} ({}%) {}", scored, total, pct, time_str));
-                    }
-                } else if let Some(ref result) = self.importance_result {
-                    ui.label(result);
                 }
             });
 
@@ -678,91 +377,17 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Advanced")
             .default_open(false)
             .show(ui, |ui| {
-                let prev_physics = self.graph.physics_enabled;
                 ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled");
-                if self.graph.physics_enabled != prev_physics {
-                    self.mark_settings_dirty();
-                }
                 ui.add_space(5.0);
                 ui.label("Physics Tuning");
-
-                let prev_repulsion = self.layout.repulsion;
-                let prev_attraction = self.layout.attraction;
-                let prev_centering = self.layout.centering;
-                let prev_size_weight = self.layout.size_repulsion_weight;
-
                 ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion"));
                 ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction"));
                 ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering"));
-                ui.add(egui::Slider::new(&mut self.layout.size_repulsion_weight, 0.0..=1.0)
-                    .text("Size→Repulsion")
-                    .fixed_decimals(2));
-
-                if (self.layout.repulsion - prev_repulsion).abs() > 1.0
-                    || (self.layout.attraction - prev_attraction).abs() > 0.0001
-                    || (self.layout.centering - prev_centering).abs() > 0.000001
-                    || (self.layout.size_repulsion_weight - prev_size_weight).abs() > 0.001
-                {
-                    self.mark_settings_dirty();
-                }
-
-                ui.add_space(10.0);
-                ui.label("Temporal Attraction");
-
-                // Cache values before closure to avoid borrow issues
-                let temporal_enabled = self.graph.temporal_attraction_enabled;
-                let mut new_temporal_enabled = temporal_enabled;
-                ui.checkbox(&mut new_temporal_enabled, "Enable temporal clustering");
-                if new_temporal_enabled != temporal_enabled {
-                    self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
-                    self.mark_settings_dirty();
-                }
-
-                if self.graph.temporal_attraction_enabled {
-                    let prev_temporal_strength = self.layout.temporal_strength;
-                    ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
-                        .logarithmic(true)
-                        .text("Strength"));
-                    if (self.layout.temporal_strength - prev_temporal_strength).abs() > 0.001 {
-                        self.mark_settings_dirty();
-                    }
-
-                    // Temporal window slider (in minutes for UX, stored as seconds)
-                    let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
-                    let prev_window_mins = window_mins;
-                    ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
-                        .text("Window (min)")
-                        .fixed_decimals(0));
-                    if (window_mins - prev_window_mins).abs() > 0.1 {
-                        self.graph.set_temporal_window(window_mins as f64 * 60.0);
-                        self.mark_settings_dirty();
-                    }
-
-                    // Temporal edge opacity slider
-                    let prev_opacity = self.temporal_edge_opacity;
-                    ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
-                        .text("Edge opacity")
-                        .fixed_decimals(2));
-                    if (self.temporal_edge_opacity - prev_opacity).abs() > 0.001 {
-                        self.mark_settings_dirty();
-                    }
-
-                    // Show temporal edge count
-                    let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
-                    ui.label(format!("Temporal edges: {}", temporal_count));
-                }
 
                 ui.add_space(10.0);
                 ui.label("Recency Scaling");
-                let prev_min_scale = self.recency_min_scale;
-                let prev_decay_rate = self.recency_decay_rate;
                 ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
                 ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
-                if (self.recency_min_scale - prev_min_scale).abs() > 0.0001
-                    || (self.recency_decay_rate - prev_decay_rate).abs() > 0.01
-                {
-                    self.mark_settings_dirty();
-                }
             });
 
         ui.add_space(10.0);
@@ -995,38 +620,8 @@ impl DashboardApp {
             }
         }
 
-        // Build combined visibility set for physics (timeline + importance + role filtering)
-        let role_filter = self.role_filter;
-        let physics_visible: Option<HashSet<String>> = if self.timeline_enabled || self.importance_filter_enabled || role_filter != RoleFilter::ShowAll {
-            let visible: HashSet<String> = self.graph.data.nodes.iter()
-                .filter(|node| {
-                    // Check timeline visibility
-                    if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
-                        return false;
-                    }
-                    // Check importance visibility
-                    if self.importance_filter_enabled {
-                        if let Some(score) = node.importance_score {
-                            if score < self.importance_threshold {
-                                return false;
-                            }
-                        }
-                    }
-                    // Check role visibility
-                    if !role_filter.is_visible(&node.role) {
-                        return false;
-                    }
-                    true
-                })
-                .map(|n| n.id.clone())
-                .collect();
-            Some(visible)
-        } else {
-            None // No filtering - physics uses all nodes
-        };
-
         // Run physics simulation (uses graph-space center, unaffected by viewport pan)
-        self.layout.step(&mut self.graph, center, physics_visible.as_ref());
+        self.layout.step(&mut self.graph, center);
 
         // Cache values for transform closure to avoid borrowing self
         let pan_offset = self.pan_offset;
@@ -1040,119 +635,55 @@ impl DashboardApp {
         };
 
         // Draw edges first (behind nodes)
-        // When filtering (importance or role), we need to draw "bridge" edges that skip filtered nodes
-        // to keep session flows connected.
-        let mut drawn_bridges: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let importance_threshold = self.importance_threshold;
-        let importance_filter_enabled = self.importance_filter_enabled;
-
         for edge in &self.graph.data.edges {
             // Skip edges for hidden nodes when timeline is enabled
             if self.timeline_enabled && !self.graph.is_edge_visible(edge) {
                 continue;
             }
 
-            // Helper: check if a node is filtered out (by importance or role)
-            let is_node_filtered = |node_id: &str| -> bool {
-                if let Some(node) = self.graph.get_node(node_id) {
-                    // Check importance filter
-                    if importance_filter_enabled {
-                        if let Some(score) = node.importance_score {
-                            if score < importance_threshold {
-                                return true;
-                            }
-                        }
-                    }
-                    // Check role filter
-                    if !role_filter.is_visible(&node.role) {
-                        return true;
-                    }
-                    false
-                } else {
-                    true // Node not found = filtered
-                }
-            };
-
-            // Determine source and target for this edge (with bridging if needed)
-            let needs_bridging = importance_filter_enabled || role_filter != RoleFilter::ShowAll;
-            let (draw_source, draw_target, is_bridge) = if needs_bridging {
-                let is_session_edge = !edge.is_temporal && !edge.is_similarity && !edge.is_topic && !edge.is_obsidian;
-
-                let source_filtered = is_node_filtered(&edge.source);
-                let target_filtered = is_node_filtered(&edge.target);
-
-                if is_session_edge && source_filtered {
-                    // Source is filtered - skip (its predecessor will bridge to target or beyond)
+            // Skip edges where either endpoint is below importance threshold
+            if self.importance_filter_enabled {
+                let source_below = self.graph.get_node(&edge.source)
+                    .and_then(|n| n.importance_score)
+                    .map_or(false, |s| s < self.importance_threshold);
+                let target_below = self.graph.get_node(&edge.target)
+                    .and_then(|n| n.importance_score)
+                    .map_or(false, |s| s < self.importance_threshold);
+                if source_below || target_below {
                     continue;
-                } else if is_session_edge && target_filtered {
-                    // Target is filtered - find next visible node in chain to bridge to
-                    if let Some(next_visible) = self.graph.next_visible_in_chain(&edge.source, importance_threshold, role_filter) {
-                        // Check if we already drew this bridge
-                        let bridge_key = (edge.source.clone(), next_visible.clone());
-                        if drawn_bridges.contains(&bridge_key) {
-                            continue;
-                        }
-                        drawn_bridges.insert(bridge_key);
-                        (edge.source.clone(), next_visible, true)
-                    } else {
-                        continue; // No visible target to bridge to
-                    }
-                } else if source_filtered || target_filtered {
-                    // Non-session edge with filtered endpoint - skip entirely
-                    continue;
-                } else {
-                    // Both visible - draw normally
-                    (edge.source.clone(), edge.target.clone(), false)
                 }
-            } else {
-                // No filtering - draw all edges
-                (edge.source.clone(), edge.target.clone(), false)
-            };
+            }
 
-            let source_pos = match self.graph.get_pos(&draw_source) {
+            let source_pos = match self.graph.get_pos(&edge.source) {
                 Some(p) => transform(p),
                 None => continue,
             };
-            let target_pos = match self.graph.get_pos(&draw_target) {
+            let target_pos = match self.graph.get_pos(&edge.target) {
                 Some(p) => transform(p),
                 None => continue,
             };
 
-            // Use dashed style for bridge edges (optional visual hint)
-            // Temporal edges use configurable opacity
-            let base_opacity = if edge.is_temporal {
-                self.temporal_edge_opacity
-            } else if is_bridge {
-                0.3
-            } else {
-                0.5
-            };
-            let color = self.graph.edge_color(edge).gamma_multiply(base_opacity);
+            let color = self.graph.edge_color(edge).gamma_multiply(0.5);
             let stroke = Stroke::new(1.5 * self.zoom, color);
 
             painter.line_segment([source_pos, target_pos], stroke);
 
             // Draw arrow if enabled
             if self.show_arrows {
-                let delta = target_pos - source_pos;
-                let length = delta.length();
-                // Skip arrow if nodes are at same position (prevents NaN from normalized())
-                if length > 0.01 {
-                    let dir = delta / length;
-                    let arrow_size = 8.0 * self.zoom;
-                    let arrow_pos = target_pos - dir * (self.node_size * self.zoom + 2.0);
+                let dir = (target_pos - source_pos).normalized();
+                let arrow_size = 8.0 * self.zoom;
+                let arrow_pos = target_pos - dir * (self.node_size * self.zoom + 2.0);
 
-                    let perp = Vec2::new(-dir.y, dir.x);
-                    let p1 = arrow_pos;
-                    let p2 = arrow_pos - dir * arrow_size + perp * arrow_size * 0.5;
-                    let p3 = arrow_pos - dir * arrow_size - perp * arrow_size * 0.5;
+                let perp = Vec2::new(-dir.y, dir.x);
+                let p1 = arrow_pos;
+                let p2 = arrow_pos - dir * arrow_size + perp * arrow_size * 0.5;
+                let p3 = arrow_pos - dir * arrow_size - perp * arrow_size * 0.5;
 
-                    painter.add(egui::Shape::convex_polygon(
-                        vec![p1, p2, p3],
-                        color,
-                        Stroke::NONE,
-                    ));
-                }
+                painter.add(egui::Shape::convex_polygon(
+                    vec![p1, p2, p3],
+                    color,
+                    Stroke::NONE,
+                ));
             }
         }
 
@@ -1174,10 +705,6 @@ impl DashboardApp {
                         }
                     }
                 }
-                // Skip nodes hidden by role filter
-                if !role_filter.is_visible(&node.role) {
-                    continue;
-                }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
                     let distance = screen_pos.distance(hover_pos);
@@ -1192,7 +719,7 @@ impl DashboardApp {
         }
         self.graph.hovered_node = new_hovered;
 
-        // Draw nodes (only visible ones when filtering is enabled)
+        // Draw nodes (only visible ones when timeline is enabled)
         for node in &self.graph.data.nodes {
             // Skip hidden nodes when timeline is enabled
             if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
@@ -1208,42 +735,29 @@ impl DashboardApp {
                 }
             }
 
-            // Skip nodes hidden by role filter
-            if !role_filter.is_visible(&node.role) {
-                continue;
-            }
-
             if let Some(pos) = self.graph.get_pos(&node.id) {
                 let screen_pos = transform(pos);
                 let is_hovered = self.graph.hovered_node.as_ref() == Some(&node.id);
                 let is_selected = self.graph.selected_node.as_ref() == Some(&node.id);
 
-                // Node size scaling based on mode (recency or importance)
+                // Exponential scaling based on distance from scrubber position
                 let min_s = self.recency_min_scale;
-                let size_scale = if self.size_by_importance {
-                    // Importance-based: scale by importance score (0.0-1.0)
-                    node.importance_score
-                        .map(|score| min_s + (1.0 - min_s) * score)
-                        .unwrap_or(0.5) // No score = medium size
-                } else {
-                    // Recency-based: exponential decay from scrubber position
-                    let decay = self.recency_decay_rate;
-                    if self.graph.timeline.max_time > self.graph.timeline.min_time {
-                        if let Some(node_time) = node.timestamp_secs() {
-                            let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
-                            let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
-                            let distance = (scrubber_time - node_time).abs();
-                            let normalized_distance = (distance / time_range).clamp(0.0, 1.0);
-                            min_s + (1.0 - min_s) * (-decay * normalized_distance as f32).exp()
-                        } else {
-                            0.5 // No timestamp = medium size
-                        }
+                let decay = self.recency_decay_rate;
+                let recency_scale = if self.graph.timeline.max_time > self.graph.timeline.min_time {
+                    if let Some(node_time) = node.timestamp_secs() {
+                        let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
+                        let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
+                        let distance = (scrubber_time - node_time).abs();
+                        let normalized_distance = (distance / time_range).clamp(0.0, 1.0);
+                        min_s + (1.0 - min_s) * (-decay * normalized_distance as f32).exp()
                     } else {
-                        1.0 // No time range = all same size
+                        0.5 // No timestamp = medium size
                     }
+                } else {
+                    1.0 // No time range = all same size
                 };
 
-                let base_size = self.node_size * self.zoom * size_scale;
+                let base_size = self.node_size * self.zoom * recency_scale;
                 let size = if is_hovered || is_selected {
                     base_size * 1.3
                 } else {
@@ -1377,35 +891,13 @@ impl DashboardApp {
         let timestamps: Vec<f64> = self.graph.timeline.timestamps.clone();
         let min_time = self.graph.timeline.min_time;
         let max_time = self.graph.timeline.max_time;
-        let spacing_mode = self.graph.timeline.spacing_mode;
-        let node_count = timestamps.len();
 
-        // Helper to calculate position from time (time-based mode)
+        // Helper to calculate position from time
         let position_at_time = |t: f64| -> f32 {
             if max_time <= min_time {
                 1.0
             } else {
                 ((t - min_time) / (max_time - min_time)) as f32
-            }
-        };
-
-        // Helper to calculate position for a node at index (respects spacing mode)
-        let position_for_notch = |index: usize| -> f32 {
-            match spacing_mode {
-                crate::graph::types::TimelineSpacingMode::TimeBased => {
-                    if index < node_count {
-                        position_at_time(timestamps[index])
-                    } else {
-                        1.0
-                    }
-                }
-                crate::graph::types::TimelineSpacingMode::EvenSpacing => {
-                    if node_count <= 1 {
-                        1.0
-                    } else {
-                        index as f32 / (node_count - 1) as f32
-                    }
-                }
             }
         };
 
@@ -1445,7 +937,6 @@ impl DashboardApp {
                     &label
                 ).clicked() {
                     self.graph.timeline.speed = speed;
-                    self.mark_settings_dirty();
                 }
             }
         });
@@ -1476,10 +967,10 @@ impl DashboardApp {
             Color32::from_rgb(30, 33, 40)
         );
 
-        // Draw notches for each node (positioned by spacing mode)
+        // Draw notches for each node timestamp
         let notch_color = Color32::from_rgb(60, 65, 75);
-        for i in 0..node_count {
-            let pos = position_for_notch(i);
+        for &t in &timestamps {
+            let pos = position_at_time(t);
             let x = rect.left() + pos * rect.width();
             painter.line_segment(
                 [Pos2::new(x, rect.top() + 5.0), Pos2::new(x, rect.bottom() - 5.0)],
@@ -1529,8 +1020,8 @@ impl DashboardApp {
                     self.graph.timeline.start_position = new_pos.min(self.graph.timeline.position - 0.01);
                 } else {
                     // Move end handle (main position)
-                    // Snap to nearest notch for smooth scrubbing (respects spacing mode)
-                    let snapped = self.graph.timeline.snap_to_notch_modal(new_pos);
+                    // Snap to nearest notch for smooth scrubbing
+                    let snapped = self.graph.timeline.snap_to_notch(new_pos);
                     self.graph.timeline.position = snapped.max(self.graph.timeline.start_position + 0.01);
                 }
 
@@ -1545,7 +1036,7 @@ impl DashboardApp {
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let new_pos = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                let snapped = self.graph.timeline.snap_to_notch_modal(new_pos);
+                let snapped = self.graph.timeline.snap_to_notch(new_pos);
                 self.graph.timeline.position = snapped.max(self.graph.timeline.start_position + 0.01);
                 self.graph.update_visible_nodes();
             }
@@ -1578,60 +1069,6 @@ impl eframe::App for DashboardApp {
                     self.summary_error = Some("Summary request cancelled".to_string());
                     self.summary_loading = false;
                     self.summary_receiver = None;
-                }
-            }
-        }
-
-        // Poll importance stats while scoring is in progress
-        if self.importance_scoring {
-            let should_poll = self.importance_last_poll
-                .map(|last| last.elapsed().as_secs_f64() >= 1.0)
-                .unwrap_or(true);
-
-            if should_poll {
-                if let Ok(stats) = self.api.fetch_importance_stats() {
-                    let scored = self.importance_initial_unscored - stats.unscored_messages;
-                    self.importance_progress = Some((scored, self.importance_initial_unscored));
-                    self.importance_last_poll = Some(Instant::now());
-                }
-            }
-        }
-
-        // Check for importance backfill result from background thread
-        if let Some(ref rx) = self.importance_receiver {
-            match rx.try_recv() {
-                Ok(Ok(data)) => {
-                    // Format the result nicely
-                    let scored = data.get("messages_scored").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let sessions = data.get("sessions_processed").and_then(|v| v.as_i64()).unwrap_or(0);
-                    self.importance_result = Some(format!("Scored {} msgs in {} sessions", scored, sessions));
-                    self.importance_scoring = false;
-                    self.importance_receiver = None;
-                    self.importance_start_time = None;
-                    self.importance_last_poll = None;
-                    self.importance_progress = None;
-                    // Reload graph to show new scores
-                    self.load_graph();
-                }
-                Ok(Err(e)) => {
-                    self.importance_result = Some(format!("Error: {}", e));
-                    self.importance_scoring = false;
-                    self.importance_receiver = None;
-                    self.importance_start_time = None;
-                    self.importance_last_poll = None;
-                    self.importance_progress = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still loading, request repaint to check again
-                    ctx.request_repaint();
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.importance_result = Some("Scoring cancelled".to_string());
-                    self.importance_scoring = false;
-                    self.importance_receiver = None;
-                    self.importance_start_time = None;
-                    self.importance_last_poll = None;
-                    self.importance_progress = None;
                 }
             }
         }
@@ -1690,15 +1127,6 @@ impl eframe::App for DashboardApp {
             .show(ctx, |ui| {
                 self.render_graph(ui);
             });
-
-        // Save settings if dirty (debounced by only saving when actually modified)
-        self.save_settings_if_dirty();
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Ensure settings are saved on exit
-        self.mark_settings_dirty();
-        self.save_settings_if_dirty();
     }
 }
 

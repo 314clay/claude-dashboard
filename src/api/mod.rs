@@ -2,4 +2,4 @@
 
 mod client;
 
-pub use client::{ApiClient, ImportanceStats};
+pub use client::ApiClient;
