@@ -117,7 +117,27 @@ pub struct GraphEdge {
     pub is_topic: bool,
     #[serde(default)]
     pub is_similarity: bool,
+    #[serde(default)]
+    pub is_temporal: bool,
+    /// Strength multiplier for this edge (used by temporal and similarity edges)
     pub similarity: Option<f32>,
+}
+
+impl GraphEdge {
+    /// Create a temporal edge between two nodes
+    pub fn temporal(source: String, target: String, strength: f32) -> Self {
+        Self {
+            source,
+            target,
+            session_id: String::new(),
+            timestamp: None,
+            is_obsidian: false,
+            is_topic: false,
+            is_similarity: false,
+            is_temporal: true,
+            similarity: Some(strength),
+        }
+    }
 }
 
 /// Complete graph data from the API
@@ -280,6 +300,10 @@ pub struct GraphState {
     pub selected_node: Option<String>,
     /// Timeline state
     pub timeline: TimelineState,
+    /// Temporal attraction enabled
+    pub temporal_attraction_enabled: bool,
+    /// Temporal window in seconds (nodes within this window attract)
+    pub temporal_window_secs: f64,
 }
 
 impl GraphState {
@@ -296,6 +320,8 @@ impl GraphState {
             hovered_node: None,
             selected_node: None,
             timeline: TimelineState::default(),
+            temporal_attraction_enabled: true,
+            temporal_window_secs: 300.0, // 5 minutes default
         }
     }
 
@@ -340,6 +366,110 @@ impl GraphState {
 
         // Build timeline data
         self.build_timeline();
+
+        // Build temporal edges (pre-computed at load time)
+        if self.temporal_attraction_enabled {
+            self.build_temporal_edges();
+        }
+    }
+
+    /// Maximum number of temporal edges to prevent performance issues with large datasets.
+    const MAX_TEMPORAL_EDGES: usize = 10_000;
+
+    /// Node count threshold above which temporal edges are auto-disabled.
+    const TEMPORAL_EDGE_NODE_LIMIT: usize = 2000;
+
+    /// Build pre-computed temporal edges between nodes close in time.
+    /// Uses sliding window algorithm: O(n) instead of O(n²).
+    pub fn build_temporal_edges(&mut self) {
+        // Remove any existing temporal edges first
+        self.data.edges.retain(|e| !e.is_temporal);
+
+        if self.timeline.sorted_indices.is_empty() {
+            return;
+        }
+
+        // Auto-disable for very large datasets to prevent freezing
+        let node_count = self.timeline.sorted_indices.len();
+        if node_count > Self::TEMPORAL_EDGE_NODE_LIMIT {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "Skipping temporal edges: {} nodes exceeds limit of {}",
+                node_count,
+                Self::TEMPORAL_EDGE_NODE_LIMIT
+            );
+            return;
+        }
+
+        let window = self.temporal_window_secs;
+        let mut temporal_edges = Vec::new();
+
+        // Sliding window over sorted timestamps
+        for i in 0..node_count {
+            let node_i_idx = self.timeline.sorted_indices[i];
+            let ts_i = self.timeline.timestamps[i];
+
+            for j in (i + 1)..node_count {
+                let ts_j = self.timeline.timestamps[j];
+                let dt = ts_j - ts_i;
+
+                // Since sorted, if we exceed window we're done with this node
+                if dt > window {
+                    break;
+                }
+
+                let node_j_idx = self.timeline.sorted_indices[j];
+
+                // Strength decays linearly from 1.0 to 0.0 over the window
+                let strength = 1.0 - (dt / window) as f32;
+
+                let source_id = self.data.nodes[node_i_idx].id.clone();
+                let target_id = self.data.nodes[node_j_idx].id.clone();
+
+                temporal_edges.push(GraphEdge::temporal(source_id, target_id, strength));
+
+                // Hard cap to prevent runaway memory/performance issues
+                if temporal_edges.len() >= Self::MAX_TEMPORAL_EDGES {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "Hit temporal edge limit of {} (window: {}s)",
+                        Self::MAX_TEMPORAL_EDGES,
+                        window
+                    );
+                    self.data.edges.extend(temporal_edges);
+                    return;
+                }
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "Built {} temporal edges (window: {}s, nodes: {})",
+            temporal_edges.len(),
+            window,
+            node_count
+        );
+
+        self.data.edges.extend(temporal_edges);
+    }
+
+    /// Rebuild temporal edges with a new window size
+    pub fn set_temporal_window(&mut self, window_secs: f64) {
+        self.temporal_window_secs = window_secs;
+        if self.temporal_attraction_enabled {
+            self.build_temporal_edges();
+        }
+    }
+
+    /// Toggle temporal attraction on/off
+    pub fn set_temporal_attraction_enabled(&mut self, enabled: bool) {
+        self.temporal_attraction_enabled = enabled;
+        if enabled {
+            self.build_temporal_edges();
+        } else {
+            // Remove temporal edges
+            self.data.edges.retain(|e| !e.is_temporal);
+        }
     }
 
     /// Build timeline sorted indices and timestamps

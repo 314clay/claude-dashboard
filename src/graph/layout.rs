@@ -26,6 +26,8 @@ pub struct ForceLayout {
     pub max_velocity: f32,
     /// Ideal edge length
     pub ideal_length: f32,
+    /// Temporal edge strength multiplier
+    pub temporal_strength: f32,
 }
 
 impl Default for ForceLayout {
@@ -38,6 +40,7 @@ impl Default for ForceLayout {
             min_distance: 30.0,
             max_velocity: 50.0,
             ideal_length: 100.0,
+            temporal_strength: 0.5,
         }
     }
 }
@@ -92,7 +95,20 @@ impl ForceLayout {
             let delta = pos_target - pos_source;
             let distance = delta.length().max(self.min_distance);
             let displacement = distance - self.ideal_length;
-            let force_magnitude = self.attraction * displacement;
+
+            // Base attraction, modified by edge strength for temporal/similarity edges
+            let edge_multiplier = if edge.is_temporal {
+                // Temporal edges: use pre-computed similarity * temporal_strength
+                edge.similarity.unwrap_or(1.0) * self.temporal_strength
+            } else if edge.is_similarity {
+                // Similarity edges also use their strength
+                edge.similarity.unwrap_or(1.0)
+            } else {
+                // Regular edges: full strength
+                1.0
+            };
+
+            let force_magnitude = self.attraction * displacement * edge_multiplier;
 
             let force = delta.normalized() * force_magnitude;
             forces[source_idx] += force;
