@@ -70,6 +70,9 @@ pub struct DashboardApp {
     recency_min_scale: f32,
     recency_decay_rate: f32,
 
+    // Temporal edge opacity
+    temporal_edge_opacity: f32,
+
     // Importance filtering
     importance_threshold: f32,
     importance_filter_enabled: bool,
@@ -118,6 +121,7 @@ impl DashboardApp {
             timeline_enabled: true,
             recency_min_scale: 0.01,
             recency_decay_rate: 3.0,
+            temporal_edge_opacity: 0.3,
             importance_threshold: 0.0,
             importance_filter_enabled: false,
             pan_offset: Vec2::ZERO,
@@ -388,6 +392,42 @@ impl DashboardApp {
                 ui.label("Recency Scaling");
                 ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
                 ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label("Temporal Clustering");
+
+                let temporal_enabled = self.graph.temporal_attraction_enabled;
+                let mut new_temporal_enabled = temporal_enabled;
+                ui.checkbox(&mut new_temporal_enabled, "Enable temporal edges");
+                if new_temporal_enabled != temporal_enabled {
+                    self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
+                }
+
+                if self.graph.temporal_attraction_enabled {
+                    ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
+                        .logarithmic(true)
+                        .text("Strength"));
+
+                    // Temporal window slider (in minutes for UX, stored as seconds)
+                    let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
+                    let prev_window_mins = window_mins;
+                    ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
+                        .text("Window (min)")
+                        .fixed_decimals(0));
+                    if (window_mins - prev_window_mins).abs() > 0.1 {
+                        self.graph.set_temporal_window(window_mins as f64 * 60.0);
+                    }
+
+                    // Temporal edge opacity slider
+                    ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
+                        .text("Edge opacity")
+                        .fixed_decimals(2));
+
+                    // Show temporal edge count
+                    let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
+                    ui.label(format!("Temporal edges: {}", temporal_count));
+                }
             });
 
         ui.add_space(10.0);
@@ -663,7 +703,12 @@ impl DashboardApp {
                 None => continue,
             };
 
-            let color = self.graph.edge_color(edge).gamma_multiply(0.5);
+            let base_opacity = if edge.is_temporal {
+                self.temporal_edge_opacity
+            } else {
+                0.5
+            };
+            let color = self.graph.edge_color(edge).gamma_multiply(base_opacity);
             let stroke = Stroke::new(1.5 * self.zoom, color);
 
             painter.line_segment([source_pos, target_pos], stroke);

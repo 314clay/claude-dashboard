@@ -376,11 +376,9 @@ impl GraphState {
     /// Maximum number of temporal edges to prevent performance issues with large datasets.
     const MAX_TEMPORAL_EDGES: usize = 10_000;
 
-    /// Node count threshold above which temporal edges are auto-disabled.
-    const TEMPORAL_EDGE_NODE_LIMIT: usize = 2000;
-
     /// Build pre-computed temporal edges between nodes close in time.
     /// Uses sliding window algorithm: O(n) instead of O(n²).
+    /// Caps at MAX_TEMPORAL_EDGES to prevent performance issues.
     pub fn build_temporal_edges(&mut self) {
         // Remove any existing temporal edges first
         self.data.edges.retain(|e| !e.is_temporal);
@@ -389,18 +387,7 @@ impl GraphState {
             return;
         }
 
-        // Auto-disable for very large datasets to prevent freezing
         let node_count = self.timeline.sorted_indices.len();
-        if node_count > Self::TEMPORAL_EDGE_NODE_LIMIT {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "Skipping temporal edges: {} nodes exceeds limit of {}",
-                node_count,
-                Self::TEMPORAL_EDGE_NODE_LIMIT
-            );
-            return;
-        }
-
         let window = self.temporal_window_secs;
         let mut temporal_edges = Vec::new();
 
