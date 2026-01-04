@@ -35,6 +35,9 @@ tracing-subscriber = "0.3"
 # Random for layout initialization
 rand = "0.8"
 
+# Platform directories for settings
+dirs = "5"
+
 [profile.release]
 opt-level = 3
 lto = true

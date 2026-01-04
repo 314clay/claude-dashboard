@@ -9,6 +9,10 @@
 use super::quadtree::Quadtree;
 use super::types::GraphState;
 use egui::{Pos2, Vec2};
+use rand::seq::SliceRandom;
+
+/// Maximum temporal edges to process per physics frame (stochastic sampling)
+const TEMPORAL_EDGES_PER_FRAME: usize = 2000;
 
 /// Force-directed layout parameters
 pub struct ForceLayout {
@@ -72,47 +76,34 @@ impl ForceLayout {
             }
         }
 
-        // Attraction along edges
-        for edge in &state.data.edges {
-            let source_idx = match state.node_index.get(&edge.source) {
-                Some(&i) => i,
-                None => continue,
-            };
-            let target_idx = match state.node_index.get(&edge.target) {
-                Some(&i) => i,
-                None => continue,
-            };
+        // Separate temporal edges from regular edges for stochastic sampling
+        let (temporal_edges, regular_edges): (Vec<_>, Vec<_>) = state
+            .data
+            .edges
+            .iter()
+            .partition(|e| e.is_temporal);
 
-            let pos_source = match state.positions.get(&edge.source) {
-                Some(&p) => p,
-                None => continue,
-            };
-            let pos_target = match state.positions.get(&edge.target) {
-                Some(&p) => p,
-                None => continue,
-            };
+        // Process ALL regular edges (structural edges are important)
+        for edge in &regular_edges {
+            self.apply_edge_force(edge, state, &mut forces, 1.0);
+        }
 
-            let delta = pos_target - pos_source;
-            let distance = delta.length().max(self.min_distance);
-            let displacement = distance - self.ideal_length;
+        // Stochastic sampling: process a random subset of temporal edges
+        // Scale force by sampling ratio to maintain correct average force
+        let temporal_count = temporal_edges.len();
+        if temporal_count > 0 {
+            let sample_size = temporal_count.min(TEMPORAL_EDGES_PER_FRAME);
+            let scale = temporal_count as f32 / sample_size as f32;
 
-            // Base attraction, modified by edge strength for temporal/similarity edges
-            let edge_multiplier = if edge.is_temporal {
-                // Temporal edges: use pre-computed similarity * temporal_strength
-                edge.similarity.unwrap_or(1.0) * self.temporal_strength
-            } else if edge.is_similarity {
-                // Similarity edges also use their strength
-                edge.similarity.unwrap_or(1.0)
-            } else {
-                // Regular edges: full strength
-                1.0
-            };
+            // Sample without replacement
+            let mut rng = rand::thread_rng();
+            let sampled: Vec<_> = temporal_edges
+                .choose_multiple(&mut rng, sample_size)
+                .collect();
 
-            let force_magnitude = self.attraction * displacement * edge_multiplier;
-
-            let force = delta.normalized() * force_magnitude;
-            forces[source_idx] += force;
-            forces[target_idx] -= force;
+            for edge in sampled {
+                self.apply_edge_force(edge, state, &mut forces, scale);
+            }
         }
 
         // Centering force
@@ -147,5 +138,54 @@ impl ForceLayout {
         let total_velocity: f32 = state.velocities.values().map(|v| v.length()).sum();
         let avg_velocity = total_velocity / state.data.nodes.len().max(1) as f32;
         avg_velocity < 0.5
+    }
+
+    /// Apply attraction force for a single edge
+    fn apply_edge_force(
+        &self,
+        edge: &super::types::GraphEdge,
+        state: &GraphState,
+        forces: &mut [Vec2],
+        scale: f32,
+    ) {
+        let source_idx = match state.node_index.get(&edge.source) {
+            Some(&i) => i,
+            None => return,
+        };
+        let target_idx = match state.node_index.get(&edge.target) {
+            Some(&i) => i,
+            None => return,
+        };
+
+        let pos_source = match state.positions.get(&edge.source) {
+            Some(&p) => p,
+            None => return,
+        };
+        let pos_target = match state.positions.get(&edge.target) {
+            Some(&p) => p,
+            None => return,
+        };
+
+        let delta = pos_target - pos_source;
+        let distance = delta.length().max(self.min_distance);
+        let displacement = distance - self.ideal_length;
+
+        // Base attraction, modified by edge strength for temporal/similarity edges
+        let edge_multiplier = if edge.is_temporal {
+            // Temporal edges: use pre-computed similarity * temporal_strength
+            edge.similarity.unwrap_or(1.0) * self.temporal_strength
+        } else if edge.is_similarity {
+            // Similarity edges also use their strength
+            edge.similarity.unwrap_or(1.0)
+        } else {
+            // Regular edges: full strength
+            1.0
+        };
+
+        let force_magnitude = self.attraction * displacement * edge_multiplier * scale;
+
+        let force = delta.normalized() * force_magnitude;
+        forces[source_idx] += force;
+        forces[target_idx] -= force;
     }
 }

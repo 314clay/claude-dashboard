@@ -18,10 +18,11 @@ from components.queries import (
     get_sessions,
     get_overview_metrics,
     get_session_messages,
+    get_session_summary,
     get_tool_usage,
     get_project_session_graph_data,
 )
-from components.summarizer import generate_partial_summary
+from components.summarizer import generate_partial_summary, get_or_create_summary
 from components.importance_scorer import (
     backfill_importance_scores,
     get_importance_stats,
@@ -131,6 +132,37 @@ def partial_summary(
     if result is None:
         return {"error": "Failed to generate summary - no messages found"}
     return result
+
+
+@app.get("/session/{session_id}/summary")
+def session_summary(
+    session_id: str,
+    generate: bool = Query(default=False, description="Generate summary if it doesn't exist"),
+):
+    """Get the full session summary from the database.
+
+    Returns summary, user_requests, completed_work, topics, detected_project.
+    If generate=true, will create the summary via AI if it doesn't exist (may take 2-5 seconds).
+    """
+    # Fast path: just check database
+    result = get_session_summary(session_id)
+    if result is not None:
+        return {"exists": True, "generated": False, **result}
+
+    # No summary exists
+    if not generate:
+        return {"exists": False, "generated": False}
+
+    # Generate new summary via AI
+    result = get_or_create_summary(session_id)
+    if result is None:
+        return {"exists": False, "generated": False, "error": "Failed to generate summary"}
+
+    # Convert datetime to ISO string if present
+    if result.get('generated_at') and hasattr(result['generated_at'], 'isoformat'):
+        result['generated_at'] = result['generated_at'].isoformat()
+
+    return {"exists": True, "generated": True, **result}
 
 
 @app.get("/tools")

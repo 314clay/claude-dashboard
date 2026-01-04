@@ -1,6 +1,6 @@
 //! HTTP client for the dashboard API.
 
-use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData};
+use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SessionSummaryData};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -18,6 +18,15 @@ struct GraphResponse {
 #[derive(Debug, Deserialize)]
 struct HealthResponse {
     status: String,
+}
+
+/// Importance scoring statistics from the API
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportanceStats {
+    pub total_messages: i64,
+    pub scored_messages: i64,
+    pub unscored_messages: i64,
+    pub sessions_with_unscored: i64,
 }
 
 pub struct ApiClient {
@@ -108,6 +117,60 @@ impl ApiClient {
         }
 
         Ok(summary)
+    }
+
+    /// Fetch full session summary from the database, optionally generating if missing
+    pub fn fetch_session_summary(
+        &self,
+        session_id: &str,
+        generate_if_missing: bool,
+    ) -> Result<SessionSummaryData, String> {
+        let url = format!(
+            "{}/session/{}/summary?generate={}",
+            self.base_url, session_id, generate_if_missing
+        );
+
+        // Longer timeout if we might generate via AI
+        let timeout = if generate_if_missing { 30 } else { 5 };
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(timeout))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let summary: SessionSummaryData = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(summary)
+    }
+
+    /// Fetch importance scoring statistics
+    pub fn fetch_importance_stats(&self) -> Result<ImportanceStats, String> {
+        let url = format!("{}/importance/stats", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let stats: ImportanceStats = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(stats)
     }
 }
 

@@ -1,8 +1,9 @@
 //! Main application state and UI.
 
-use crate::api::ApiClient;
-use crate::graph::types::PartialSummaryData;
+use crate::api::{ApiClient, ImportanceStats};
+use crate::graph::types::{PartialSummaryData, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
+use crate::settings::Settings;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
@@ -46,6 +47,26 @@ impl TimeRange {
             TimeRange::Month3 => "Past 3 months",
         }
     }
+
+    fn from_hours(hours: f32) -> Self {
+        if hours <= 1.0 {
+            TimeRange::Hour1
+        } else if hours <= 6.0 {
+            TimeRange::Hour6
+        } else if hours <= 24.0 {
+            TimeRange::Hour24
+        } else if hours <= 72.0 {
+            TimeRange::Day3
+        } else if hours <= 168.0 {
+            TimeRange::Week1
+        } else if hours <= 336.0 {
+            TimeRange::Week2
+        } else if hours <= 720.0 {
+            TimeRange::Month1
+        } else {
+            TimeRange::Month3
+        }
+    }
 }
 
 /// Main dashboard application
@@ -76,6 +97,8 @@ pub struct DashboardApp {
     // Importance filtering
     importance_threshold: f32,
     importance_filter_enabled: bool,
+    size_by_importance: bool,
+    importance_stats: Option<ImportanceStats>,
 
     // Viewport state
     pan_offset: Vec2,
@@ -92,7 +115,7 @@ pub struct DashboardApp {
     frame_times: Vec<f32>,
     fps: f32,
 
-    // Summary panel state
+    // Summary panel state (point-in-time)
     summary_node_id: Option<String>,
     summary_session_id: Option<String>,
     summary_timestamp: Option<String>,
@@ -101,29 +124,59 @@ pub struct DashboardApp {
     summary_error: Option<String>,
     summary_receiver: Option<Receiver<Result<PartialSummaryData, String>>>,
 
+    // Session summary state (full session)
+    session_summary_data: Option<SessionSummaryData>,
+    session_summary_loading: bool,
+    session_summary_receiver: Option<Receiver<Result<SessionSummaryData, String>>>,
+
     // Double-click detection
     last_click_time: Instant,
     last_click_node: Option<String>,
+
+    // Settings persistence
+    settings: Settings,
+    settings_dirty: bool,
+    last_settings_save: Instant,
 }
 
 impl DashboardApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Load saved settings
+        let settings = Settings::load();
+
+        // Create layout with saved physics settings
+        let mut layout = ForceLayout::default();
+        layout.repulsion = settings.repulsion;
+        layout.attraction = settings.attraction;
+        layout.centering = settings.centering;
+        layout.temporal_strength = settings.temporal_strength;
+
+        // Create graph state with saved settings
+        let mut graph = GraphState::new();
+        graph.physics_enabled = settings.physics_enabled;
+        graph.color_by_project = settings.color_by_project;
+        graph.temporal_attraction_enabled = settings.temporal_attraction_enabled;
+        graph.temporal_window_secs = settings.temporal_window_mins as f64 * 60.0;
+        graph.max_temporal_edges = settings.max_temporal_edges;
+
         let mut app = Self {
             api: ApiClient::new(),
             api_connected: false,
             api_error: None,
-            graph: GraphState::new(),
-            layout: ForceLayout::default(),
-            time_range: TimeRange::Hour24,
-            node_size: 15.0,
-            show_arrows: true,
+            graph,
+            layout,
+            time_range: TimeRange::from_hours(settings.time_range_hours),
+            node_size: settings.node_size,
+            show_arrows: settings.show_arrows,
             loading: false,
-            timeline_enabled: true,
-            recency_min_scale: 0.01,
-            recency_decay_rate: 3.0,
-            temporal_edge_opacity: 0.3,
-            importance_threshold: 0.0,
-            importance_filter_enabled: false,
+            timeline_enabled: settings.timeline_enabled,
+            recency_min_scale: settings.recency_min_scale,
+            recency_decay_rate: settings.recency_decay_rate,
+            temporal_edge_opacity: settings.temporal_edge_opacity,
+            importance_threshold: settings.importance_threshold,
+            importance_filter_enabled: settings.importance_filter_enabled,
+            size_by_importance: settings.size_by_importance,
+            importance_stats: None,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
@@ -134,7 +187,7 @@ impl DashboardApp {
             frame_times: Vec::with_capacity(60),
             fps: 0.0,
 
-            // Summary panel state
+            // Summary panel state (point-in-time)
             summary_node_id: None,
             summary_session_id: None,
             summary_timestamp: None,
@@ -143,9 +196,19 @@ impl DashboardApp {
             summary_error: None,
             summary_receiver: None,
 
+            // Session summary state (full session)
+            session_summary_data: None,
+            session_summary_loading: false,
+            session_summary_receiver: None,
+
             // Double-click detection
             last_click_time: Instant::now(),
             last_click_node: None,
+
+            // Settings persistence
+            settings,
+            settings_dirty: false,
+            last_settings_save: Instant::now(),
         };
 
         // Check API connection and load initial data
@@ -174,6 +237,44 @@ impl DashboardApp {
         }
     }
 
+    /// Mark settings as needing to be saved
+    fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
+    }
+
+    /// Copy current UI state to settings struct
+    fn sync_settings_from_ui(&mut self) {
+        self.settings.time_range_hours = self.time_range.hours();
+        self.settings.node_size = self.node_size;
+        self.settings.show_arrows = self.show_arrows;
+        self.settings.timeline_enabled = self.timeline_enabled;
+        self.settings.color_by_project = self.graph.color_by_project;
+        self.settings.importance_threshold = self.importance_threshold;
+        self.settings.importance_filter_enabled = self.importance_filter_enabled;
+        self.settings.size_by_importance = self.size_by_importance;
+        self.settings.physics_enabled = self.graph.physics_enabled;
+        self.settings.repulsion = self.layout.repulsion;
+        self.settings.attraction = self.layout.attraction;
+        self.settings.centering = self.layout.centering;
+        self.settings.temporal_strength = self.layout.temporal_strength;
+        self.settings.temporal_attraction_enabled = self.graph.temporal_attraction_enabled;
+        self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
+        self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
+        self.settings.max_temporal_edges = self.graph.max_temporal_edges;
+        self.settings.recency_min_scale = self.recency_min_scale;
+        self.settings.recency_decay_rate = self.recency_decay_rate;
+    }
+
+    /// Save settings if dirty and enough time has passed (debounce)
+    fn maybe_save_settings(&mut self) {
+        if self.settings_dirty && self.last_settings_save.elapsed().as_secs() >= 2 {
+            self.sync_settings_from_ui();
+            self.settings.save();
+            self.settings_dirty = false;
+            self.last_settings_save = Instant::now();
+        }
+    }
+
     fn load_graph(&mut self) {
         self.loading = true;
 
@@ -186,6 +287,11 @@ impl DashboardApp {
                 );
                 self.graph.load(data, bounds);
                 self.loading = false;
+
+                // Fetch importance stats
+                if let Ok(stats) = self.api.fetch_importance_stats() {
+                    self.importance_stats = Some(stats);
+                }
             }
             Err(e) => {
                 self.api_error = Some(e);
@@ -253,15 +359,30 @@ impl DashboardApp {
             self.summary_data = None;
             self.summary_error = None;
 
-            // Create channel for async result
+            // Also reset session summary state
+            self.session_summary_data = None;
+            self.session_summary_loading = true;
+
+            // Create channels for async results
             let (tx, rx) = mpsc::channel();
             self.summary_receiver = Some(rx);
 
-            // Spawn thread to fetch summary
+            let (session_tx, session_rx) = mpsc::channel();
+            self.session_summary_receiver = Some(session_rx);
+
+            // Spawn thread to fetch point-in-time summary
             let api = ApiClient::new();
+            let session_id_for_partial = session_id.clone();
             std::thread::spawn(move || {
-                let result = api.fetch_partial_summary(&session_id, &timestamp);
+                let result = api.fetch_partial_summary(&session_id_for_partial, &timestamp);
                 let _ = tx.send(result);
+            });
+
+            // Spawn thread to fetch full session summary (generate if missing)
+            let api2 = ApiClient::new();
+            std::thread::spawn(move || {
+                let result = api2.fetch_session_summary(&session_id, true);
+                let _ = session_tx.send(result);
             });
         }
     }
@@ -315,6 +436,7 @@ impl DashboardApp {
 
                 if self.time_range != prev_range {
                     self.load_graph();
+                    self.mark_settings_dirty();
                 }
 
                 ui.add_space(5.0);
@@ -344,18 +466,29 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Display")
             .default_open(true)
             .show(ui, |ui| {
-                ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size"));
-                ui.checkbox(&mut self.show_arrows, "Show arrows");
-                ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber");
+                if ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.checkbox(&mut self.size_by_importance, "Size by importance").changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.checkbox(&mut self.show_arrows, "Show arrows").changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber").changed() {
+                    self.mark_settings_dirty();
+                }
 
                 ui.add_space(5.0);
                 ui.label("Color by:");
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
                         self.graph.color_by_project = true;
+                        self.mark_settings_dirty();
                     }
                     if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
                         self.graph.color_by_project = false;
+                        self.mark_settings_dirty();
                     }
                 });
             });
@@ -364,16 +497,26 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Filtering")
             .default_open(true)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance");
+                if ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance").changed() {
+                    self.mark_settings_dirty();
+                }
                 if self.importance_filter_enabled {
-                    ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
+                    if ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
                         .text("Min importance")
-                        .fixed_decimals(2));
+                        .fixed_decimals(2)).changed() {
+                        self.mark_settings_dirty();
+                    }
                     // Show count
                     let visible = self.graph.data.nodes.iter()
                         .filter(|n| n.importance_score.map_or(true, |s| s >= self.importance_threshold))
                         .count();
                     ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
+                }
+
+                // Show importance scoring stats
+                if let Some(ref stats) = self.importance_stats {
+                    ui.add_space(5.0);
+                    ui.label(format!("Scored: {} / {}", stats.scored_messages, stats.total_messages));
                 }
             });
 
@@ -381,17 +524,29 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Advanced")
             .default_open(false)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled");
+                if ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled").changed() {
+                    self.mark_settings_dirty();
+                }
                 ui.add_space(5.0);
                 ui.label("Physics Tuning");
-                ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion"));
-                ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction"));
-                ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering"));
+                if ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
+                    self.mark_settings_dirty();
+                }
 
                 ui.add_space(10.0);
                 ui.label("Recency Scaling");
-                ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale"));
-                ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate"));
+                if ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate")).changed() {
+                    self.mark_settings_dirty();
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -402,12 +557,15 @@ impl DashboardApp {
                 ui.checkbox(&mut new_temporal_enabled, "Enable temporal edges");
                 if new_temporal_enabled != temporal_enabled {
                     self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
+                    self.mark_settings_dirty();
                 }
 
                 if self.graph.temporal_attraction_enabled {
-                    ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
+                    if ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
                         .logarithmic(true)
-                        .text("Strength"));
+                        .text("Strength")).changed() {
+                        self.mark_settings_dirty();
+                    }
 
                     // Temporal window slider (in minutes for UX, stored as seconds)
                     let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
@@ -417,12 +575,45 @@ impl DashboardApp {
                         .fixed_decimals(0));
                     if (window_mins - prev_window_mins).abs() > 0.1 {
                         self.graph.set_temporal_window(window_mins as f64 * 60.0);
+                        self.mark_settings_dirty();
                     }
 
                     // Temporal edge opacity slider
-                    ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
+                    if ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
                         .text("Edge opacity")
-                        .fixed_decimals(2));
+                        .fixed_decimals(2)).changed() {
+                        self.mark_settings_dirty();
+                    }
+
+                    // Max temporal edges dropdown
+                    let edge_limits = [
+                        (10_000, "10k"),
+                        (50_000, "50k"),
+                        (100_000, "100k"),
+                        (250_000, "250k"),
+                        (500_000, "500k"),
+                        (1_000_000, "1M"),
+                    ];
+                    let current_limit = self.graph.max_temporal_edges;
+                    let current_label = edge_limits.iter()
+                        .find(|(v, _)| *v == current_limit)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Custom");
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max edges:");
+                        egui::ComboBox::from_id_salt("max_temporal_edges")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in edge_limits {
+                                    if ui.selectable_label(current_limit == value, label).clicked() {
+                                        self.graph.set_max_temporal_edges(value);
+                                        self.settings.max_temporal_edges = value;
+                                        self.mark_settings_dirty();
+                                    }
+                                }
+                            });
+                    });
 
                     // Show temporal edge count
                     let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
@@ -581,10 +772,101 @@ impl DashboardApp {
                 if ui.button("Clear").clicked() {
                     self.summary_data = None;
                     self.summary_node_id = None;
+                    self.session_summary_data = None;
                 }
             } else {
                 ui.label("Double-click a node to generate");
                 ui.label("a summary up to that point.");
+            }
+        });
+
+        // Session Summary Panel (full session)
+        ui.collapsing("Session Summary", |ui| {
+            if self.session_summary_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Generating summary...");
+                });
+            } else if let Some(ref data) = self.session_summary_data {
+                // Check for errors first
+                if let Some(ref err) = data.error {
+                    ui.colored_label(Color32::RED, format!("Error: {}", err));
+                } else if !data.exists {
+                    ui.label("No summary could be generated.");
+                } else {
+                    // Show "just generated" badge if applicable
+                    if data.generated {
+                        ui.colored_label(Color32::from_rgb(34, 197, 94), "✓ Just generated");
+                        ui.add_space(5.0);
+                    }
+
+                    // Project and topics
+                    if let Some(ref project) = data.detected_project {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Project:").strong());
+                            ui.label(project);
+                        });
+                    }
+
+                    if let Some(ref topics) = data.topics {
+                        if !topics.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new("Topics:").strong());
+                                for topic in topics.iter().take(5) {
+                                    ui.label(format!("[{}]", topic));
+                                }
+                            });
+                        }
+                    }
+
+                    ui.add_space(5.0);
+
+                    // Summary paragraph
+                    if let Some(ref summary) = data.summary {
+                        ui.label(egui::RichText::new("Summary").strong());
+                        egui::ScrollArea::vertical()
+                            .max_height(100.0)
+                            .id_salt("session_summary_scroll")
+                            .show(ui, |ui| {
+                                ui.label(summary);
+                            });
+                        ui.add_space(5.0);
+                    }
+
+                    // Completed work
+                    if let Some(ref completed) = data.completed_work {
+                        if !completed.is_empty() {
+                            ui.label(egui::RichText::new("Completed Work").strong().color(Color32::GREEN));
+                            egui::ScrollArea::vertical()
+                                .max_height(80.0)
+                                .id_salt("session_completed_scroll")
+                                .show(ui, |ui| {
+                                    for line in completed.split('\n').filter(|l| !l.is_empty()) {
+                                        ui.label(line);
+                                    }
+                                });
+                            ui.add_space(5.0);
+                        }
+                    }
+
+                    // User requests
+                    if let Some(ref requests) = data.user_requests {
+                        if !requests.is_empty() {
+                            ui.label(egui::RichText::new("User Requests").strong().color(Color32::from_rgb(100, 149, 237)));
+                            egui::ScrollArea::vertical()
+                                .max_height(60.0)
+                                .id_salt("session_requests_scroll")
+                                .show(ui, |ui| {
+                                    for line in requests.split('\n').filter(|l| !l.is_empty()) {
+                                        ui.label(line);
+                                    }
+                                });
+                        }
+                    }
+                }
+            } else {
+                ui.label("Double-click a node to see");
+                ui.label("the full session summary.");
             }
         });
 
@@ -802,7 +1084,15 @@ impl DashboardApp {
                     1.0 // No time range = all same size
                 };
 
-                let base_size = self.node_size * self.zoom * recency_scale;
+                // Importance scaling: scale node radius by importance score
+                let importance_scale = if self.size_by_importance {
+                    // Use importance score (0.3 to 1.0 range to keep minimum visible)
+                    node.importance_score.unwrap_or(0.5) * 0.7 + 0.3
+                } else {
+                    1.0
+                };
+
+                let base_size = self.node_size * self.zoom * recency_scale * importance_scale;
                 let size = if is_hovered || is_selected {
                     base_size * 1.3
                 } else {
@@ -874,13 +1164,38 @@ impl DashboardApp {
                         Some(score) => format!("{:.0}%", score * 100.0),
                         None => "—".to_string(),
                     };
+
+                    // Build token info for assistant nodes
+                    let token_str = if node.role == crate::graph::types::Role::Assistant {
+                        let mut parts = Vec::new();
+                        if let Some(output) = node.output_tokens {
+                            parts.push(format!("out: {}", output));
+                        }
+                        if let Some(input) = node.input_tokens {
+                            parts.push(format!("in: {}", input));
+                        }
+                        if let Some(cache) = node.cache_read_tokens {
+                            if cache > 0 {
+                                parts.push(format!("cache: {}", cache));
+                            }
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nTokens: {}", parts.join(", "))
+                        }
+                    } else {
+                        String::new()
+                    };
+
                     let tooltip_text = format!(
-                        "{}\n{}\n\nSession: {}\nProject: {}\nImportance: {}",
+                        "{}\n{}\n\nSession: {}\nProject: {}\nImportance: {}{}",
                         node.role.label(),
                         truncate(&node.content_preview, 80),
                         node.session_short,
                         node.project,
-                        importance_str
+                        importance_str,
+                        token_str
                     );
 
                     let galley = painter.layout_no_wrap(
@@ -1092,8 +1407,9 @@ impl DashboardApp {
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_fps();
+        self.maybe_save_settings();
 
-        // Check for summary result from background thread
+        // Check for point-in-time summary result from background thread
         if let Some(ref rx) = self.summary_receiver {
             match rx.try_recv() {
                 Ok(Ok(data)) => {
@@ -1114,6 +1430,30 @@ impl eframe::App for DashboardApp {
                     self.summary_error = Some("Summary request cancelled".to_string());
                     self.summary_loading = false;
                     self.summary_receiver = None;
+                }
+            }
+        }
+
+        // Check for session summary result from background thread
+        if let Some(ref rx) = self.session_summary_receiver {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.session_summary_data = Some(data);
+                    self.session_summary_loading = false;
+                    self.session_summary_receiver = None;
+                }
+                Ok(Err(_)) => {
+                    // Session summary failed, but don't show error (it's optional)
+                    self.session_summary_loading = false;
+                    self.session_summary_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still loading, request repaint to check again
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.session_summary_loading = false;
+                    self.session_summary_receiver = None;
                 }
             }
         }
@@ -1172,6 +1512,14 @@ impl eframe::App for DashboardApp {
             .show(ctx, |ui| {
                 self.render_graph(ui);
             });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Force save settings on exit
+        if self.settings_dirty {
+            self.sync_settings_from_ui();
+            self.settings.save();
+        }
     }
 }
 

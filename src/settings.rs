@@ -1,6 +1,5 @@
 //! Persistent settings for the dashboard app.
 
-use crate::graph::types::RoleFilter;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,14 +15,14 @@ pub struct Settings {
     pub timeline_enabled: bool,
     pub size_by_importance: bool,
     pub color_by_project: bool,
+    #[serde(default)]
     pub timeline_spacing_even: bool,
+    #[serde(default = "default_timeline_speed")]
     pub timeline_speed: f32,
 
     // Filtering
     pub importance_threshold: f32,
     pub importance_filter_enabled: bool,
-    #[serde(default)]
-    pub role_filter: RoleFilter,
 
     // Physics
     pub physics_enabled: bool,
@@ -35,10 +34,20 @@ pub struct Settings {
     pub temporal_attraction_enabled: bool,
     pub temporal_window_mins: f32,
     pub temporal_edge_opacity: f32,
+    #[serde(default = "default_max_temporal_edges")]
+    pub max_temporal_edges: usize,
 
     // Recency Scaling
     pub recency_min_scale: f32,
     pub recency_decay_rate: f32,
+}
+
+fn default_timeline_speed() -> f32 {
+    1.0
+}
+
+fn default_max_temporal_edges() -> usize {
+    100_000
 }
 
 impl Default for Settings {
@@ -59,7 +68,6 @@ impl Default for Settings {
             // Filtering
             importance_threshold: 0.0,
             importance_filter_enabled: false,
-            role_filter: RoleFilter::default(),
 
             // Physics
             physics_enabled: true,
@@ -71,6 +79,7 @@ impl Default for Settings {
             temporal_attraction_enabled: true,
             temporal_window_mins: 5.0,
             temporal_edge_opacity: 0.3,
+            max_temporal_edges: 100_000,
 
             // Recency Scaling
             recency_min_scale: 0.01,
