@@ -20,6 +20,14 @@ struct HealthResponse {
     status: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportanceStats {
+    pub total_messages: i64,
+    pub scored_messages: i64,
+    pub unscored_messages: i64,
+    pub sessions_with_unscored: i64,
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -108,6 +116,51 @@ impl ApiClient {
         }
 
         Ok(summary)
+    }
+
+    /// Fetch importance scoring statistics
+    pub fn fetch_importance_stats(&self) -> Result<ImportanceStats, String> {
+        let url = format!("{}/importance/stats", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        resp.json()
+            .map_err(|e| format!("Failed to parse response: {}", e))
+    }
+
+    /// Trigger importance scoring for unprocessed messages
+    /// If since_days is Some, only score sessions with messages in the past N days
+    pub fn trigger_importance_backfill(&self, since_days: Option<f32>) -> Result<serde_json::Value, String> {
+        let mut url = format!(
+            "{}/importance/backfill?staleness_days=0&max_sessions=500&parallel=20",
+            self.base_url
+        );
+        if let Some(days) = since_days {
+            url.push_str(&format!("&since_days={}", days));
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(300)) // 5 min timeout for large backfills
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        resp.json()
+            .map_err(|e| format!("Failed to parse response: {}", e))
     }
 }
 

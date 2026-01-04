@@ -22,11 +22,12 @@ from components.queries import (
     get_project_session_graph_data,
 )
 from components.summarizer import generate_partial_summary
-from components.importance_scorer import (
+from components.importance import (
     backfill_importance_scores,
     get_importance_stats,
-    score_session,
+    SessionContextManager,
 )
+from components.importance.backfill import score_single_session
 
 from project_detection import (
     get_project_summary,
@@ -191,26 +192,46 @@ def importance_stats():
 @app.post("/importance/backfill")
 def importance_backfill(
     max_sessions: int = Query(default=50, description="Max sessions to process"),
-    batch_size: int = Query(default=25, description="Messages per LLM call"),
+    staleness_days: float = Query(default=1.0, description="Days of inactivity before scoring"),
+    batch_size: int = Query(default=100, description="Messages per LLM call"),
+    parallel: int = Query(default=1, description="Parallel workers (1=sequential, 5=recommended)"),
+    since_days: float = Query(default=None, description="Only process sessions with messages in past N days"),
 ):
     """Backfill importance scores for unscored messages.
 
-    Calls Gemini to score messages on importance (0.0-1.0).
-    This may take 2-5 seconds per session.
+    Two-phase approach:
+    1. Creates session summary (expensive, ~$0.01) if needed
+    2. Scores messages using summary context (cheap per message)
+
+    Only processes sessions with no activity for staleness_days.
+    Use parallel=5 for ~5x speedup.
+    Use since_days to limit to recent sessions only.
     """
-    return backfill_importance_scores(max_sessions, batch_size)
+    return backfill_importance_scores(max_sessions, staleness_days, batch_size, parallel, since_days)
 
 
 @app.post("/importance/session/{session_id}")
 def importance_score_session(
     session_id: str,
-    batch_size: int = Query(default=25, description="Messages per LLM call"),
+    batch_size: int = Query(default=100, description="Messages per LLM call"),
 ):
     """Score messages in a specific session.
 
-    Calls Gemini to score unscored messages in the session.
+    Gets or creates session context, then scores all unscored messages.
     """
-    return score_session(session_id, batch_size)
+    return score_single_session(session_id, batch_size)
+
+
+@app.get("/importance/stale")
+def importance_stale(
+    threshold: int = Query(default=10, description="Message count difference to consider stale"),
+):
+    """Get sessions with stale contexts (many new messages since summary generation).
+
+    Use this to identify sessions that may need re-summarization.
+    """
+    manager = SessionContextManager()
+    return {"stale_sessions": manager.get_stale_sessions(threshold)}
 
 
 if __name__ == "__main__":

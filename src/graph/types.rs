@@ -4,6 +4,42 @@ use egui::Pos2;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+/// Timeline spacing mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimelineSpacingMode {
+    #[default]
+    TimeBased,
+    EvenSpacing,
+}
+
+/// Role filter for hiding specific message types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RoleFilter {
+    #[default]
+    ShowAll,
+    HideClaude,
+    HideUser,
+}
+
+impl RoleFilter {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RoleFilter::ShowAll => "Show All",
+            RoleFilter::HideClaude => "Hide Claude",
+            RoleFilter::HideUser => "Hide You",
+        }
+    }
+
+    /// Check if a role should be visible under this filter
+    pub fn is_visible(&self, role: &Role) -> bool {
+        match self {
+            RoleFilter::ShowAll => true,
+            RoleFilter::HideClaude => *role != Role::Assistant,
+            RoleFilter::HideUser => *role != Role::User,
+        }
+    }
+}
+
 /// Role of a message in the conversation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -117,7 +153,27 @@ pub struct GraphEdge {
     pub is_topic: bool,
     #[serde(default)]
     pub is_similarity: bool,
+    #[serde(default)]
+    pub is_temporal: bool,
+    /// Strength multiplier for this edge (used by temporal and similarity edges)
     pub similarity: Option<f32>,
+}
+
+impl GraphEdge {
+    /// Create a temporal edge between two nodes
+    pub fn temporal(source: String, target: String, strength: f32) -> Self {
+        Self {
+            source,
+            target,
+            session_id: String::new(),
+            timestamp: None,
+            is_obsidian: false,
+            is_topic: false,
+            is_similarity: false,
+            is_temporal: true,
+            similarity: Some(strength),
+        }
+    }
 }
 
 /// Complete graph data from the API
@@ -167,6 +223,8 @@ pub struct TimelineState {
     pub speed: f32,
     /// Set of visible node IDs based on current time window
     pub visible_nodes: HashSet<String>,
+    /// Spacing mode for timeline display
+    pub spacing_mode: TimelineSpacingMode,
 }
 
 impl Default for TimelineState {
@@ -181,6 +239,7 @@ impl Default for TimelineState {
             playing: false,
             speed: 1.0,
             visible_nodes: HashSet::new(),
+            spacing_mode: TimelineSpacingMode::default(),
         }
     }
 }
@@ -239,6 +298,63 @@ impl TimelineState {
         }
         pos
     }
+
+    /// Get position for a node at the given sorted index, respecting spacing mode
+    pub fn position_for_index(&self, index: usize) -> f32 {
+        match self.spacing_mode {
+            TimelineSpacingMode::TimeBased => {
+                if index < self.timestamps.len() {
+                    self.position_at_time(self.timestamps[index])
+                } else {
+                    1.0
+                }
+            }
+            TimelineSpacingMode::EvenSpacing => {
+                let count = self.timestamps.len();
+                if count <= 1 {
+                    1.0
+                } else {
+                    index as f32 / (count - 1) as f32
+                }
+            }
+        }
+    }
+
+    /// Get the sorted index for a given position, respecting spacing mode
+    pub fn index_at_position(&self, pos: f32) -> usize {
+        let count = self.timestamps.len();
+        if count == 0 {
+            return 0;
+        }
+
+        match self.spacing_mode {
+            TimelineSpacingMode::TimeBased => {
+                // Find closest timestamp to the time at this position
+                let target_time = self.time_at_position(pos);
+                let mut best_idx = 0;
+                let mut best_diff = f64::MAX;
+                for (i, &t) in self.timestamps.iter().enumerate() {
+                    let diff = (t - target_time).abs();
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_idx = i;
+                    }
+                }
+                best_idx
+            }
+            TimelineSpacingMode::EvenSpacing => {
+                // Direct mapping: position * (count - 1)
+                let index = (pos * (count - 1) as f32).round() as usize;
+                index.min(count - 1)
+            }
+        }
+    }
+
+    /// Snap position to nearest notch, respecting spacing mode
+    pub fn snap_to_notch_modal(&self, pos: f32) -> f32 {
+        let idx = self.index_at_position(pos);
+        self.position_for_index(idx)
+    }
 }
 
 /// Convert days since epoch to civil date
@@ -280,6 +396,12 @@ pub struct GraphState {
     pub selected_node: Option<String>,
     /// Timeline state
     pub timeline: TimelineState,
+    /// Temporal attraction enabled
+    pub temporal_attraction_enabled: bool,
+    /// Temporal window in seconds (nodes within this window attract)
+    pub temporal_window_secs: f64,
+    /// Session chains: ordered node IDs per session (for importance bridging)
+    pub session_chains: HashMap<String, Vec<String>>,
 }
 
 impl GraphState {
@@ -296,6 +418,9 @@ impl GraphState {
             hovered_node: None,
             selected_node: None,
             timeline: TimelineState::default(),
+            temporal_attraction_enabled: true,
+            temporal_window_secs: 300.0, // 5 minutes default
+            session_chains: HashMap::new(),
         }
     }
 
@@ -310,6 +435,7 @@ impl GraphState {
         self.node_index.clear();
         self.session_colors.clear();
         self.project_colors.clear();
+        self.session_chains.clear();
 
         // Build node index and initialize positions
         for (i, node) in data.nodes.iter().enumerate() {
@@ -338,8 +464,176 @@ impl GraphState {
         self.data = data;
         self.physics_enabled = true;
 
+        // Build session chains from edges (for importance bridging)
+        self.build_session_chains();
+
         // Build timeline data
         self.build_timeline();
+
+        // Build temporal edges (pre-computed at load time)
+        if self.temporal_attraction_enabled {
+            self.build_temporal_edges();
+        }
+    }
+
+    /// Maximum number of temporal edges to prevent performance issues with large datasets.
+    /// Beyond this limit, temporal edges are sampled to stay within budget.
+    const MAX_TEMPORAL_EDGES: usize = 10_000;
+
+    /// Node count threshold above which temporal edges are auto-disabled.
+    const TEMPORAL_EDGE_NODE_LIMIT: usize = 2000;
+
+    /// Build pre-computed temporal edges between nodes close in time.
+    /// Uses sliding window algorithm: O(n) instead of O(n²).
+    ///
+    /// Safety: Limits total temporal edges to MAX_TEMPORAL_EDGES to prevent
+    /// memory and performance issues with large datasets.
+    pub fn build_temporal_edges(&mut self) {
+        // Remove any existing temporal edges first
+        self.data.edges.retain(|e| !e.is_temporal);
+
+        if self.timeline.sorted_indices.is_empty() {
+            return;
+        }
+
+        // Auto-disable for very large datasets to prevent freezing
+        let node_count = self.timeline.sorted_indices.len();
+        if node_count > Self::TEMPORAL_EDGE_NODE_LIMIT {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "Skipping temporal edges: {} nodes exceeds limit of {}",
+                node_count,
+                Self::TEMPORAL_EDGE_NODE_LIMIT
+            );
+            return;
+        }
+
+        let window = self.temporal_window_secs;
+        let mut temporal_edges = Vec::new();
+
+        // Sliding window over sorted timestamps
+        // For each node, connect to all following nodes within the time window
+        for i in 0..node_count {
+            let node_i_idx = self.timeline.sorted_indices[i];
+            let ts_i = self.timeline.timestamps[i];
+
+            for j in (i + 1)..node_count {
+                let ts_j = self.timeline.timestamps[j];
+                let dt = ts_j - ts_i;
+
+                // Since sorted, if we exceed window we're done with this node
+                if dt > window {
+                    break;
+                }
+
+                let node_j_idx = self.timeline.sorted_indices[j];
+
+                // Strength decays linearly from 1.0 to 0.0 over the window
+                let strength = 1.0 - (dt / window) as f32;
+
+                let source_id = self.data.nodes[node_i_idx].id.clone();
+                let target_id = self.data.nodes[node_j_idx].id.clone();
+
+                temporal_edges.push(GraphEdge::temporal(source_id, target_id, strength));
+
+                // Hard cap to prevent runaway memory/performance issues
+                if temporal_edges.len() >= Self::MAX_TEMPORAL_EDGES {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "Hit temporal edge limit of {} (window: {}s)",
+                        Self::MAX_TEMPORAL_EDGES,
+                        window
+                    );
+                    self.data.edges.extend(temporal_edges);
+                    return;
+                }
+            }
+        }
+
+        // Debug: temporal edges created
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "Built {} temporal edges (window: {}s, nodes: {})",
+            temporal_edges.len(),
+            window,
+            node_count
+        );
+
+        self.data.edges.extend(temporal_edges);
+    }
+
+    /// Rebuild temporal edges with a new window size
+    pub fn set_temporal_window(&mut self, window_secs: f64) {
+        self.temporal_window_secs = window_secs;
+        if self.temporal_attraction_enabled {
+            self.build_temporal_edges();
+        }
+    }
+
+    /// Toggle temporal attraction on/off
+    pub fn set_temporal_attraction_enabled(&mut self, enabled: bool) {
+        self.temporal_attraction_enabled = enabled;
+        if enabled {
+            self.build_temporal_edges();
+        } else {
+            // Remove temporal edges
+            self.data.edges.retain(|e| !e.is_temporal);
+        }
+    }
+
+    /// Build session chains: ordered node IDs per session.
+    /// Used for "bridging" edges when nodes are filtered by importance.
+    fn build_session_chains(&mut self) {
+        self.session_chains.clear();
+
+        // Build chains by traversing non-temporal edges (sequential session edges)
+        // Each edge source→target means target comes after source in that session
+        for edge in &self.data.edges {
+            if edge.is_temporal || edge.is_similarity || edge.is_topic || edge.is_obsidian {
+                continue; // Skip non-session edges
+            }
+
+            let chain = self
+                .session_chains
+                .entry(edge.session_id.clone())
+                .or_insert_with(Vec::new);
+
+            // If chain is empty, add source first
+            if chain.is_empty() {
+                chain.push(edge.source.clone());
+            }
+            chain.push(edge.target.clone());
+        }
+    }
+
+    /// Get the next visible node in the session chain after the given node.
+    /// Considers both importance threshold and role filter.
+    /// Returns None if no next visible node exists.
+    pub fn next_visible_in_chain(
+        &self,
+        node_id: &str,
+        importance_threshold: f32,
+        role_filter: RoleFilter,
+    ) -> Option<String> {
+        // Find which session this node belongs to
+        let node = self.get_node(node_id)?;
+        let chain = self.session_chains.get(&node.session_id)?;
+
+        // Find position of current node in chain
+        let pos = chain.iter().position(|id| id == node_id)?;
+
+        // Look for next visible node (must pass both importance and role filter)
+        for next_id in chain.iter().skip(pos + 1) {
+            if let Some(next_node) = self.get_node(next_id) {
+                let score = next_node.importance_score.unwrap_or(1.0);
+                let passes_importance = score >= importance_threshold;
+                let passes_role = role_filter.is_visible(&next_node.role);
+                if passes_importance && passes_role {
+                    return Some(next_id.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Build timeline sorted indices and timestamps
@@ -376,14 +670,38 @@ impl GraphState {
     pub fn update_visible_nodes(&mut self) {
         self.timeline.visible_nodes.clear();
 
-        let start_time = self.timeline.time_at_position(self.timeline.start_position);
-        let end_time = self.timeline.time_at_position(self.timeline.position);
+        let count = self.timeline.sorted_indices.len();
+        if count == 0 {
+            return;
+        }
 
-        for (i, &idx) in self.timeline.sorted_indices.iter().enumerate() {
-            let t = self.timeline.timestamps[i];
-            if t >= start_time && t <= end_time {
-                if let Some(node) = self.data.nodes.get(idx) {
-                    self.timeline.visible_nodes.insert(node.id.clone());
+        match self.timeline.spacing_mode {
+            TimelineSpacingMode::TimeBased => {
+                // Original time-based logic
+                let start_time = self.timeline.time_at_position(self.timeline.start_position);
+                let end_time = self.timeline.time_at_position(self.timeline.position);
+
+                for (i, &idx) in self.timeline.sorted_indices.iter().enumerate() {
+                    let t = self.timeline.timestamps[i];
+                    if t >= start_time && t <= end_time {
+                        if let Some(node) = self.data.nodes.get(idx) {
+                            self.timeline.visible_nodes.insert(node.id.clone());
+                        }
+                    }
+                }
+            }
+            TimelineSpacingMode::EvenSpacing => {
+                // Index-based visibility
+                let start_idx = self.timeline.index_at_position(self.timeline.start_position);
+                let end_idx = self.timeline.index_at_position(self.timeline.position);
+
+                for i in start_idx..=end_idx {
+                    if i < self.timeline.sorted_indices.len() {
+                        let node_idx = self.timeline.sorted_indices[i];
+                        if let Some(node) = self.data.nodes.get(node_idx) {
+                            self.timeline.visible_nodes.insert(node.id.clone());
+                        }
+                    }
                 }
             }
         }

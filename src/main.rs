@@ -5,6 +5,7 @@
 mod api;
 mod app;
 mod graph;
+mod settings;
 
 use eframe::egui;
 use tracing_subscriber;
