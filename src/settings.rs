@@ -3,6 +3,55 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Preset configurations for node sizing formula
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SizingPreset {
+    #[default]
+    Balanced,
+    ImportanceFocused,
+    RecencyFocused,
+    TokenFocused,
+    Uniform,
+    Custom,
+}
+
+impl SizingPreset {
+    /// Get display label for the preset
+    pub fn label(&self) -> &'static str {
+        match self {
+            SizingPreset::Balanced => "Balanced",
+            SizingPreset::ImportanceFocused => "Importance-focused",
+            SizingPreset::RecencyFocused => "Recency-focused",
+            SizingPreset::TokenFocused => "Token-focused",
+            SizingPreset::Uniform => "Uniform",
+            SizingPreset::Custom => "Custom",
+        }
+    }
+
+    /// Get the weight values for this preset (w_imp, w_tok, w_time)
+    pub fn weights(&self) -> (f32, f32, f32) {
+        match self {
+            SizingPreset::Balanced => (0.5, 0.3, 0.5),
+            SizingPreset::ImportanceFocused => (1.0, 0.1, 0.2),
+            SizingPreset::RecencyFocused => (0.2, 0.1, 1.0),
+            SizingPreset::TokenFocused => (0.1, 1.0, 0.2),
+            SizingPreset::Uniform => (0.0, 0.0, 0.0),
+            SizingPreset::Custom => (0.5, 0.3, 0.5), // Default values for custom
+        }
+    }
+
+    /// All presets for UI iteration (excludes Custom since it's auto-selected)
+    pub fn all() -> &'static [SizingPreset] {
+        &[
+            SizingPreset::Balanced,
+            SizingPreset::ImportanceFocused,
+            SizingPreset::RecencyFocused,
+            SizingPreset::TokenFocused,
+            SizingPreset::Uniform,
+        ]
+    }
+}
+
 /// All persistable UI settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -13,8 +62,19 @@ pub struct Settings {
     pub node_size: f32,
     pub show_arrows: bool,
     pub timeline_enabled: bool,
-    pub size_by_importance: bool,
     pub color_by_project: bool,
+
+    // Node Sizing (unified formula)
+    #[serde(default)]
+    pub sizing_preset: SizingPreset,
+    #[serde(default = "default_w_importance")]
+    pub w_importance: f32,
+    #[serde(default = "default_w_tokens")]
+    pub w_tokens: f32,
+    #[serde(default = "default_w_time")]
+    pub w_time: f32,
+    #[serde(default = "default_max_node_multiplier")]
+    pub max_node_multiplier: f32,
     #[serde(default)]
     pub timeline_spacing_even: bool,
     #[serde(default = "default_timeline_speed")]
@@ -36,10 +96,6 @@ pub struct Settings {
     pub temporal_edge_opacity: f32,
     #[serde(default = "default_max_temporal_edges")]
     pub max_temporal_edges: usize,
-
-    // Recency Scaling
-    pub recency_min_scale: f32,
-    pub recency_decay_rate: f32,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -48,6 +104,22 @@ fn default_timeline_speed() -> f32 {
 
 fn default_max_temporal_edges() -> usize {
     100_000
+}
+
+fn default_w_importance() -> f32 {
+    0.5
+}
+
+fn default_w_tokens() -> f32 {
+    0.3
+}
+
+fn default_w_time() -> f32 {
+    0.5
+}
+
+fn default_max_node_multiplier() -> f32 {
+    10.0
 }
 
 impl Default for Settings {
@@ -60,10 +132,16 @@ impl Default for Settings {
             node_size: 15.0,
             show_arrows: true,
             timeline_enabled: true,
-            size_by_importance: false,
             color_by_project: true,
             timeline_spacing_even: false,
             timeline_speed: 1.0,
+
+            // Node Sizing
+            sizing_preset: SizingPreset::Balanced,
+            w_importance: 0.5,
+            w_tokens: 0.3,
+            w_time: 0.5,
+            max_node_multiplier: 10.0,
 
             // Filtering
             importance_threshold: 0.0,
@@ -80,10 +158,6 @@ impl Default for Settings {
             temporal_window_mins: 5.0,
             temporal_edge_opacity: 0.3,
             max_temporal_edges: 100_000,
-
-            // Recency Scaling
-            recency_min_scale: 0.01,
-            recency_decay_rate: 3.0,
         }
     }
 }

@@ -60,6 +60,11 @@ pub struct GraphNode {
 }
 
 impl GraphNode {
+    /// Get total tokens (output + input) for sizing
+    pub fn total_tokens(&self) -> i32 {
+        self.output_tokens.unwrap_or(0) + self.input_tokens.unwrap_or(0)
+    }
+
     /// Parse timestamp string to epoch seconds
     pub fn timestamp_secs(&self) -> Option<f64> {
         self.timestamp.as_ref().and_then(|ts| {
@@ -338,6 +343,8 @@ pub struct GraphState {
     pub temporal_window_secs: f64,
     /// Maximum temporal edges to build
     pub max_temporal_edges: usize,
+    /// Maximum total tokens across all nodes (for normalization)
+    pub max_tokens: i32,
 }
 
 impl GraphState {
@@ -357,7 +364,19 @@ impl GraphState {
             temporal_attraction_enabled: true,
             temporal_window_secs: 300.0, // 5 minutes default
             max_temporal_edges: 100_000,
+            max_tokens: 1,
         }
+    }
+
+    /// Normalize token count to 0-1 range using log scale
+    /// Formula: log(tokens + 1) / log(max_tokens + 1)
+    pub fn normalize_tokens(&self, node: &GraphNode) -> f32 {
+        let tokens = node.total_tokens() as f32;
+        let max = self.max_tokens as f32;
+        if max <= 1.0 {
+            return 0.5; // Default when no token data
+        }
+        (tokens + 1.0).ln() / (max + 1.0).ln()
     }
 
     /// Load new graph data, initializing positions randomly
@@ -395,6 +414,13 @@ impl GraphState {
                 self.project_colors.insert(node.project.clone(), hue);
             }
         }
+
+        // Compute max tokens for normalization
+        self.max_tokens = data.nodes.iter()
+            .map(|n| n.total_tokens())
+            .max()
+            .unwrap_or(1)
+            .max(1); // Ensure non-zero for division
 
         self.data = data;
         self.physics_enabled = true;

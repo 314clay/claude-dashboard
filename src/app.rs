@@ -3,7 +3,7 @@
 use crate::api::{ApiClient, ImportanceStats};
 use crate::graph::types::{PartialSummaryData, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
-use crate::settings::Settings;
+use crate::settings::{Settings, SizingPreset};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
@@ -87,9 +87,12 @@ pub struct DashboardApp {
     loading: bool,
     timeline_enabled: bool,
 
-    // Recency scaling
-    recency_min_scale: f32,
-    recency_decay_rate: f32,
+    // Node sizing (unified formula)
+    sizing_preset: SizingPreset,
+    w_importance: f32,
+    w_tokens: f32,
+    w_time: f32,
+    max_node_multiplier: f32,
 
     // Temporal edge opacity
     temporal_edge_opacity: f32,
@@ -97,7 +100,6 @@ pub struct DashboardApp {
     // Importance filtering
     importance_threshold: f32,
     importance_filter_enabled: bool,
-    size_by_importance: bool,
     importance_stats: Option<ImportanceStats>,
 
     // Viewport state
@@ -170,12 +172,14 @@ impl DashboardApp {
             show_arrows: settings.show_arrows,
             loading: false,
             timeline_enabled: settings.timeline_enabled,
-            recency_min_scale: settings.recency_min_scale,
-            recency_decay_rate: settings.recency_decay_rate,
+            sizing_preset: settings.sizing_preset,
+            w_importance: settings.w_importance,
+            w_tokens: settings.w_tokens,
+            w_time: settings.w_time,
+            max_node_multiplier: settings.max_node_multiplier,
             temporal_edge_opacity: settings.temporal_edge_opacity,
             importance_threshold: settings.importance_threshold,
             importance_filter_enabled: settings.importance_filter_enabled,
-            size_by_importance: settings.size_by_importance,
             importance_stats: None,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
@@ -251,7 +255,11 @@ impl DashboardApp {
         self.settings.color_by_project = self.graph.color_by_project;
         self.settings.importance_threshold = self.importance_threshold;
         self.settings.importance_filter_enabled = self.importance_filter_enabled;
-        self.settings.size_by_importance = self.size_by_importance;
+        self.settings.sizing_preset = self.sizing_preset;
+        self.settings.w_importance = self.w_importance;
+        self.settings.w_tokens = self.w_tokens;
+        self.settings.w_time = self.w_time;
+        self.settings.max_node_multiplier = self.max_node_multiplier;
         self.settings.physics_enabled = self.graph.physics_enabled;
         self.settings.repulsion = self.layout.repulsion;
         self.settings.attraction = self.layout.attraction;
@@ -261,8 +269,6 @@ impl DashboardApp {
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
         self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
-        self.settings.recency_min_scale = self.recency_min_scale;
-        self.settings.recency_decay_rate = self.recency_decay_rate;
     }
 
     /// Save settings if dirty and enough time has passed (debounce)
@@ -450,8 +456,12 @@ impl DashboardApp {
                         self.show_arrows = true;
                         self.graph.physics_enabled = true;
                         self.timeline_enabled = true;
-                        self.recency_min_scale = 0.01;
-                        self.recency_decay_rate = 3.0;
+                        // Reset sizing to Balanced preset
+                        self.sizing_preset = SizingPreset::Balanced;
+                        let (w_imp, w_tok, w_time) = SizingPreset::Balanced.weights();
+                        self.w_importance = w_imp;
+                        self.w_tokens = w_tok;
+                        self.w_time = w_time;
                         self.layout.repulsion = 10000.0;
                         self.layout.attraction = 0.1;
                         self.layout.centering = 0.0001;
@@ -467,9 +477,6 @@ impl DashboardApp {
             .default_open(true)
             .show(ui, |ui| {
                 if ui.add(egui::Slider::new(&mut self.node_size, 5.0..=50.0).text("Node size")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.checkbox(&mut self.size_by_importance, "Size by importance").changed() {
                     self.mark_settings_dirty();
                 }
                 if ui.checkbox(&mut self.show_arrows, "Show arrows").changed() {
@@ -491,6 +498,77 @@ impl DashboardApp {
                         self.mark_settings_dirty();
                     }
                 });
+            });
+
+        // Node Sizing section
+        egui::CollapsingHeader::new("Node Sizing")
+            .default_open(true)
+            .show(ui, |ui| {
+                // Preset dropdown
+                let current_label = self.sizing_preset.label();
+                egui::ComboBox::from_id_salt("sizing_preset")
+                    .selected_text(current_label)
+                    .show_ui(ui, |ui| {
+                        for preset in SizingPreset::all() {
+                            if ui.selectable_label(
+                                self.sizing_preset == *preset,
+                                preset.label()
+                            ).clicked() {
+                                self.sizing_preset = *preset;
+                                let (w_imp, w_tok, w_time) = preset.weights();
+                                self.w_importance = w_imp;
+                                self.w_tokens = w_tok;
+                                self.w_time = w_time;
+                                self.mark_settings_dirty();
+                            }
+                        }
+                        // Show Custom as non-selectable label if currently custom
+                        if self.sizing_preset == SizingPreset::Custom {
+                            let _ = ui.selectable_label(true, "Custom");
+                        }
+                    });
+
+                ui.add_space(5.0);
+
+                // Weight sliders (log scale for wide range)
+                if ui.add(egui::Slider::new(&mut self.w_importance, 0.01..=50.0)
+                    .logarithmic(true)
+                    .text("Importance")
+                    .fixed_decimals(2)).changed() {
+                    self.sizing_preset = SizingPreset::Custom;
+                    self.mark_settings_dirty();
+                }
+
+                if ui.add(egui::Slider::new(&mut self.w_tokens, 0.01..=50.0)
+                    .logarithmic(true)
+                    .text("Tokens")
+                    .fixed_decimals(2)).changed() {
+                    self.sizing_preset = SizingPreset::Custom;
+                    self.mark_settings_dirty();
+                }
+
+                if ui.add(egui::Slider::new(&mut self.w_time, 0.01..=50.0)
+                    .logarithmic(true)
+                    .text("Recency")
+                    .fixed_decimals(2)).changed() {
+                    self.sizing_preset = SizingPreset::Custom;
+                    self.mark_settings_dirty();
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Max node size slider
+                if ui.add(egui::Slider::new(&mut self.max_node_multiplier, 1.0..=100.0)
+                    .logarithmic(true)
+                    .text("Max size")
+                    .fixed_decimals(1)).changed() {
+                    self.mark_settings_dirty();
+                }
+
+                // Help text
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Largest node will be this multiple of base size").weak().small());
             });
 
         // Filtering section
@@ -536,15 +614,6 @@ impl DashboardApp {
                     self.mark_settings_dirty();
                 }
                 if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
-                    self.mark_settings_dirty();
-                }
-
-                ui.add_space(10.0);
-                ui.label("Recency Scaling");
-                if ui.add(egui::Slider::new(&mut self.recency_min_scale, 0.001..=1.0).logarithmic(true).text("Min scale")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.recency_decay_rate, 0.1..=100.0).logarithmic(true).text("Decay rate")).changed() {
                     self.mark_settings_dirty();
                 }
 
@@ -1046,8 +1115,12 @@ impl DashboardApp {
         }
         self.graph.hovered_node = new_hovered;
 
-        // Draw nodes (only visible ones when timeline is enabled)
-        for node in &self.graph.data.nodes {
+        // Two-pass node rendering:
+        // Pass 1: Compute all size multipliers and find max
+        let mut node_multipliers: Vec<(usize, f32)> = Vec::new();
+        let mut max_multiplier: f32 = 0.001; // Avoid division by zero
+
+        for (idx, node) in self.graph.data.nodes.iter().enumerate() {
             // Skip hidden nodes when timeline is enabled
             if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
                 continue;
@@ -1062,37 +1135,54 @@ impl DashboardApp {
                 }
             }
 
+            if self.graph.get_pos(&node.id).is_some() {
+                // Unified node sizing formula:
+                // size = base * exp(w_imp * importance) * exp(w_tok * tokens_norm) * exp(-w_time * time_dist)
+
+                // 1. Importance factor (0-1, default 0.5)
+                let importance = node.importance_score.unwrap_or(0.5);
+                let imp_factor = (self.w_importance * importance).exp();
+
+                // 2. Token factor (log-normalized 0-1)
+                let tokens_norm = self.graph.normalize_tokens(node);
+                let tok_factor = (self.w_tokens * tokens_norm).exp();
+
+                // 3. Time/recency factor (distance from scrubber, 0-1)
+                let time_factor = if self.graph.timeline.max_time > self.graph.timeline.min_time {
+                    if let Some(node_time) = node.timestamp_secs() {
+                        let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
+                        let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
+                        let distance = (scrubber_time - node_time).abs();
+                        let normalized_distance = (distance / time_range).clamp(0.0, 1.0) as f32;
+                        (-self.w_time * normalized_distance).exp()
+                    } else {
+                        1.0 // No timestamp = neutral
+                    }
+                } else {
+                    1.0 // No time range = neutral
+                };
+
+                // Combine factors multiplicatively
+                let raw_multiplier = imp_factor * tok_factor * time_factor;
+                node_multipliers.push((idx, raw_multiplier));
+                max_multiplier = max_multiplier.max(raw_multiplier);
+            }
+        }
+
+        // Compute normalization scale: largest node gets max_node_multiplier
+        let scale = self.max_node_multiplier / max_multiplier;
+
+        // Pass 2: Draw nodes with normalized sizes
+        for (idx, raw_multiplier) in node_multipliers {
+            let node = &self.graph.data.nodes[idx];
             if let Some(pos) = self.graph.get_pos(&node.id) {
                 let screen_pos = transform(pos);
                 let is_hovered = self.graph.hovered_node.as_ref() == Some(&node.id);
                 let is_selected = self.graph.selected_node.as_ref() == Some(&node.id);
 
-                // Exponential scaling based on distance from scrubber position
-                let min_s = self.recency_min_scale;
-                let decay = self.recency_decay_rate;
-                let recency_scale = if self.graph.timeline.max_time > self.graph.timeline.min_time {
-                    if let Some(node_time) = node.timestamp_secs() {
-                        let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
-                        let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
-                        let distance = (scrubber_time - node_time).abs();
-                        let normalized_distance = (distance / time_range).clamp(0.0, 1.0);
-                        min_s + (1.0 - min_s) * (-decay * normalized_distance as f32).exp()
-                    } else {
-                        0.5 // No timestamp = medium size
-                    }
-                } else {
-                    1.0 // No time range = all same size
-                };
-
-                // Importance scaling: scale node radius by importance score
-                let importance_scale = if self.size_by_importance {
-                    // Use importance score (0.3 to 1.0 range to keep minimum visible)
-                    node.importance_score.unwrap_or(0.5) * 0.7 + 0.3
-                } else {
-                    1.0
-                };
-
-                let base_size = self.node_size * self.zoom * recency_scale * importance_scale;
+                // Apply normalization and clamp
+                let size_multiplier = (raw_multiplier * scale).clamp(0.05, self.max_node_multiplier);
+                let base_size = self.node_size * self.zoom * size_multiplier;
                 let size = if is_hovered || is_selected {
                     base_size * 1.3
                 } else {
