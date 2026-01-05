@@ -52,6 +52,96 @@ impl SizingPreset {
     }
 }
 
+/// A saved preset of display/physics settings (excludes data selection)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Preset {
+    pub name: String,
+
+    // Display
+    pub node_size: f32,
+    pub show_arrows: bool,
+    pub timeline_enabled: bool,
+    pub color_by_project: bool,
+    pub timeline_speed: f32,
+
+    // Node Sizing
+    pub sizing_preset: SizingPreset,
+    pub w_importance: f32,
+    pub w_tokens: f32,
+    pub w_time: f32,
+    pub max_node_multiplier: f32,
+
+    // Filtering
+    pub importance_threshold: f32,
+    pub importance_filter_enabled: bool,
+
+    // Physics
+    pub physics_enabled: bool,
+    pub repulsion: f32,
+    pub attraction: f32,
+    pub centering: f32,
+    pub temporal_strength: f32,
+    pub temporal_attraction_enabled: bool,
+    pub temporal_window_mins: f32,
+    pub temporal_edge_opacity: f32,
+    pub max_temporal_edges: usize,
+}
+
+impl Preset {
+    /// Create a preset from current settings
+    pub fn from_settings(name: String, settings: &Settings) -> Self {
+        Self {
+            name,
+            node_size: settings.node_size,
+            show_arrows: settings.show_arrows,
+            timeline_enabled: settings.timeline_enabled,
+            color_by_project: settings.color_by_project,
+            timeline_speed: settings.timeline_speed,
+            sizing_preset: settings.sizing_preset,
+            w_importance: settings.w_importance,
+            w_tokens: settings.w_tokens,
+            w_time: settings.w_time,
+            max_node_multiplier: settings.max_node_multiplier,
+            importance_threshold: settings.importance_threshold,
+            importance_filter_enabled: settings.importance_filter_enabled,
+            physics_enabled: settings.physics_enabled,
+            repulsion: settings.repulsion,
+            attraction: settings.attraction,
+            centering: settings.centering,
+            temporal_strength: settings.temporal_strength,
+            temporal_attraction_enabled: settings.temporal_attraction_enabled,
+            temporal_window_mins: settings.temporal_window_mins,
+            temporal_edge_opacity: settings.temporal_edge_opacity,
+            max_temporal_edges: settings.max_temporal_edges,
+        }
+    }
+
+    /// Apply this preset to settings
+    pub fn apply_to(&self, settings: &mut Settings) {
+        settings.node_size = self.node_size;
+        settings.show_arrows = self.show_arrows;
+        settings.timeline_enabled = self.timeline_enabled;
+        settings.color_by_project = self.color_by_project;
+        settings.timeline_speed = self.timeline_speed;
+        settings.sizing_preset = self.sizing_preset;
+        settings.w_importance = self.w_importance;
+        settings.w_tokens = self.w_tokens;
+        settings.w_time = self.w_time;
+        settings.max_node_multiplier = self.max_node_multiplier;
+        settings.importance_threshold = self.importance_threshold;
+        settings.importance_filter_enabled = self.importance_filter_enabled;
+        settings.physics_enabled = self.physics_enabled;
+        settings.repulsion = self.repulsion;
+        settings.attraction = self.attraction;
+        settings.centering = self.centering;
+        settings.temporal_strength = self.temporal_strength;
+        settings.temporal_attraction_enabled = self.temporal_attraction_enabled;
+        settings.temporal_window_mins = self.temporal_window_mins;
+        settings.temporal_edge_opacity = self.temporal_edge_opacity;
+        settings.max_temporal_edges = self.max_temporal_edges;
+    }
+}
+
 /// All persistable UI settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -96,6 +186,10 @@ pub struct Settings {
     pub temporal_edge_opacity: f32,
     #[serde(default = "default_max_temporal_edges")]
     pub max_temporal_edges: usize,
+
+    // Saved presets
+    #[serde(default)]
+    pub presets: Vec<Preset>,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -158,6 +252,9 @@ impl Default for Settings {
             temporal_window_mins: 5.0,
             temporal_edge_opacity: 0.3,
             max_temporal_edges: 100_000,
+
+            // Presets
+            presets: Vec::new(),
         }
     }
 }

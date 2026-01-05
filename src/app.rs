@@ -3,7 +3,7 @@
 use crate::api::{ApiClient, ImportanceStats};
 use crate::graph::types::{PartialSummaryData, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
-use crate::settings::{Settings, SizingPreset};
+use crate::settings::{Preset, Settings, SizingPreset};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
@@ -139,6 +139,10 @@ pub struct DashboardApp {
     settings: Settings,
     settings_dirty: bool,
     last_settings_save: Instant,
+
+    // Preset management
+    preset_name_input: String,
+    selected_preset_index: Option<usize>,
 }
 
 impl DashboardApp {
@@ -213,6 +217,10 @@ impl DashboardApp {
             settings,
             settings_dirty: false,
             last_settings_save: Instant::now(),
+
+            // Preset management
+            preset_name_input: String::new(),
+            selected_preset_index: None,
         };
 
         // Check API connection and load initial data
@@ -269,6 +277,32 @@ impl DashboardApp {
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
         self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
+    }
+
+    /// Copy settings values to UI fields (used when loading a preset)
+    fn sync_ui_from_settings(&mut self) {
+        // Don't sync time_range_hours since presets exclude data selection
+        self.node_size = self.settings.node_size;
+        self.show_arrows = self.settings.show_arrows;
+        self.timeline_enabled = self.settings.timeline_enabled;
+        self.graph.color_by_project = self.settings.color_by_project;
+        self.graph.timeline.speed = self.settings.timeline_speed;
+        self.importance_threshold = self.settings.importance_threshold;
+        self.importance_filter_enabled = self.settings.importance_filter_enabled;
+        self.sizing_preset = self.settings.sizing_preset;
+        self.w_importance = self.settings.w_importance;
+        self.w_tokens = self.settings.w_tokens;
+        self.w_time = self.settings.w_time;
+        self.max_node_multiplier = self.settings.max_node_multiplier;
+        self.graph.physics_enabled = self.settings.physics_enabled;
+        self.layout.repulsion = self.settings.repulsion;
+        self.layout.attraction = self.settings.attraction;
+        self.layout.centering = self.settings.centering;
+        self.layout.temporal_strength = self.settings.temporal_strength;
+        self.graph.temporal_attraction_enabled = self.settings.temporal_attraction_enabled;
+        self.graph.temporal_window_secs = (self.settings.temporal_window_mins * 60.0) as f64;
+        self.temporal_edge_opacity = self.settings.temporal_edge_opacity;
+        self.graph.max_temporal_edges = self.settings.max_temporal_edges;
     }
 
     /// Save settings if dirty and enough time has passed (debounce)
@@ -470,6 +504,78 @@ impl DashboardApp {
                         self.load_graph();
                     }
                 });
+            });
+
+        // Presets section
+        egui::CollapsingHeader::new("Presets")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Dropdown to select a preset
+                let preset_names: Vec<String> = self.settings.presets.iter().map(|p| p.name.clone()).collect();
+                let selected_label = self.selected_preset_index
+                    .and_then(|i| preset_names.get(i).cloned())
+                    .unwrap_or_else(|| "Select preset...".to_string());
+
+                egui::ComboBox::from_id_salt("preset_selector")
+                    .selected_text(&selected_label)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in preset_names.iter().enumerate() {
+                            if ui.selectable_value(&mut self.selected_preset_index, Some(i), name).changed() {
+                                // Apply the preset immediately on selection
+                                if let Some(preset) = self.settings.presets.get(i).cloned() {
+                                    preset.apply_to(&mut self.settings);
+                                    self.sync_ui_from_settings();
+                                    self.mark_settings_dirty();
+                                }
+                            }
+                        }
+                    });
+
+                ui.add_space(5.0);
+
+                // Save current settings as new preset
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.preset_name_input)
+                        .hint_text("Preset name")
+                        .desired_width(120.0));
+
+                    if ui.button("Save").clicked() && !self.preset_name_input.trim().is_empty() {
+                        let name = self.preset_name_input.trim().to_string();
+
+                        // Check if preset with this name exists
+                        if let Some(idx) = self.settings.presets.iter().position(|p| p.name == name) {
+                            // Update existing
+                            self.settings.presets[idx] = Preset::from_settings(name, &self.settings);
+                            self.selected_preset_index = Some(idx);
+                        } else {
+                            // Add new
+                            let preset = Preset::from_settings(name, &self.settings);
+                            self.settings.presets.push(preset);
+                            self.selected_preset_index = Some(self.settings.presets.len() - 1);
+                        }
+                        self.preset_name_input.clear();
+                        self.mark_settings_dirty();
+                    }
+                });
+
+                // Delete selected preset
+                if self.selected_preset_index.is_some() {
+                    ui.add_space(5.0);
+                    if ui.button("Delete selected").clicked() {
+                        if let Some(idx) = self.selected_preset_index {
+                            if idx < self.settings.presets.len() {
+                                self.settings.presets.remove(idx);
+                                self.selected_preset_index = None;
+                                self.mark_settings_dirty();
+                            }
+                        }
+                    }
+                }
+
+                if self.settings.presets.is_empty() {
+                    ui.add_space(5.0);
+                    ui.label("No saved presets yet");
+                }
             });
 
         // Display section
@@ -1278,10 +1384,13 @@ impl DashboardApp {
                         String::new()
                     };
 
+                    let timestamp_str = node.timestamp.as_deref().unwrap_or("N/A");
+
                     let tooltip_text = format!(
-                        "{}\n{}\n\nSession: {}\nProject: {}\nImportance: {}{}",
+                        "{}\n{}\n\nTime: {}\nSession: {}\nProject: {}\nImportance: {}{}",
                         node.role.label(),
                         truncate(&node.content_preview, 80),
+                        timestamp_str,
                         node.session_short,
                         node.project,
                         importance_str,
