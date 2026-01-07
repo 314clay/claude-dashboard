@@ -460,27 +460,135 @@ impl DashboardApp {
             .any(|mode| *mode != SemanticFilterMode::Off)
     }
 
+    /// Build adjacency list from graph edges for BFS neighbor lookup
+    fn build_adjacency_list(&self) -> HashMap<String, Vec<String>> {
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for edge in &self.graph.data.edges {
+            adj.entry(edge.source.clone()).or_default().push(edge.target.clone());
+            adj.entry(edge.target.clone()).or_default().push(edge.source.clone());
+        }
+        adj
+    }
+
+    /// Expand a set of nodes to include neighbors up to given depth using BFS
+    fn expand_to_neighbors(&self, seeds: &HashSet<String>, depth: usize, adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
+        let mut visited = seeds.clone();
+        let mut frontier = seeds.clone();
+
+        for _ in 0..depth {
+            let mut next_frontier = HashSet::new();
+            for node_id in &frontier {
+                if let Some(neighbors) = adj.get(node_id) {
+                    for neighbor in neighbors {
+                        if !visited.contains(neighbor) {
+                            visited.insert(neighbor.clone());
+                            next_frontier.insert(neighbor.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        visited
+    }
+
+    /// Compute the set of nodes visible based on semantic filters
+    /// Returns None if no semantic filters are active
+    /// Returns Some(HashSet) with visible node IDs when filters are active
+    fn compute_semantic_filter_visible_set(&self) -> Option<HashSet<String>> {
+        if !self.has_active_semantic_filters() {
+            return None;
+        }
+
+        // Build adjacency list once for BFS
+        let adj = self.build_adjacency_list();
+
+        // Start with all nodes, then apply filters
+        let all_node_ids: HashSet<String> = self.graph.data.nodes.iter()
+            .map(|n| n.id.clone())
+            .collect();
+
+        let mut visible = all_node_ids.clone();
+
+        for (filter_id, mode) in &self.semantic_filter_modes {
+            match mode {
+                SemanticFilterMode::Off => continue,
+
+                SemanticFilterMode::Exclude => {
+                    // Remove nodes that match this filter
+                    for node in &self.graph.data.nodes {
+                        if node.semantic_filter_matches.contains(filter_id) {
+                            visible.remove(&node.id);
+                        }
+                    }
+                }
+
+                SemanticFilterMode::Include => {
+                    // Only keep nodes that match this filter
+                    let matching: HashSet<String> = self.graph.data.nodes.iter()
+                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
+                        .map(|n| n.id.clone())
+                        .collect();
+                    visible = visible.intersection(&matching).cloned().collect();
+                }
+
+                SemanticFilterMode::IncludePlus1 => {
+                    // Keep matching nodes + their direct neighbors
+                    let matching: HashSet<String> = self.graph.data.nodes.iter()
+                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
+                        .map(|n| n.id.clone())
+                        .collect();
+                    let expanded = self.expand_to_neighbors(&matching, 1, &adj);
+                    visible = visible.intersection(&expanded).cloned().collect();
+                }
+
+                SemanticFilterMode::IncludePlus2 => {
+                    // Keep matching nodes + neighbors up to depth 2
+                    let matching: HashSet<String> = self.graph.data.nodes.iter()
+                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
+                        .map(|n| n.id.clone())
+                        .collect();
+                    let expanded = self.expand_to_neighbors(&matching, 2, &adj);
+                    visible = visible.intersection(&expanded).cloned().collect();
+                }
+            }
+        }
+
+        Some(visible)
+    }
+
     /// Check if a node passes the semantic filter criteria
     /// Returns true if the node should be visible, false if it should be hidden
     fn node_passes_semantic_filters(&self, node: &crate::graph::types::GraphNode) -> bool {
+        // For simple Include/Exclude, do quick per-node check
+        // For +1/+2 modes, we need the pre-computed set (caller should use compute_semantic_filter_visible_set)
         for (filter_id, mode) in &self.semantic_filter_modes {
             match mode {
                 SemanticFilterMode::Off => continue,
                 SemanticFilterMode::Include => {
-                    // Node must match this filter to be visible
                     if !node.semantic_filter_matches.contains(filter_id) {
                         return false;
                     }
                 }
                 SemanticFilterMode::Exclude => {
-                    // Node must NOT match this filter to be visible
                     if node.semantic_filter_matches.contains(filter_id) {
                         return false;
                     }
                 }
+                // For +1/+2, this method is not accurate - use compute_semantic_filter_visible_set instead
+                SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2 => {
+                    // Fall through - will be handled by the pre-computed set
+                    continue;
+                }
             }
         }
         true
+    }
+
+    /// Check if any semantic filter uses expansion modes (+1 or +2)
+    fn has_expansion_semantic_filters(&self) -> bool {
+        self.semantic_filter_modes.values()
+            .any(|mode| matches!(mode, SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2))
     }
 
     /// Compute which nodes should participate in physics simulation
@@ -492,6 +600,9 @@ impl DashboardApp {
         if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active {
             return None;
         }
+
+        // Pre-compute semantic filter visible set (handles +1/+2 expansion)
+        let semantic_visible = self.compute_semantic_filter_visible_set();
 
         let mut visible = HashSet::new();
         for node in &self.graph.data.nodes {
@@ -511,9 +622,11 @@ impl DashboardApp {
             if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                 continue;
             }
-            // Semantic filter - check Include/Exclude modes
-            if semantic_filter_active && !self.node_passes_semantic_filters(node) {
-                continue;
+            // Semantic filter - use pre-computed set for +1/+2, otherwise per-node check
+            if let Some(ref sem_visible) = semantic_visible {
+                if !sem_visible.contains(&node.id) {
+                    continue;
+                }
             }
             visible.insert(node.id.clone());
         }
@@ -575,8 +688,8 @@ impl DashboardApp {
             // Store state
             self.summary_node_id = Some(node_id);
             self.summary_session_id = Some(session_id.clone());
-            self.summary_timestamp = timestamp;
-            self.summary_loading = false; // Point-in-time summary disabled (requires AI)
+            self.summary_timestamp = timestamp.clone();
+            self.summary_loading = true; // Enable point-in-time summary via API
             self.summary_data = None;
             self.summary_error = None;
 
@@ -590,28 +703,42 @@ impl DashboardApp {
             }
             self.summary_window_open = true;
 
-            // Create channel for session summary
+            // Create channels for both summaries
+            let (partial_tx, partial_rx) = mpsc::channel();
             let (session_tx, session_rx) = mpsc::channel();
+            self.summary_receiver = Some(partial_rx);
             self.session_summary_receiver = Some(session_rx);
 
-            // Fetch session summary from database (read-only, no AI generation)
-            match DbClient::new() {
-                Ok(db) => {
-                    std::thread::spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            db.fetch_session_summary(&session_id)
-                        }));
-                        match result {
-                            Ok(r) => { let _ = session_tx.send(r); }
-                            Err(_) => { let _ = session_tx.send(Err("Thread panicked".to_string())); }
-                        }
-                    });
-                }
-                Err(e) => {
-                    self.session_summary_loading = false;
-                    self.summary_error = Some(format!("DB connection error: {}", e));
-                }
+            // Fetch point-in-time summary via API (with AI generation)
+            if let Some(ref ts) = timestamp {
+                let api = ApiClient::new();
+                let sid = session_id.clone();
+                let ts_clone = ts.clone();
+                std::thread::spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        api.fetch_partial_summary(&sid, &ts_clone)
+                    }));
+                    match result {
+                        Ok(r) => { let _ = partial_tx.send(r); }
+                        Err(_) => { let _ = partial_tx.send(Err("Thread panicked".to_string())); }
+                    }
+                });
+            } else {
+                // No timestamp - can't do point-in-time summary
+                self.summary_loading = false;
             }
+
+            // Fetch session summary via API (with generate_if_missing=true)
+            let api = ApiClient::new();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    api.fetch_session_summary(&session_id, true)
+                }));
+                match result {
+                    Ok(r) => { let _ = session_tx.send(r); }
+                    Err(_) => { let _ = session_tx.send(Err("Thread panicked".to_string())); }
+                }
+            });
         }
     }
 
@@ -711,6 +838,9 @@ impl DashboardApp {
     fn get_visible_session_ids(&self) -> Vec<String> {
         let mut session_ids: HashSet<String> = HashSet::new();
 
+        // Pre-compute semantic filter visible set
+        let semantic_visible = self.compute_semantic_filter_visible_set();
+
         for node in &self.graph.data.nodes {
             // Check timeline filter
             if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
@@ -729,8 +859,10 @@ impl DashboardApp {
                 continue;
             }
             // Check semantic filters
-            if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
-                continue;
+            if let Some(ref sem_visible) = semantic_visible {
+                if !sem_visible.contains(&node.id) {
+                    continue;
+                }
             }
 
             session_ids.insert(node.session_id.clone());
@@ -1330,7 +1462,7 @@ impl DashboardApp {
                     });
                 }
 
-                // List existing filters with three-state toggles
+                // List existing filters with five-state toggles
                 if !self.semantic_filters.is_empty() {
                     let filters = self.semantic_filters.clone();
                     for filter in &filters {
@@ -1341,24 +1473,15 @@ impl DashboardApp {
                                 .copied()
                                 .unwrap_or(SemanticFilterMode::Off);
 
-                            // Three-state toggle buttons: Off, Include (+), Exclude (-)
-                            let off_color = if current_mode == SemanticFilterMode::Off {
-                                Color32::from_rgb(100, 100, 120)
-                            } else {
-                                Color32::from_rgb(50, 50, 60)
-                            };
-                            let include_color = if current_mode == SemanticFilterMode::Include {
-                                Color32::from_rgb(34, 197, 94) // Green
-                            } else {
-                                Color32::from_rgb(50, 50, 60)
-                            };
-                            let exclude_color = if current_mode == SemanticFilterMode::Exclude {
-                                Color32::from_rgb(239, 68, 68) // Red
-                            } else {
-                                Color32::from_rgb(50, 50, 60)
-                            };
+                            let inactive = Color32::from_rgb(50, 50, 60);
+                            let active_neutral = Color32::from_rgb(100, 100, 120);
+                            let active_green = Color32::from_rgb(34, 197, 94);
+                            let active_blue = Color32::from_rgb(59, 130, 246);
+                            let active_purple = Color32::from_rgb(139, 92, 246);
+                            let active_red = Color32::from_rgb(239, 68, 68);
 
-                            // Off button
+                            // Off button (O)
+                            let off_color = if current_mode == SemanticFilterMode::Off { active_neutral } else { inactive };
                             if ui.add(egui::Button::new("O").fill(off_color).min_size(Vec2::new(20.0, 18.0)))
                                 .on_hover_text("Off - filter not applied")
                                 .clicked()
@@ -1366,7 +1489,17 @@ impl DashboardApp {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Off);
                             }
 
+                            // Exclude button (-)
+                            let exclude_color = if current_mode == SemanticFilterMode::Exclude { active_red } else { inactive };
+                            if ui.add(egui::Button::new("-").fill(exclude_color).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Exclude - hide matching nodes")
+                                .clicked()
+                            {
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
+                            }
+
                             // Include button (+)
+                            let include_color = if current_mode == SemanticFilterMode::Include { active_green } else { inactive };
                             if ui.add(egui::Button::new("+").fill(include_color).min_size(Vec2::new(20.0, 18.0)))
                                 .on_hover_text("Include - only show matching nodes")
                                 .clicked()
@@ -1374,12 +1507,22 @@ impl DashboardApp {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
                             }
 
-                            // Exclude button (-)
-                            if ui.add(egui::Button::new("-").fill(exclude_color).min_size(Vec2::new(20.0, 18.0)))
-                                .on_hover_text("Exclude - hide matching nodes")
+                            // Include +1 button (show matching + direct neighbors)
+                            let plus1_color = if current_mode == SemanticFilterMode::IncludePlus1 { active_blue } else { inactive };
+                            if ui.add(egui::Button::new("+1").fill(plus1_color).min_size(Vec2::new(24.0, 18.0)))
+                                .on_hover_text("Include +1 - show matching nodes + their direct neighbors")
                                 .clicked()
                             {
-                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus1);
+                            }
+
+                            // Include +2 button (show matching + neighbors up to depth 2)
+                            let plus2_color = if current_mode == SemanticFilterMode::IncludePlus2 { active_purple } else { inactive };
+                            if ui.add(egui::Button::new("+2").fill(plus2_color).min_size(Vec2::new(24.0, 18.0)))
+                                .on_hover_text("Include +2 - show matching nodes + neighbors up to 2 hops")
+                                .clicked()
+                            {
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus2);
                             }
 
                             // Filter name and match count
@@ -1432,7 +1575,7 @@ impl DashboardApp {
                 if !active_filters.is_empty() {
                     ui.add_space(5.0);
                     let include_count = active_filters.iter()
-                        .filter(|(_, mode)| **mode == SemanticFilterMode::Include)
+                        .filter(|(_, mode)| matches!(mode, SemanticFilterMode::Include | SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2))
                         .count();
                     let exclude_count = active_filters.iter()
                         .filter(|(_, mode)| **mode == SemanticFilterMode::Exclude)
@@ -1711,6 +1854,9 @@ impl DashboardApp {
             center + centered * zoom + pan_offset
         };
 
+        // Pre-compute semantic filter visible set once for both edge and node rendering
+        let semantic_visible = self.compute_semantic_filter_visible_set();
+
         // Draw edges first (behind nodes)
         for edge in &self.graph.data.edges {
             // Skip edges for hidden nodes when timeline is enabled
@@ -1743,12 +1889,8 @@ impl DashboardApp {
             }
 
             // Skip edges where either endpoint doesn't pass semantic filters
-            if self.has_active_semantic_filters() {
-                let source_excluded = self.graph.get_node(&edge.source)
-                    .map_or(true, |n| !self.node_passes_semantic_filters(n));
-                let target_excluded = self.graph.get_node(&edge.target)
-                    .map_or(true, |n| !self.node_passes_semantic_filters(n));
-                if source_excluded || target_excluded {
+            if let Some(ref sem_visible) = semantic_visible {
+                if !sem_visible.contains(&edge.source) || !sem_visible.contains(&edge.target) {
                     continue;
                 }
             }
@@ -1814,8 +1956,10 @@ impl DashboardApp {
                     continue;
                 }
                 // Skip nodes that don't pass semantic filters
-                if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
-                    continue;
+                if let Some(ref sem_visible) = semantic_visible {
+                    if !sem_visible.contains(&node.id) {
+                        continue;
+                    }
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
@@ -1857,8 +2001,10 @@ impl DashboardApp {
             }
 
             // Skip nodes that don't pass semantic filters
-            if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
-                continue;
+            if let Some(ref sem_visible) = semantic_visible {
+                if !sem_visible.contains(&node.id) {
+                    continue;
+                }
             }
 
             if self.graph.get_pos(&node.id).is_some() {

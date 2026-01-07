@@ -11,8 +11,8 @@ _partial_summary_cache: dict[tuple[str, str], dict] = {}
 
 # LiteLLM proxy configuration
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-1234")  # Placeholder key
-MODEL_NAME = os.environ.get("SUMMARY_MODEL", "gemini-2.5-flash")
+LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
+MODEL_NAME = os.environ.get("SUMMARY_MODEL", "fast")
 
 SUMMARY_PROMPT = """Analyze this Claude Code conversation and provide a structured summary.
 
@@ -58,6 +58,41 @@ def _generate_via_litellm(prompt: str) -> str | None:
         return None
 
 
+def _extract_json(text: str) -> dict | None:
+    """Extract JSON object from LLM response, handling markdown and extra text."""
+    import json
+    import re
+
+    text = text.strip()
+
+    # Try to extract from markdown code block first
+    if "```" in text:
+        # Find content between ``` markers
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+    # Try to find JSON object directly
+    # Look for { ... } pattern
+    match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Try the whole text as JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
 def generate_session_summary(session_id: str) -> dict | None:
     """Generate a summary for a session using LiteLLM proxy."""
     # Get messages
@@ -90,15 +125,10 @@ def generate_session_summary(session_id: str) -> dict | None:
 
     try:
         import json
-        # Remove any markdown code blocks if present
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        text = text.strip()
-
-        result = json.loads(text)
+        result = _extract_json(text)
+        if result is None:
+            print(f"Could not extract JSON from response: {text[:200]}...")
+            return None
         return {
             "summary": result.get("summary", ""),
             "user_requests": result.get("user_requests", ""),
@@ -191,17 +221,19 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
         }
 
     try:
-        import json
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        text = text.strip()
+        result = _extract_json(text)
+        if result is None:
+            print(f"Could not extract JSON from partial summary: {text[:200]}...")
+            return {
+                "summary": "Failed to parse summary response",
+                "completed_work": "",
+                "unsuccessful_attempts": "",
+                "current_focus": "",
+                "user_count": user_count,
+                "assistant_count": assistant_count,
+            }
 
-        result = json.loads(text)
-
-        # Ensure string fields are always strings (Gemini sometimes returns arrays)
+        # Ensure string fields are always strings (LLMs sometimes return arrays)
         def ensure_string(val):
             if isinstance(val, list):
                 return "\n".join(str(v) for v in val) if val else ""
