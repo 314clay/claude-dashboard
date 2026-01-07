@@ -353,6 +353,10 @@ pub struct GraphState {
     pub session_colors: HashMap<String, f32>,
     /// Project colors (project_name -> hue)
     pub project_colors: HashMap<String, f32>,
+    /// Parent directory hues (top-level dir -> base hue) for tree-based coloring
+    pub parent_hues: HashMap<String, f32>,
+    /// Sibling counts per parent (for offset calculation)
+    pub sibling_counts: HashMap<String, usize>,
     /// Color mode: true = by project, false = by session
     pub color_by_project: bool,
     /// Is physics simulation running?
@@ -382,6 +386,8 @@ impl GraphState {
             node_index: HashMap::new(),
             session_colors: HashMap::new(),
             project_colors: HashMap::new(),
+            parent_hues: HashMap::new(),
+            sibling_counts: HashMap::new(),
             color_by_project: true, // Default to project coloring
             physics_enabled: true,
             hovered_node: None,
@@ -405,6 +411,58 @@ impl GraphState {
         (tokens + 1.0).ln() / (max + 1.0).ln()
     }
 
+    /// Compute hue for a project based on its position in the directory tree.
+    /// Projects under the same parent directory get similar hues (within ±20°).
+    /// Different top-level directories get distinct hues (golden ratio spacing).
+    fn compute_project_hue(&mut self, project: &str) -> f32 {
+        // Extract path after ~/w/ (or just use first component if different structure)
+        let path = project.trim_start_matches("~/w/").trim_start_matches("~/");
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if parts.is_empty() {
+            // Fallback for empty/weird paths
+            return (self.project_colors.len() as f32 * 137.5) % 360.0;
+        }
+
+        // Top-level directory determines base hue
+        let top_level = parts[0].to_string();
+
+        // Get or assign base hue for this top-level directory
+        let base_hue = if let Some(&hue) = self.parent_hues.get(&top_level) {
+            hue
+        } else {
+            // New top-level: assign using golden ratio for good distribution
+            let hue = (self.parent_hues.len() as f32 * 137.5) % 360.0;
+            self.parent_hues.insert(top_level.clone(), hue);
+            hue
+        };
+
+        // If this is the top-level itself (no subdirs), return base hue
+        if parts.len() == 1 {
+            return base_hue;
+        }
+
+        // For subdirectories, offset slightly from parent hue
+        // Each sibling gets a 8° offset, wrapping within ±30° of base
+        let sibling_idx = *self.sibling_counts.get(&top_level).unwrap_or(&0);
+        self.sibling_counts.insert(top_level, sibling_idx + 1);
+
+        // Offset pattern: 0, 8, -8, 16, -16, 24, -24, ...
+        // This spreads siblings around the base hue
+        let offset = if sibling_idx == 0 {
+            0.0
+        } else {
+            let magnitude = ((sibling_idx + 1) / 2) as f32 * 8.0;
+            if sibling_idx % 2 == 1 { magnitude } else { -magnitude }
+        };
+
+        // Clamp offset to ±30° so siblings stay visually grouped
+        let clamped_offset = offset.clamp(-30.0, 30.0);
+
+        // Return final hue, wrapping around 360°
+        (base_hue + clamped_offset + 360.0) % 360.0
+    }
+
     /// Load new graph data, initializing positions randomly
     pub fn load(&mut self, data: GraphData, bounds: egui::Rect) {
         use rand::Rng;
@@ -416,6 +474,8 @@ impl GraphState {
         self.node_index.clear();
         self.session_colors.clear();
         self.project_colors.clear();
+        self.parent_hues.clear();
+        self.sibling_counts.clear();
 
         // Build node index and initialize positions
         for (i, node) in data.nodes.iter().enumerate() {
@@ -433,10 +493,10 @@ impl GraphState {
                 self.session_colors.insert(node.session_id.clone(), hue);
             }
 
-            // Assign project color if not already assigned
+            // Assign project color using tree-based hue assignment
+            // Projects under the same parent directory get similar hues
             if !node.project.is_empty() && !self.project_colors.contains_key(&node.project) {
-                // Use golden ratio for better color distribution
-                let hue = (self.project_colors.len() as f32 * 137.5) % 360.0;
+                let hue = self.compute_project_hue(&node.project);
                 self.project_colors.insert(node.project.clone(), hue);
             }
         }
