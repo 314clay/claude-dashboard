@@ -1,6 +1,6 @@
 //! HTTP client for the dashboard API.
 
-use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SessionSummaryData};
+use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SemanticFilter, SessionSummaryData};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -27,6 +27,14 @@ pub struct ImportanceStats {
     pub scored_messages: i64,
     pub unscored_messages: i64,
     pub sessions_with_unscored: i64,
+}
+
+/// Result from rescore operation
+#[derive(Debug, Clone, Deserialize)]
+pub struct RescoreResult {
+    pub sessions_processed: i64,
+    pub messages_rescored: i64,
+    pub errors: Vec<String>,
 }
 
 pub struct ApiClient {
@@ -171,6 +179,121 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(stats)
+    }
+
+    /// Rescore importance for messages in specified sessions
+    ///
+    /// Overwrites existing scores atomically - if cancelled midway,
+    /// no messages are left with NULL scores.
+    pub fn rescore_importance(&self, session_ids: Vec<String>) -> Result<RescoreResult, String> {
+        let url = format!("{}/importance/rescore", self.base_url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "session_ids": session_ids }))
+            .timeout(Duration::from_secs(120)) // Long timeout for LLM calls
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let result: RescoreResult = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(result)
+    }
+
+    /// Fetch all semantic filters
+    pub fn fetch_semantic_filters(&self) -> Result<Vec<SemanticFilter>, String> {
+        let url = format!("{}/semantic-filters", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        #[derive(Deserialize)]
+        struct FiltersResponse {
+            filters: Vec<SemanticFilter>,
+        }
+
+        let response: FiltersResponse = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(response.filters)
+    }
+
+    /// Create a new semantic filter
+    pub fn create_semantic_filter(&self, name: &str) -> Result<SemanticFilter, String> {
+        let url = format!("{}/semantic-filters", self.base_url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "name": name,
+                "query_text": name
+            }))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let filter: SemanticFilter = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(filter)
+    }
+
+    /// Delete a semantic filter
+    pub fn delete_semantic_filter(&self, id: i32) -> Result<(), String> {
+        let url = format!("{}/semantic-filters/{}", self.base_url, id);
+
+        let resp = self
+            .client
+            .delete(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Trigger categorization for a semantic filter
+    pub fn trigger_categorization(&self, filter_id: i32) -> Result<(), String> {
+        let url = format!("{}/semantic-filters/{}/categorize", self.base_url, filter_id);
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(60)) // Longer timeout for AI categorization
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        Ok(())
     }
 }
 

@@ -2,18 +2,13 @@
 
 Provides REST endpoints for the Rust desktop app to fetch graph data.
 """
-import sys
-from pathlib import Path
-
-# Add dashboard to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "dashboard"))
-
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import uvicorn
 
-from components.queries import (
+# Import from local db module (self-contained)
+from db.queries import (
     get_graph_data,
     get_sessions,
     get_overview_metrics,
@@ -22,11 +17,12 @@ from components.queries import (
     get_tool_usage,
     get_project_session_graph_data,
 )
-from components.summarizer import generate_partial_summary, get_or_create_summary
-from components.importance_scorer import (
+from db.summarizer import generate_partial_summary, get_or_create_summary
+from db.importance.backfill import (
     backfill_importance_scores,
     get_importance_stats,
-    score_session,
+    score_single_session as score_session,
+    rescore_sessions,
 )
 
 from project_detection import (
@@ -34,6 +30,17 @@ from project_detection import (
     detect_project_for_session,
     backfill_detected_projects,
 )
+from db.semantic_filters import (
+    get_all_filters,
+    create_filter,
+    delete_filter,
+    get_filter_status,
+)
+from db.semantic_filter_scorer import (
+    categorize_messages,
+    get_filter_stats,
+)
+from pydantic import BaseModel
 
 app = FastAPI(
     title="Dashboard API",
@@ -45,9 +52,19 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
+
+# Pydantic models for request bodies
+class SemanticFilterCreate(BaseModel):
+    name: str
+    query_text: str
+
+
+class RescoreRequest(BaseModel):
+    session_ids: list[str]
 
 
 @app.get("/health")
@@ -223,14 +240,17 @@ def importance_stats():
 @app.post("/importance/backfill")
 def importance_backfill(
     max_sessions: int = Query(default=50, description="Max sessions to process"),
-    batch_size: int = Query(default=25, description="Messages per LLM call"),
+    staleness_days: float = Query(default=1.0, description="Days of inactivity before scoring"),
+    batch_size: int = Query(default=100, description="Messages per LLM call"),
+    parallel: int = Query(default=1, description="Parallel workers"),
+    since_days: float = Query(default=None, description="Only process sessions with messages in past N days"),
 ):
     """Backfill importance scores for unscored messages.
 
     Calls Gemini to score messages on importance (0.0-1.0).
     This may take 2-5 seconds per session.
     """
-    return backfill_importance_scores(max_sessions, batch_size)
+    return backfill_importance_scores(max_sessions, staleness_days, batch_size, parallel, since_days)
 
 
 @app.post("/importance/session/{session_id}")
@@ -243,6 +263,103 @@ def importance_score_session(
     Calls Gemini to score unscored messages in the session.
     """
     return score_session(session_id, batch_size)
+
+
+@app.post("/importance/rescore")
+def importance_rescore(
+    body: RescoreRequest,
+    batch_size: int = Query(default=30, description="Messages per LLM call"),
+):
+    """Rescore importance for messages in specified sessions.
+
+    Unlike /importance/session, this OVERWRITES existing scores atomically.
+    If cancelled midway, no messages are left with NULL scores - they either
+    keep their old score or get the new score.
+
+    Body: { session_ids: ["uuid1", "uuid2", ...] }
+
+    Returns: { sessions_processed, messages_rescored, errors }
+    """
+    return rescore_sessions(body.session_ids, batch_size)
+
+
+# ==== Semantic Filter Endpoints ====
+
+@app.get("/semantic-filters")
+def list_semantic_filters():
+    """List all semantic filters with stats.
+
+    Returns filters with total_scored and matches counts.
+    """
+    filters = get_all_filters()
+    return {"filters": filters}
+
+
+@app.post("/semantic-filters")
+def create_semantic_filter(body: SemanticFilterCreate):
+    """Create a new semantic filter.
+
+    Body: { name, query_text }
+    Returns the created filter.
+    """
+    try:
+        filter_data = create_filter(body.name, body.query_text)
+        return {"success": True, "filter": filter_data}
+    except Exception as e:
+        # Likely unique constraint violation on name
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/semantic-filters/{filter_id}")
+def delete_semantic_filter(filter_id: int):
+    """Delete a semantic filter and its results.
+
+    Returns success status.
+    """
+    deleted = delete_filter(filter_id)
+    if deleted:
+        return {"success": True, "deleted": filter_id}
+    else:
+        return {"success": False, "error": "Filter not found"}
+
+
+@app.get("/semantic-filters/{filter_id}/status")
+def semantic_filter_status(filter_id: int):
+    """Get scoring progress for a specific filter.
+
+    Returns: { filter_id, name, total, scored, pending, matches }
+    """
+    status = get_filter_status(filter_id)
+    if status is None:
+        return {"error": "Filter not found"}
+    return status
+
+
+@app.post("/semantic-filters/{filter_id}/categorize")
+def categorize_filter_messages(
+    filter_id: int,
+    batch_size: int = Query(default=50, description="Messages per LLM call (50-100 recommended)"),
+    max_messages: int = Query(default=5000, description="Maximum messages to process"),
+):
+    """Trigger categorization for a semantic filter.
+
+    Scores unscored messages against all active filters in batches.
+    Uses Gemini to determine which messages match the filter criteria.
+
+    This may take several seconds depending on the number of unscored messages.
+
+    Returns: { filter_id, scored, matches, batches_processed, errors }
+    """
+    return categorize_messages(filter_id, batch_size, max_messages)
+
+
+@app.get("/semantic-filters/stats")
+def semantic_filter_stats():
+    """Get statistics about semantic filter scoring coverage.
+
+    Returns: { total_messages, filters: [{ id, name, scored_count, match_count }] }
+    """
+    return get_filter_stats()
 
 
 if __name__ == "__main__":

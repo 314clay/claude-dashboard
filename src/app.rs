@@ -1,10 +1,12 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, ImportanceStats};
-use crate::graph::types::{PartialSummaryData, SessionSummaryData};
+use crate::api::{ApiClient, RescoreResult};
+use crate::db::DbClient;
+use crate::graph::types::{PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::settings::{Preset, Settings, SizingPreset};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
@@ -69,12 +71,19 @@ impl TimeRange {
     }
 }
 
+/// Importance scoring statistics
+#[derive(Debug, Clone)]
+pub struct ImportanceStats {
+    pub total_messages: i64,
+    pub scored_messages: i64,
+}
+
 /// Main dashboard application
 pub struct DashboardApp {
-    // API client
-    api: ApiClient,
-    api_connected: bool,
-    api_error: Option<String>,
+    // Database client
+    db: Option<DbClient>,
+    db_connected: bool,
+    db_error: Option<String>,
 
     // Graph state
     graph: GraphState,
@@ -101,6 +110,14 @@ pub struct DashboardApp {
     importance_threshold: f32,
     importance_filter_enabled: bool,
     importance_stats: Option<ImportanceStats>,
+    rescore_loading: bool,
+    rescore_receiver: Option<Receiver<Result<RescoreResult, String>>>,
+    rescore_result: Option<RescoreResult>,
+
+    // Project filtering
+    project_filter_enabled: bool,
+    selected_projects: HashSet<String>,
+    available_projects: Vec<String>,
 
     // Viewport state
     pan_offset: Vec2,
@@ -131,6 +148,10 @@ pub struct DashboardApp {
     session_summary_loading: bool,
     session_summary_receiver: Option<Receiver<Result<SessionSummaryData, String>>>,
 
+    // Floating summary window state
+    summary_window_open: bool,
+    summary_window_dragged: bool,
+
     // Double-click detection
     last_click_time: Instant,
     last_click_node: Option<String>,
@@ -143,6 +164,14 @@ pub struct DashboardApp {
     // Preset management
     preset_name_input: String,
     selected_preset_index: Option<usize>,
+
+    // Semantic filters
+    semantic_filters: Vec<SemanticFilter>,
+    semantic_filter_modes: HashMap<i32, SemanticFilterMode>,
+    new_filter_input: String,
+    semantic_filter_loading: bool,
+    categorizing_filter_id: Option<i32>,
+    categorization_receiver: Option<Receiver<Result<(), String>>>,
 }
 
 impl DashboardApp {
@@ -156,6 +185,7 @@ impl DashboardApp {
         layout.attraction = settings.attraction;
         layout.centering = settings.centering;
         layout.temporal_strength = settings.temporal_strength;
+        layout.size_physics_weight = settings.size_physics_weight;
 
         // Create graph state with saved settings
         let mut graph = GraphState::new();
@@ -165,10 +195,16 @@ impl DashboardApp {
         graph.temporal_window_secs = settings.temporal_window_mins as f64 * 60.0;
         graph.max_temporal_edges = settings.max_temporal_edges;
 
+        // Try to connect to database
+        let (db, db_connected, db_error) = match DbClient::new() {
+            Ok(client) => (Some(client), true, None),
+            Err(e) => (None, false, Some(e)),
+        };
+
         let mut app = Self {
-            api: ApiClient::new(),
-            api_connected: false,
-            api_error: None,
+            db,
+            db_connected,
+            db_error,
             graph,
             layout,
             time_range: TimeRange::from_hours(settings.time_range_hours),
@@ -185,6 +221,12 @@ impl DashboardApp {
             importance_threshold: settings.importance_threshold,
             importance_filter_enabled: settings.importance_filter_enabled,
             importance_stats: None,
+            rescore_loading: false,
+            rescore_receiver: None,
+            rescore_result: None,
+            project_filter_enabled: false,
+            selected_projects: HashSet::new(),
+            available_projects: Vec::new(),
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
@@ -209,6 +251,10 @@ impl DashboardApp {
             session_summary_loading: false,
             session_summary_receiver: None,
 
+            // Floating summary window state
+            summary_window_open: false,
+            summary_window_dragged: false,
+
             // Double-click detection
             last_click_time: Instant::now(),
             last_click_node: None,
@@ -221,30 +267,35 @@ impl DashboardApp {
             // Preset management
             preset_name_input: String::new(),
             selected_preset_index: None,
+
+            // Semantic filters
+            semantic_filters: Vec::new(),
+            semantic_filter_modes: HashMap::new(),
+            new_filter_input: String::new(),
+            semantic_filter_loading: false,
+            categorizing_filter_id: None,
+            categorization_receiver: None,
         };
 
-        // Check API connection and load initial data
-        app.check_api();
-        if app.api_connected {
+        // Load initial data if connected
+        if app.db_connected {
             app.load_graph();
         }
 
         app
     }
 
-    fn check_api(&mut self) {
-        match self.api.health() {
-            Ok(true) => {
-                self.api_connected = true;
-                self.api_error = None;
-            }
-            Ok(false) => {
-                self.api_connected = false;
-                self.api_error = Some("API unhealthy".to_string());
+    fn reconnect_db(&mut self) {
+        match DbClient::new() {
+            Ok(client) => {
+                self.db = Some(client);
+                self.db_connected = true;
+                self.db_error = None;
             }
             Err(e) => {
-                self.api_connected = false;
-                self.api_error = Some(e);
+                self.db = None;
+                self.db_connected = false;
+                self.db_error = Some(e);
             }
         }
     }
@@ -272,6 +323,7 @@ impl DashboardApp {
         self.settings.repulsion = self.layout.repulsion;
         self.settings.attraction = self.layout.attraction;
         self.settings.centering = self.layout.centering;
+        self.settings.size_physics_weight = self.layout.size_physics_weight;
         self.settings.temporal_strength = self.layout.temporal_strength;
         self.settings.temporal_attraction_enabled = self.graph.temporal_attraction_enabled;
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
@@ -298,6 +350,7 @@ impl DashboardApp {
         self.layout.repulsion = self.settings.repulsion;
         self.layout.attraction = self.settings.attraction;
         self.layout.centering = self.settings.centering;
+        self.layout.size_physics_weight = self.settings.size_physics_weight;
         self.layout.temporal_strength = self.settings.temporal_strength;
         self.graph.temporal_attraction_enabled = self.settings.temporal_attraction_enabled;
         self.graph.temporal_window_secs = (self.settings.temporal_window_mins * 60.0) as f64;
@@ -316,9 +369,14 @@ impl DashboardApp {
     }
 
     fn load_graph(&mut self) {
+        let Some(ref db) = self.db else {
+            self.db_error = Some("Database not connected".to_string());
+            return;
+        };
+
         self.loading = true;
 
-        match self.api.fetch_graph(self.time_range.hours(), None) {
+        match db.fetch_graph(self.time_range.hours(), None) {
             Ok(data) => {
                 // Initialize with centered bounds
                 let bounds = egui::Rect::from_center_size(
@@ -328,13 +386,30 @@ impl DashboardApp {
                 self.graph.load(data, bounds);
                 self.loading = false;
 
+                // Extract available projects from nodes
+                let projects: HashSet<String> = self.graph.data.nodes.iter()
+                    .map(|n| n.project.clone())
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                let mut sorted_projects: Vec<String> = projects.into_iter().collect();
+                sorted_projects.sort();
+                self.available_projects = sorted_projects;
+                // Select all projects by default
+                self.selected_projects = self.available_projects.iter().cloned().collect();
+
                 // Fetch importance stats
-                if let Ok(stats) = self.api.fetch_importance_stats() {
-                    self.importance_stats = Some(stats);
+                if let Ok(stats) = db.fetch_importance_stats() {
+                    self.importance_stats = Some(ImportanceStats {
+                        total_messages: stats.total_messages,
+                        scored_messages: stats.scored_messages,
+                    });
                 }
+
+                // Load semantic filters from API
+                self.load_semantic_filters();
             }
             Err(e) => {
-                self.api_error = Some(e);
+                self.db_error = Some(e);
                 self.loading = false;
             }
         }
@@ -379,51 +454,513 @@ impl DashboardApp {
         closest_node.cloned()
     }
 
-    /// Trigger summary generation for a double-clicked node
+    /// Check if any semantic filters are active (not Off)
+    fn has_active_semantic_filters(&self) -> bool {
+        self.semantic_filter_modes.values()
+            .any(|mode| *mode != SemanticFilterMode::Off)
+    }
+
+    /// Check if a node passes the semantic filter criteria
+    /// Returns true if the node should be visible, false if it should be hidden
+    fn node_passes_semantic_filters(&self, node: &crate::graph::types::GraphNode) -> bool {
+        for (filter_id, mode) in &self.semantic_filter_modes {
+            match mode {
+                SemanticFilterMode::Off => continue,
+                SemanticFilterMode::Include => {
+                    // Node must match this filter to be visible
+                    if !node.semantic_filter_matches.contains(filter_id) {
+                        return false;
+                    }
+                }
+                SemanticFilterMode::Exclude => {
+                    // Node must NOT match this filter to be visible
+                    if node.semantic_filter_matches.contains(filter_id) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Compute which nodes should participate in physics simulation
+    /// Returns None if no filtering is active (simulate all nodes)
+    /// Returns Some(HashSet) with visible node IDs when filtering is active
+    fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
+        // If no filters active, return None (simulate all)
+        let semantic_filter_active = self.has_active_semantic_filters();
+        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active {
+            return None;
+        }
+
+        let mut visible = HashSet::new();
+        for node in &self.graph.data.nodes {
+            // Timeline filter
+            if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
+                continue;
+            }
+            // Importance filter
+            if self.importance_filter_enabled {
+                if let Some(score) = node.importance_score {
+                    if score < self.importance_threshold {
+                        continue;
+                    }
+                }
+            }
+            // Project filter
+            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
+                continue;
+            }
+            // Semantic filter - check Include/Exclude modes
+            if semantic_filter_active && !self.node_passes_semantic_filters(node) {
+                continue;
+            }
+            visible.insert(node.id.clone());
+        }
+        Some(visible)
+    }
+
+    /// Compute node sizes for physics simulation
+    /// Returns None if size_physics_weight is 0 (uniform masses)
+    /// Returns Some(HashMap) with node_id -> size when physics uses variable mass
+    fn compute_node_sizes(&self) -> Option<std::collections::HashMap<String, f32>> {
+        // If weight is ~0, return None for uniform masses (optimization)
+        if self.layout.size_physics_weight < 0.001 {
+            return None;
+        }
+
+        let mut sizes = std::collections::HashMap::new();
+
+        for node in &self.graph.data.nodes {
+            // Same formula as visual sizing, but for ALL nodes
+            // (physics may simulate nodes not currently drawn)
+
+            // 1. Importance factor (0-1, default 0.5)
+            let importance = node.importance_score.unwrap_or(0.5);
+            let imp_factor = (self.w_importance * importance).exp();
+
+            // 2. Token factor (log-normalized 0-1)
+            let tokens_norm = self.graph.normalize_tokens(node);
+            let tok_factor = (self.w_tokens * tokens_norm).exp();
+
+            // 3. Time/recency factor (distance from scrubber, 0-1)
+            let time_factor = if self.graph.timeline.max_time > self.graph.timeline.min_time {
+                if let Some(node_time) = node.timestamp_secs() {
+                    let time_range = self.graph.timeline.max_time - self.graph.timeline.min_time;
+                    let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
+                    let distance = (scrubber_time - node_time).abs();
+                    let normalized_distance = (distance / time_range).clamp(0.0, 1.0) as f32;
+                    (-self.w_time * normalized_distance).exp()
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+
+            // Combine factors multiplicatively (same as visual sizing)
+            let size = imp_factor * tok_factor * time_factor;
+            sizes.insert(node.id.clone(), size);
+        }
+
+        Some(sizes)
+    }
+
+    /// Trigger summary fetch for a double-clicked node
     fn trigger_summary_for_node(&mut self, node_id: String) {
         if let Some(node) = self.graph.get_node(&node_id) {
             let session_id = node.session_id.clone();
-            let timestamp = match &node.timestamp {
-                Some(ts) => ts.clone(),
-                None => {
-                    self.summary_error = Some("Node has no timestamp".to_string());
-                    return;
-                }
-            };
+            let timestamp = node.timestamp.clone();
 
             // Store state
             self.summary_node_id = Some(node_id);
             self.summary_session_id = Some(session_id.clone());
-            self.summary_timestamp = Some(timestamp.clone());
-            self.summary_loading = true;
+            self.summary_timestamp = timestamp;
+            self.summary_loading = false; // Point-in-time summary disabled (requires AI)
             self.summary_data = None;
             self.summary_error = None;
 
-            // Also reset session summary state
+            // Reset session summary state
             self.session_summary_data = None;
             self.session_summary_loading = true;
 
-            // Create channels for async results
-            let (tx, rx) = mpsc::channel();
-            self.summary_receiver = Some(rx);
+            // Open floating window
+            if !self.summary_window_dragged {
+                self.summary_window_dragged = false;
+            }
+            self.summary_window_open = true;
 
+            // Create channel for session summary
             let (session_tx, session_rx) = mpsc::channel();
             self.session_summary_receiver = Some(session_rx);
 
-            // Spawn thread to fetch point-in-time summary
+            // Fetch session summary from database (read-only, no AI generation)
+            match DbClient::new() {
+                Ok(db) => {
+                    std::thread::spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            db.fetch_session_summary(&session_id)
+                        }));
+                        match result {
+                            Ok(r) => { let _ = session_tx.send(r); }
+                            Err(_) => { let _ = session_tx.send(Err("Thread panicked".to_string())); }
+                        }
+                    });
+                }
+                Err(e) => {
+                    self.session_summary_loading = false;
+                    self.summary_error = Some(format!("DB connection error: {}", e));
+                }
+            }
+        }
+    }
+
+    /// Load semantic filters from the API
+    fn load_semantic_filters(&mut self) {
+        self.semantic_filter_loading = true;
+
+        let api = ApiClient::new();
+        match api.fetch_semantic_filters() {
+            Ok(filters) => {
+                self.semantic_filters = filters;
+                self.semantic_filter_loading = false;
+            }
+            Err(e) => {
+                eprintln!("Failed to load semantic filters: {}", e);
+                self.semantic_filter_loading = false;
+            }
+        }
+    }
+
+    /// Create a new semantic filter
+    fn create_semantic_filter(&mut self) {
+        let name = self.new_filter_input.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+
+        let api = ApiClient::new();
+        match api.create_semantic_filter(&name) {
+            Ok(filter) => {
+                self.semantic_filters.push(filter);
+                self.new_filter_input.clear();
+            }
+            Err(e) => {
+                eprintln!("Failed to create semantic filter: {}", e);
+            }
+        }
+    }
+
+    /// Delete a semantic filter
+    fn delete_semantic_filter(&mut self, filter_id: i32) {
+        let api = ApiClient::new();
+        match api.delete_semantic_filter(filter_id) {
+            Ok(()) => {
+                self.semantic_filters.retain(|f| f.id != filter_id);
+                self.semantic_filter_modes.remove(&filter_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to delete semantic filter: {}", e);
+            }
+        }
+    }
+
+    /// Trigger categorization for a semantic filter (runs in background)
+    fn trigger_categorization(&mut self, filter_id: i32) {
+        self.categorizing_filter_id = Some(filter_id);
+
+        // Run categorization in background thread
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
             let api = ApiClient::new();
-            let session_id_for_partial = session_id.clone();
-            std::thread::spawn(move || {
-                let result = api.fetch_partial_summary(&session_id_for_partial, &timestamp);
-                let _ = tx.send(result);
+            let result = api.trigger_categorization(filter_id);
+            let _ = tx.send(result);
+        });
+
+        // Store the receiver to check later
+        // We'll check this in the update loop
+        self.categorization_receiver = Some(rx);
+    }
+
+    /// Start rescoring importance for visible nodes (runs in background)
+    fn start_rescore_visible(&mut self) {
+        // Collect unique session IDs from visible nodes
+        let session_ids: Vec<String> = self.get_visible_session_ids();
+
+        if session_ids.is_empty() {
+            return;
+        }
+
+        self.rescore_loading = true;
+        self.rescore_result = None;
+
+        // Run rescore in background thread
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            let result = api.rescore_importance(session_ids);
+            let _ = tx.send(result);
+        });
+
+        self.rescore_receiver = Some(rx);
+    }
+
+    /// Get unique session IDs from currently visible nodes
+    fn get_visible_session_ids(&self) -> Vec<String> {
+        let mut session_ids: HashSet<String> = HashSet::new();
+
+        for node in &self.graph.data.nodes {
+            // Check timeline filter
+            if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
+                continue;
+            }
+            // Check importance filter
+            if self.importance_filter_enabled {
+                if let Some(score) = node.importance_score {
+                    if score < self.importance_threshold {
+                        continue;
+                    }
+                }
+            }
+            // Check project filter
+            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
+                continue;
+            }
+            // Check semantic filters
+            if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
+                continue;
+            }
+
+            session_ids.insert(node.session_id.clone());
+        }
+
+        session_ids.into_iter().collect()
+    }
+
+    /// Render the floating summary window
+    fn render_summary_window(&mut self, ctx: &egui::Context) {
+        if !self.summary_window_open {
+            return;
+        }
+
+        // Calculate default position (top-right, offset from edge)
+        let screen_rect = ctx.screen_rect();
+        let default_pos = egui::pos2(screen_rect.right() - 420.0, 60.0);
+
+        let mut open = self.summary_window_open;
+
+        let window_response = egui::Window::new("Summary")
+            .open(&mut open)
+            .default_pos(default_pos)
+            .default_size([400.0, 500.0])
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                // Point-in-Time Summary section
+                egui::CollapsingHeader::new("Point-in-Time Summary")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if self.summary_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Generating summary...");
+                            });
+                        } else if let Some(ref error) = self.summary_error.clone() {
+                            ui.colored_label(Color32::RED, format!("Error: {}", error));
+                            if ui.button("Dismiss").clicked() {
+                                self.summary_error = None;
+                                self.summary_node_id = None;
+                            }
+                        } else if let Some(ref data) = self.summary_data.clone() {
+                            // Message counts
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Messages: {} you / {} Claude",
+                                    data.user_count, data.assistant_count));
+                            });
+                            ui.add_space(5.0);
+
+                            // Summary
+                            ui.label(egui::RichText::new("Summary").strong());
+                            egui::ScrollArea::vertical()
+                                .max_height(80.0)
+                                .id_salt("window_summary_scroll")
+                                .show(ui, |ui| {
+                                    ui.label(&data.summary);
+                                });
+                            ui.add_space(5.0);
+
+                            // Current Focus
+                            if !data.current_focus.is_empty() {
+                                ui.label(egui::RichText::new("Working On").strong());
+                                ui.label(&data.current_focus);
+                                ui.add_space(5.0);
+                            }
+
+                            // Completed Work
+                            if !data.completed_work.is_empty() {
+                                ui.label(egui::RichText::new("Completed").strong().color(Color32::GREEN));
+                                egui::ScrollArea::vertical()
+                                    .max_height(60.0)
+                                    .id_salt("window_completed_scroll")
+                                    .show(ui, |ui| {
+                                        for line in data.completed_work.split('\n').filter(|l| !l.is_empty()) {
+                                            ui.label(line);
+                                        }
+                                    });
+                                ui.add_space(5.0);
+                            }
+
+                            // Unsuccessful Attempts
+                            if !data.unsuccessful_attempts.is_empty() {
+                                ui.label(egui::RichText::new("Tried but Failed").strong().color(Color32::from_rgb(255, 100, 100)));
+                                egui::ScrollArea::vertical()
+                                    .max_height(60.0)
+                                    .id_salt("window_failed_scroll")
+                                    .show(ui, |ui| {
+                                        for line in data.unsuccessful_attempts.split('\n').filter(|l| !l.is_empty()) {
+                                            ui.label(line);
+                                        }
+                                    });
+                            }
+
+                            // Importance grading for the clicked node
+                            if let Some(ref node_id) = self.summary_node_id.clone() {
+                                if let Some(node) = self.graph.get_node(&node_id) {
+                                    if node.importance_score.is_some() || node.importance_reason.is_some() {
+                                        ui.add_space(5.0);
+                                        ui.label(egui::RichText::new("Importance").strong().color(Color32::from_rgb(255, 193, 7)));
+                                        if let Some(score) = node.importance_score {
+                                            ui.label(format!("Score: {:.0}%", score * 100.0));
+                                        }
+                                        if let Some(ref reason) = node.importance_reason {
+                                            ui.label(reason);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.colored_label(egui::Color32::GRAY, "(Disabled - requires AI generation)");
+                        }
+                    });
+
+                ui.separator();
+
+                // Session Summary section
+                egui::CollapsingHeader::new("Session Summary")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if self.session_summary_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Generating summary...");
+                            });
+                        } else if let Some(ref data) = self.session_summary_data.clone() {
+                            // Check for errors first
+                            if let Some(ref err) = data.error {
+                                ui.colored_label(Color32::RED, format!("Error: {}", err));
+                            } else if !data.exists {
+                                ui.label("No summary in database for this session.");
+                            } else {
+                                // Show "just generated" badge if applicable
+                                if data.generated {
+                                    ui.colored_label(Color32::from_rgb(34, 197, 94), "✓ Just generated");
+                                    ui.add_space(5.0);
+                                }
+
+                                // Project and topics
+                                if let Some(ref project) = data.detected_project {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Project:").strong());
+                                        ui.label(project);
+                                    });
+                                }
+
+                                if let Some(ref topics) = data.topics {
+                                    if !topics.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(egui::RichText::new("Topics:").strong());
+                                            for topic in topics.iter().take(5) {
+                                                ui.label(format!("[{}]", topic));
+                                            }
+                                        });
+                                    }
+                                }
+
+                                ui.add_space(5.0);
+
+                                // Summary paragraph
+                                if let Some(ref summary) = data.summary {
+                                    ui.label(egui::RichText::new("Summary").strong());
+                                    egui::ScrollArea::vertical()
+                                        .max_height(100.0)
+                                        .id_salt("window_session_summary_scroll")
+                                        .show(ui, |ui| {
+                                            ui.label(summary);
+                                        });
+                                    ui.add_space(5.0);
+                                }
+
+                                // Completed work
+                                if let Some(ref completed) = data.completed_work {
+                                    if !completed.is_empty() {
+                                        ui.label(egui::RichText::new("Completed Work").strong().color(Color32::GREEN));
+                                        egui::ScrollArea::vertical()
+                                            .max_height(80.0)
+                                            .id_salt("window_session_completed_scroll")
+                                            .show(ui, |ui| {
+                                                for line in completed.split('\n').filter(|l| !l.is_empty()) {
+                                                    ui.label(line);
+                                                }
+                                            });
+                                        ui.add_space(5.0);
+                                    }
+                                }
+
+                                // User requests
+                                if let Some(ref requests) = data.user_requests {
+                                    if !requests.is_empty() {
+                                        ui.label(egui::RichText::new("User Requests").strong().color(Color32::from_rgb(100, 149, 237)));
+                                        egui::ScrollArea::vertical()
+                                            .max_height(60.0)
+                                            .id_salt("window_session_requests_scroll")
+                                            .show(ui, |ui| {
+                                                for line in requests.split('\n').filter(|l| !l.is_empty()) {
+                                                    ui.label(line);
+                                                }
+                                            });
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label("Double-click a node to see");
+                            ui.label("the full session summary.");
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Clear button
+                if ui.button("Clear & Close").clicked() {
+                    self.summary_data = None;
+                    self.summary_node_id = None;
+                    self.session_summary_data = None;
+                    self.summary_window_open = false;
+                    self.summary_window_dragged = false;
+                }
             });
 
-            // Spawn thread to fetch full session summary (generate if missing)
-            let api2 = ApiClient::new();
-            std::thread::spawn(move || {
-                let result = api2.fetch_session_summary(&session_id, true);
-                let _ = session_tx.send(result);
-            });
+        self.summary_window_open = open;
+
+        // Detect if window was dragged from default position
+        if let Some(inner) = window_response {
+            let pos = inner.response.rect.left_top();
+            let dist = (pos - default_pos).length();
+            if dist > 10.0 {
+                self.summary_window_dragged = true;
+            }
         }
     }
 
@@ -431,22 +968,22 @@ impl DashboardApp {
         ui.heading("Graph Controls");
         ui.add_space(10.0);
 
-        // API status
+        // Database status
         ui.horizontal(|ui| {
-            if self.api_connected {
-                ui.colored_label(Color32::GREEN, "● API Connected");
+            if self.db_connected {
+                ui.colored_label(Color32::GREEN, "● DB Connected");
             } else {
-                ui.colored_label(Color32::RED, "● API Disconnected");
+                ui.colored_label(Color32::RED, "● DB Disconnected");
                 if ui.button("Retry").clicked() {
-                    self.check_api();
-                    if self.api_connected {
+                    self.reconnect_db();
+                    if self.db_connected {
                         self.load_graph();
                     }
                 }
             }
         });
 
-        if let Some(ref err) = self.api_error {
+        if let Some(ref err) = self.db_error {
             ui.colored_label(Color32::RED, format!("Error: {}", err));
         }
 
@@ -499,6 +1036,7 @@ impl DashboardApp {
                         self.layout.repulsion = 10000.0;
                         self.layout.attraction = 0.1;
                         self.layout.centering = 0.0001;
+                        self.layout.size_physics_weight = 0.0;
                         self.pan_offset = Vec2::ZERO;
                         self.zoom = 1.0;
                         self.load_graph();
@@ -702,6 +1240,209 @@ impl DashboardApp {
                     ui.add_space(5.0);
                     ui.label(format!("Scored: {} / {}", stats.scored_messages, stats.total_messages));
                 }
+
+                // Rescore button
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    let button_enabled = !self.rescore_loading && !self.graph.data.nodes.is_empty();
+                    if ui.add_enabled(button_enabled, egui::Button::new("Rescore Visible")).clicked() {
+                        self.start_rescore_visible();
+                    }
+                    if self.rescore_loading {
+                        ui.spinner();
+                    }
+                });
+
+                // Show rescore result
+                if let Some(ref result) = self.rescore_result {
+                    if result.errors.is_empty() {
+                        ui.label(format!("Rescored {} msgs in {} sessions",
+                            result.messages_rescored, result.sessions_processed));
+                    } else {
+                        ui.colored_label(Color32::YELLOW, format!(
+                            "Rescored {} msgs, {} errors",
+                            result.messages_rescored, result.errors.len()
+                        ));
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Project filter
+                ui.checkbox(&mut self.project_filter_enabled, "Filter by project");
+                if self.project_filter_enabled && !self.available_projects.is_empty() {
+                    // Cache available_projects to avoid borrow issues
+                    let available = self.available_projects.clone();
+                    ui.indent("project_filter_list", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for project in &available {
+                                    let mut selected = self.selected_projects.contains(project);
+                                    if ui.checkbox(&mut selected, project).changed() {
+                                        if selected {
+                                            self.selected_projects.insert(project.clone());
+                                        } else {
+                                            self.selected_projects.remove(project);
+                                        }
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("All").clicked() {
+                                self.selected_projects = available.iter().cloned().collect();
+                            }
+                            if ui.small_button("None").clicked() {
+                                self.selected_projects.clear();
+                            }
+                        });
+                        // Show count
+                        let visible = self.graph.data.nodes.iter()
+                            .filter(|n| self.selected_projects.contains(&n.project))
+                            .count();
+                        ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
+                    });
+                }
+            });
+
+        // Semantic Filters section
+        egui::CollapsingHeader::new("Semantic Filters")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Loading indicator
+                if self.semantic_filter_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading filters...");
+                    });
+                }
+
+                // Categorization in progress indicator
+                if let Some(filter_id) = self.categorizing_filter_id {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        if let Some(filter) = self.semantic_filters.iter().find(|f| f.id == filter_id) {
+                            ui.label(format!("Categorizing '{}'...", filter.name));
+                        } else {
+                            ui.label("Categorizing...");
+                        }
+                    });
+                }
+
+                // List existing filters with three-state toggles
+                if !self.semantic_filters.is_empty() {
+                    let filters = self.semantic_filters.clone();
+                    for filter in &filters {
+                        ui.horizontal(|ui| {
+                            // Get current mode for this filter
+                            let current_mode = self.semantic_filter_modes
+                                .get(&filter.id)
+                                .copied()
+                                .unwrap_or(SemanticFilterMode::Off);
+
+                            // Three-state toggle buttons: Off, Include (+), Exclude (-)
+                            let off_color = if current_mode == SemanticFilterMode::Off {
+                                Color32::from_rgb(100, 100, 120)
+                            } else {
+                                Color32::from_rgb(50, 50, 60)
+                            };
+                            let include_color = if current_mode == SemanticFilterMode::Include {
+                                Color32::from_rgb(34, 197, 94) // Green
+                            } else {
+                                Color32::from_rgb(50, 50, 60)
+                            };
+                            let exclude_color = if current_mode == SemanticFilterMode::Exclude {
+                                Color32::from_rgb(239, 68, 68) // Red
+                            } else {
+                                Color32::from_rgb(50, 50, 60)
+                            };
+
+                            // Off button
+                            if ui.add(egui::Button::new("O").fill(off_color).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Off - filter not applied")
+                                .clicked()
+                            {
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Off);
+                            }
+
+                            // Include button (+)
+                            if ui.add(egui::Button::new("+").fill(include_color).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Include - only show matching nodes")
+                                .clicked()
+                            {
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
+                            }
+
+                            // Exclude button (-)
+                            if ui.add(egui::Button::new("-").fill(exclude_color).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Exclude - hide matching nodes")
+                                .clicked()
+                            {
+                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
+                            }
+
+                            // Filter name and match count
+                            ui.label(format!("{} ({}/{})", filter.name, filter.matches, filter.total_scored));
+
+                            // Categorize button
+                            let is_categorizing = self.categorizing_filter_id == Some(filter.id);
+                            ui.add_enabled_ui(!is_categorizing && self.categorizing_filter_id.is_none(), |ui| {
+                                if ui.small_button("Run").on_hover_text("Categorize messages with this filter").clicked() {
+                                    self.trigger_categorization(filter.id);
+                                }
+                            });
+
+                            // Delete button
+                            ui.add_enabled_ui(self.categorizing_filter_id.is_none(), |ui| {
+                                if ui.small_button("X").on_hover_text("Delete filter").clicked() {
+                                    self.delete_semantic_filter(filter.id);
+                                }
+                            });
+                        });
+                    }
+                    ui.add_space(5.0);
+                } else if !self.semantic_filter_loading {
+                    ui.label("No filters defined");
+                    ui.add_space(5.0);
+                }
+
+                // Add new filter input
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_filter_input)
+                            .hint_text("New filter...")
+                            .desired_width(120.0)
+                    );
+
+                    let can_add = !self.new_filter_input.trim().is_empty()
+                        && self.categorizing_filter_id.is_none();
+
+                    if ui.add_enabled(can_add, egui::Button::new("+")).clicked()
+                        || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_add)
+                    {
+                        self.create_semantic_filter();
+                    }
+                });
+
+                // Show active filter count and effect
+                let active_filters: Vec<_> = self.semantic_filter_modes.iter()
+                    .filter(|(_, mode)| **mode != SemanticFilterMode::Off)
+                    .collect();
+                if !active_filters.is_empty() {
+                    ui.add_space(5.0);
+                    let include_count = active_filters.iter()
+                        .filter(|(_, mode)| **mode == SemanticFilterMode::Include)
+                        .count();
+                    let exclude_count = active_filters.iter()
+                        .filter(|(_, mode)| **mode == SemanticFilterMode::Exclude)
+                        .count();
+                    ui.label(format!(
+                        "Active: {} include, {} exclude",
+                        include_count,
+                        exclude_count
+                    ));
+                }
             });
 
         // Advanced section (collapsed by default)
@@ -722,6 +1463,12 @@ impl DashboardApp {
                 if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
                     self.mark_settings_dirty();
                 }
+                if ui.add(egui::Slider::new(&mut self.layout.size_physics_weight, 0.0..=5.0)
+                    .text("Size→Physics")
+                    .fixed_decimals(2)).changed() {
+                    self.mark_settings_dirty();
+                }
+                ui.label(egui::RichText::new("↑ Small nodes become less significant").small().weak());
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -876,176 +1623,6 @@ impl DashboardApp {
         }
 
         ui.add_space(10.0);
-        ui.separator();
-
-        // Point-in-Time Summary Panel
-        ui.collapsing("Point-in-Time Summary", |ui| {
-            if self.summary_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Generating summary...");
-                });
-            } else if let Some(ref error) = self.summary_error {
-                ui.colored_label(Color32::RED, format!("Error: {}", error));
-                if ui.button("Dismiss").clicked() {
-                    self.summary_error = None;
-                    self.summary_node_id = None;
-                }
-            } else if let Some(ref data) = self.summary_data {
-                // Message counts
-                ui.horizontal(|ui| {
-                    ui.label(format!("Messages: {} you / {} Claude",
-                        data.user_count, data.assistant_count));
-                });
-                ui.add_space(5.0);
-
-                // Summary
-                ui.label(egui::RichText::new("Summary").strong());
-                egui::ScrollArea::vertical()
-                    .max_height(80.0)
-                    .id_salt("summary_scroll")
-                    .show(ui, |ui| {
-                        ui.label(&data.summary);
-                    });
-                ui.add_space(5.0);
-
-                // Current Focus
-                if !data.current_focus.is_empty() {
-                    ui.label(egui::RichText::new("Working On").strong());
-                    ui.label(&data.current_focus);
-                    ui.add_space(5.0);
-                }
-
-                // Completed Work
-                if !data.completed_work.is_empty() {
-                    ui.label(egui::RichText::new("Completed").strong().color(Color32::GREEN));
-                    egui::ScrollArea::vertical()
-                        .max_height(60.0)
-                        .id_salt("completed_scroll")
-                        .show(ui, |ui| {
-                            for line in data.completed_work.split('\n').filter(|l| !l.is_empty()) {
-                                ui.label(line);
-                            }
-                        });
-                    ui.add_space(5.0);
-                }
-
-                // Unsuccessful Attempts
-                if !data.unsuccessful_attempts.is_empty() {
-                    ui.label(egui::RichText::new("Tried but Failed").strong().color(Color32::from_rgb(255, 100, 100)));
-                    egui::ScrollArea::vertical()
-                        .max_height(60.0)
-                        .id_salt("failed_scroll")
-                        .show(ui, |ui| {
-                            for line in data.unsuccessful_attempts.split('\n').filter(|l| !l.is_empty()) {
-                                ui.label(line);
-                            }
-                        });
-                }
-
-                ui.add_space(5.0);
-                if ui.button("Clear").clicked() {
-                    self.summary_data = None;
-                    self.summary_node_id = None;
-                    self.session_summary_data = None;
-                }
-            } else {
-                ui.label("Double-click a node to generate");
-                ui.label("a summary up to that point.");
-            }
-        });
-
-        // Session Summary Panel (full session)
-        ui.collapsing("Session Summary", |ui| {
-            if self.session_summary_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Generating summary...");
-                });
-            } else if let Some(ref data) = self.session_summary_data {
-                // Check for errors first
-                if let Some(ref err) = data.error {
-                    ui.colored_label(Color32::RED, format!("Error: {}", err));
-                } else if !data.exists {
-                    ui.label("No summary could be generated.");
-                } else {
-                    // Show "just generated" badge if applicable
-                    if data.generated {
-                        ui.colored_label(Color32::from_rgb(34, 197, 94), "✓ Just generated");
-                        ui.add_space(5.0);
-                    }
-
-                    // Project and topics
-                    if let Some(ref project) = data.detected_project {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Project:").strong());
-                            ui.label(project);
-                        });
-                    }
-
-                    if let Some(ref topics) = data.topics {
-                        if !topics.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new("Topics:").strong());
-                                for topic in topics.iter().take(5) {
-                                    ui.label(format!("[{}]", topic));
-                                }
-                            });
-                        }
-                    }
-
-                    ui.add_space(5.0);
-
-                    // Summary paragraph
-                    if let Some(ref summary) = data.summary {
-                        ui.label(egui::RichText::new("Summary").strong());
-                        egui::ScrollArea::vertical()
-                            .max_height(100.0)
-                            .id_salt("session_summary_scroll")
-                            .show(ui, |ui| {
-                                ui.label(summary);
-                            });
-                        ui.add_space(5.0);
-                    }
-
-                    // Completed work
-                    if let Some(ref completed) = data.completed_work {
-                        if !completed.is_empty() {
-                            ui.label(egui::RichText::new("Completed Work").strong().color(Color32::GREEN));
-                            egui::ScrollArea::vertical()
-                                .max_height(80.0)
-                                .id_salt("session_completed_scroll")
-                                .show(ui, |ui| {
-                                    for line in completed.split('\n').filter(|l| !l.is_empty()) {
-                                        ui.label(line);
-                                    }
-                                });
-                            ui.add_space(5.0);
-                        }
-                    }
-
-                    // User requests
-                    if let Some(ref requests) = data.user_requests {
-                        if !requests.is_empty() {
-                            ui.label(egui::RichText::new("User Requests").strong().color(Color32::from_rgb(100, 149, 237)));
-                            egui::ScrollArea::vertical()
-                                .max_height(60.0)
-                                .id_salt("session_requests_scroll")
-                                .show(ui, |ui| {
-                                    for line in requests.split('\n').filter(|l| !l.is_empty()) {
-                                        ui.label(line);
-                                    }
-                                });
-                        }
-                    }
-                }
-            } else {
-                ui.label("Double-click a node to see");
-                ui.label("the full session summary.");
-            }
-        });
-
-        ui.add_space(10.0);
 
         // Legend
         ui.separator();
@@ -1118,7 +1695,10 @@ impl DashboardApp {
         }
 
         // Run physics simulation (uses graph-space center, unaffected by viewport pan)
-        self.layout.step(&mut self.graph, center);
+        // Only simulate visible nodes (respects timeline + importance filters)
+        let physics_visible = self.compute_physics_visible_nodes();
+        let node_sizes = self.compute_node_sizes();
+        self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
 
         // Cache values for transform closure to avoid borrowing self
         let pan_offset = self.pan_offset;
@@ -1147,6 +1727,28 @@ impl DashboardApp {
                     .and_then(|n| n.importance_score)
                     .map_or(false, |s| s < self.importance_threshold);
                 if source_below || target_below {
+                    continue;
+                }
+            }
+
+            // Skip edges where either endpoint is not in selected projects
+            if self.project_filter_enabled {
+                let source_excluded = self.graph.get_node(&edge.source)
+                    .map_or(true, |n| !self.selected_projects.contains(&n.project));
+                let target_excluded = self.graph.get_node(&edge.target)
+                    .map_or(true, |n| !self.selected_projects.contains(&n.project));
+                if source_excluded || target_excluded {
+                    continue;
+                }
+            }
+
+            // Skip edges where either endpoint doesn't pass semantic filters
+            if self.has_active_semantic_filters() {
+                let source_excluded = self.graph.get_node(&edge.source)
+                    .map_or(true, |n| !self.node_passes_semantic_filters(n));
+                let target_excluded = self.graph.get_node(&edge.target)
+                    .map_or(true, |n| !self.node_passes_semantic_filters(n));
+                if source_excluded || target_excluded {
                     continue;
                 }
             }
@@ -1207,6 +1809,14 @@ impl DashboardApp {
                         }
                     }
                 }
+                // Skip nodes not in selected projects when filter is enabled
+                if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
+                    continue;
+                }
+                // Skip nodes that don't pass semantic filters
+                if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
+                    continue;
+                }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
                     let distance = screen_pos.distance(hover_pos);
@@ -1239,6 +1849,16 @@ impl DashboardApp {
                         continue;
                     }
                 }
+            }
+
+            // Skip nodes not in selected projects when filter is enabled
+            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
+                continue;
+            }
+
+            // Skip nodes that don't pass semantic filters
+            if self.has_active_semantic_filters() && !self.node_passes_semantic_filters(node) {
+                continue;
             }
 
             if self.graph.get_pos(&node.id).is_some() {
@@ -1641,10 +2261,10 @@ impl eframe::App for DashboardApp {
                     self.session_summary_loading = false;
                     self.session_summary_receiver = None;
                 }
-                Ok(Err(_)) => {
-                    // Session summary failed, but don't show error (it's optional)
+                Ok(Err(e)) => {
                     self.session_summary_loading = false;
                     self.session_summary_receiver = None;
+                    self.summary_error = Some(format!("Session summary: {}", e));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Still loading, request repaint to check again
@@ -1653,6 +2273,61 @@ impl eframe::App for DashboardApp {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.session_summary_loading = false;
                     self.session_summary_receiver = None;
+                    self.summary_error = Some("Session summary fetch disconnected".to_string());
+                }
+            }
+        }
+
+        // Check for categorization result from background thread
+        if let Some(ref rx) = self.categorization_receiver {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    // Categorization completed - reload filters to get updated stats
+                    self.categorizing_filter_id = None;
+                    self.categorization_receiver = None;
+                    self.load_semantic_filters();
+                    // Also reload graph to get updated semantic_filter_matches
+                    self.load_graph();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Categorization failed: {}", e);
+                    self.categorizing_filter_id = None;
+                    self.categorization_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still loading, request repaint to check again
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.categorizing_filter_id = None;
+                    self.categorization_receiver = None;
+                }
+            }
+        }
+
+        // Check for rescore result from background thread
+        if let Some(ref rx) = self.rescore_receiver {
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    // Rescore completed - store result and reload graph
+                    self.rescore_result = Some(result);
+                    self.rescore_loading = false;
+                    self.rescore_receiver = None;
+                    // Reload graph to get updated importance scores
+                    self.load_graph();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Rescore failed: {}", e);
+                    self.rescore_loading = false;
+                    self.rescore_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still loading, request repaint to check again
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.rescore_loading = false;
+                    self.rescore_receiver = None;
                 }
             }
         }
@@ -1675,7 +2350,8 @@ impl eframe::App for DashboardApp {
         }
 
         // Request continuous repaint for physics simulation or playback
-        if (self.graph.physics_enabled && !self.layout.is_settled(&self.graph))
+        let physics_visible = self.compute_physics_visible_nodes();
+        if (self.graph.physics_enabled && !self.layout.is_settled(&self.graph, physics_visible.as_ref()))
             || self.graph.timeline.playing
         {
             ctx.request_repaint();
@@ -1683,6 +2359,9 @@ impl eframe::App for DashboardApp {
 
         // Dark theme
         ctx.set_visuals(egui::Visuals::dark());
+
+        // Floating summary window (rendered before panels so it floats on top)
+        self.render_summary_window(ctx);
 
         // Sidebar
         egui::SidePanel::left("sidebar")

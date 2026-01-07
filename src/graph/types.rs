@@ -4,6 +4,15 @@ use egui::Pos2;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+/// Mode for semantic filter application
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SemanticFilterMode {
+    #[default]
+    Off,      // Don't apply this filter
+    Include,  // Only show nodes that MATCH
+    Exclude,  // Hide nodes that MATCH
+}
+
 /// Role of a message in the conversation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +66,8 @@ pub struct GraphNode {
     pub cache_read_tokens: Option<i32>,
     #[serde(default)]
     pub cache_creation_tokens: Option<i32>,
+    #[serde(default)]
+    pub semantic_filter_matches: Vec<i32>,
 }
 
 impl GraphNode {
@@ -201,6 +212,19 @@ pub struct SessionSummaryData {
     pub generated_at: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// A semantic filter for categorizing messages
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticFilter {
+    pub id: i32,
+    pub name: String,
+    pub query_text: String,
+    pub is_active: bool,
+    #[serde(default)]
+    pub total_scored: i64,
+    #[serde(default)]
+    pub matches: i64,
 }
 
 /// Timeline state for scrubbing through time

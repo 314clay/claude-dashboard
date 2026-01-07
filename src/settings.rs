@@ -80,6 +80,8 @@ pub struct Preset {
     pub repulsion: f32,
     pub attraction: f32,
     pub centering: f32,
+    #[serde(default)]
+    pub size_physics_weight: f32,
     pub temporal_strength: f32,
     pub temporal_attraction_enabled: bool,
     pub temporal_window_mins: f32,
@@ -108,6 +110,7 @@ impl Preset {
             repulsion: settings.repulsion,
             attraction: settings.attraction,
             centering: settings.centering,
+            size_physics_weight: settings.size_physics_weight,
             temporal_strength: settings.temporal_strength,
             temporal_attraction_enabled: settings.temporal_attraction_enabled,
             temporal_window_mins: settings.temporal_window_mins,
@@ -134,6 +137,7 @@ impl Preset {
         settings.repulsion = self.repulsion;
         settings.attraction = self.attraction;
         settings.centering = self.centering;
+        settings.size_physics_weight = self.size_physics_weight;
         settings.temporal_strength = self.temporal_strength;
         settings.temporal_attraction_enabled = self.temporal_attraction_enabled;
         settings.temporal_window_mins = self.temporal_window_mins;
@@ -179,7 +183,8 @@ pub struct Settings {
     pub repulsion: f32,
     pub attraction: f32,
     pub centering: f32,
-    pub size_repulsion_weight: f32,
+    /// How much visual size affects physics (0 = uniform, higher = more differentiation)
+    pub size_physics_weight: f32,
     pub temporal_strength: f32,
     pub temporal_attraction_enabled: bool,
     pub temporal_window_mins: f32,
@@ -246,7 +251,7 @@ impl Default for Settings {
             repulsion: 10000.0,
             attraction: 0.1,
             centering: 0.0001,
-            size_repulsion_weight: 0.0,
+            size_physics_weight: 0.0,
             temporal_strength: 0.5,
             temporal_attraction_enabled: true,
             temporal_window_mins: 5.0,

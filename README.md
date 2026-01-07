@@ -1,14 +1,77 @@
 # Claude Activity Dashboard (Native)
 
-High-performance native desktop app for visualizing Claude Code sessions. Built with Rust + egui, replacing the laggy Streamlit + vis.js implementation.
+High-performance native desktop app for visualizing Claude Code sessions. Built with Rust + egui for smooth 60fps graph visualization with thousands of nodes.
+
+## Features
+
+- **Force-directed graph** - Interactive visualization of conversations with adjustable physics
+- **Timeline scrubber** - Playback conversations over time, filter by date range
+- **Session summaries** - AI-generated summaries using Gemini (via LiteLLM proxy)
+- **Importance scoring** - Messages scored 0-1 based on decision impact
 
 ## Quick Start
 
+### Prerequisites
+
+- **Rust** - Install via [rustup](https://rustup.rs)
+- **Python 3.10+** - For the API backend
+- **PostgreSQL** - With the `claude_sessions` schema
+
+### Setup
+
+1. **Clone and navigate to the dashboard-native directory**
+
+2. **Set up Python environment**
+   ```bash
+   cd api
+   python3 -m venv ../venv
+   source ../venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. **Configure database** (copy and edit)
+   ```bash
+   cp api/.env.example api/.env
+   # Edit api/.env with your database credentials
+   ```
+
+4. **Start the app**
+   ```bash
+   ./start.sh
+   ```
+
+The script will:
+- Start the Python API on port 8000
+- Build the Rust app (first run takes ~1 min)
+- Launch the dashboard
+
+## Configuration
+
+Copy `api/.env.example` to `api/.env` and configure:
+
 ```bash
-./start.sh
+# Database
+DB_HOST=localhost
+DB_PORT=5433
+DB_USER=postgres
+DB_NAME=connectingservices
+
+# LLM for AI summaries (optional)
+LITELLM_BASE_URL=http://localhost:4001
+LITELLM_API_KEY=sk-your-key
 ```
 
-This starts the Python API backend and launches the Rust app.
+## Database Schema
+
+The dashboard expects a PostgreSQL database with the `claude_sessions` schema:
+
+```sql
+-- Core tables
+claude_sessions.sessions (session_id, cwd, start_time, end_time)
+claude_sessions.messages (id, session_id, role, content, timestamp, importance_score)
+claude_sessions.tool_usages (id, message_id, tool_name, tool_input, timestamp)
+claude_sessions.session_summaries (session_id, summary, topics, detected_project)
+```
 
 ## Architecture
 
@@ -22,10 +85,6 @@ This starts the Python API backend and launches the Rust app.
 │  - Controls │  - Node selection         │               │
 ├─────────────┴───────────────────────────┴───────────────┤
 │                   Timeline Scrubber                     │
-│  - Playback controls (▶ ⏸ ⏮ ⏭)                        │
-│  - Speed selector (0.5x - 8x)                           │
-│  - Draggable time range handles                         │
-│  - Node timestamp notches                               │
 ├─────────────────────────────────────────────────────────┤
 │                    reqwest HTTP                         │
 └────────────────────────┬────────────────────────────────┘
@@ -33,75 +92,35 @@ This starts the Python API backend and launches the Rust app.
            ┌─────────────▼────────────┐
            │   Python API (FastAPI)   │
            │   localhost:8000         │
-           │                          │
-           │  Wraps existing queries  │
-           │  from dashboard/         │
            └─────────────┬────────────┘
                          │
            ┌─────────────▼────────────┐
            │      PostgreSQL          │
-           │      localhost:5433      │
            └──────────────────────────┘
 ```
 
-## Current Features
-
-### Graph Visualization
-- [x] Force-directed layout with adjustable physics
-- [x] Node colors by role (white=user, orange=Claude)
-- [x] Session-colored edges
-- [x] Pan (drag) and zoom (scroll wheel)
-- [x] Hover tooltips with message preview
-- [x] Click to select nodes
-- [x] Arrow indicators on edges
-
-### Timeline Scrubber
-- [x] Bottom panel with time range display
-- [x] Playback controls (play/pause/reset/skip)
-- [x] Speed selector (0.5x, 1x, 2x, 4x, 8x)
-- [x] Draggable scrubber with notches at node timestamps
-- [x] Start/end handles for time window
-- [x] Nodes filter based on time window
-
-### Sidebar Controls
-- [x] Time range selector (1h, 6h, 24h, 3d, 1w)
-- [x] Node size slider
-- [x] Show/hide arrows toggle
-- [x] Physics enable/disable
-- [x] Timeline enable/disable
-- [x] Physics parameters (repulsion, attraction, centering)
-- [x] Statistics display (nodes, edges, FPS)
-- [x] Legend
-
 ## Development
 
-### Prerequisites
+### Run components separately
 
-- **Rust**: Install via `rustup` (https://rustup.rs)
-- **Python**: 3.10+ with venv at `/Users/clayarnold/w/connect/venv`
-- **PostgreSQL**: Running on port 5433 (via Docker)
+```bash
+# API only (with hot reload)
+cd api
+source ../venv/bin/activate
+uvicorn main:app --reload --port 8000
+
+# Rust app only (API must be running)
+cargo run --release
+```
 
 ### Build
 
 ```bash
 # Debug build (faster compilation)
-source ~/.cargo/env
 cargo build
 
-# Release build (optimized, what start.sh uses)
+# Release build (optimized)
 cargo build --release
-```
-
-### Run Components Separately
-
-```bash
-# API only
-cd api
-/Users/clayarnold/w/connect/venv/bin/uvicorn main:app --reload --port 8000
-
-# App only (API must be running)
-source ~/.cargo/env
-cargo run --release
 ```
 
 ### API Endpoints
@@ -113,7 +132,10 @@ cargo run --release
 | `GET /sessions?hours=24&limit=50` | Session list |
 | `GET /metrics?hours=24` | Overview counts |
 | `GET /session/{id}/messages` | Messages for a session |
+| `GET /session/{id}/summary` | AI-generated summary |
 | `GET /tools?hours=24` | Tool usage stats |
+| `GET /projects` | Detected projects |
+| `POST /importance/backfill` | Score message importance |
 
 ## File Structure
 
@@ -122,24 +144,24 @@ dashboard-native/
 ├── Cargo.toml              # Rust dependencies
 ├── start.sh                # One-command startup
 ├── README.md               # This file
-├── CLAUDE.md               # Dev notes for Claude Code
 │
 ├── src/
-│   ├── main.rs             # Entry point, window setup
-│   ├── app.rs              # UI state, rendering, timeline
-│   │
-│   ├── api/
-│   │   ├── mod.rs          # Module exports
-│   │   └── client.rs       # HTTP client for Python API
-│   │
+│   ├── main.rs             # Entry point
+│   ├── app.rs              # UI rendering
+│   ├── api/client.rs       # HTTP client
 │   └── graph/
-│       ├── mod.rs          # Module exports
-│       ├── types.rs        # GraphNode, GraphEdge, GraphState, TimelineState
-│       └── layout.rs       # Force-directed physics simulation
+│       ├── types.rs        # Data structures
+│       └── layout.rs       # Force-directed physics
 │
 └── api/
-    ├── main.py             # FastAPI app wrapping dashboard queries
-    └── requirements.txt    # Python deps (fastapi, uvicorn)
+    ├── main.py             # FastAPI endpoints
+    ├── requirements.txt    # Python dependencies
+    ├── .env.example        # Configuration template
+    ├── project_detection.py
+    └── db/                 # Database module
+        ├── queries.py      # SQL queries
+        ├── summarizer.py   # AI summaries
+        └── importance/     # Importance scoring
 ```
 
 ## Performance
@@ -147,39 +169,10 @@ dashboard-native/
 | Metric | Target | Actual |
 |--------|--------|--------|
 | FPS (500 nodes) | ≥55 | ~60 |
-| FPS (1000 nodes) | ≥45 | TBD |
+| FPS (1000 nodes) | ≥45 | ~55 |
 | Startup time | <1s | ~0.5s |
 | Memory | <100MB | ~50MB |
 
-## Roadmap
+## License
 
-### Phase 1: Graph Prototype ✅
-- [x] Basic graph rendering
-- [x] Force-directed layout
-- [x] Pan/zoom/hover/click
-- [x] Timeline scrubber with playback
-
-### Phase 2: Graph Polish
-- [ ] Detail panel (slide-in from right on double-click)
-- [ ] Obsidian node type (purple diamond)
-- [ ] Topic node type (green hexagon)
-- [ ] Semantic similarity edges (cyan, dashed)
-- [ ] Session filter dropdown
-- [ ] Keyboard shortcuts (spacebar=play, arrows=step)
-
-### Phase 3: Additional Pages
-- [ ] Overview dashboard (metrics, charts)
-- [ ] Session explorer (list + detail view)
-- [ ] Tools analysis (usage breakdown)
-- [ ] Work patterns (heatmap, badges)
-
-## Spec Document
-
-Full feature spec with 31 user stories:
-`/Users/clayarnold/w/connect/docs/dashboard-feature-spec.md`
-
-## Related
-
-- **Original Streamlit dashboard**: `/Users/clayarnold/w/connect/dashboard/`
-- **Database schema**: `claude_sessions` in PostgreSQL
-- **Docker config**: `/Users/clayarnold/w/connect/database/docker/docker-compose.yml`
+MIT

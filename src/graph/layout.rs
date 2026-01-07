@@ -10,6 +10,7 @@ use super::quadtree::Quadtree;
 use super::types::GraphState;
 use egui::{Pos2, Vec2};
 use rand::seq::SliceRandom;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum temporal edges to process per physics frame (stochastic sampling)
 const TEMPORAL_EDGES_PER_FRAME: usize = 2000;
@@ -32,6 +33,8 @@ pub struct ForceLayout {
     pub ideal_length: f32,
     /// Temporal edge strength multiplier
     pub temporal_strength: f32,
+    /// How much visual size affects mass/charge (0 = uniform, higher = more differentiation)
+    pub size_physics_weight: f32,
 }
 
 impl Default for ForceLayout {
@@ -45,26 +48,82 @@ impl Default for ForceLayout {
             max_velocity: 50.0,
             ideal_length: 100.0,
             temporal_strength: 0.5,
+            size_physics_weight: 0.0,
         }
     }
 }
 
 impl ForceLayout {
     /// Run one iteration of the force simulation
-    pub fn step(&self, state: &mut GraphState, center: Pos2) {
+    /// If `visible_nodes` is Some, only simulate those nodes (filtered view)
+    /// `node_sizes` maps node IDs to their visual sizes (for mass-based physics)
+    pub fn step(
+        &self,
+        state: &mut GraphState,
+        center: Pos2,
+        visible_nodes: Option<&HashSet<String>>,
+        node_sizes: Option<&HashMap<String, f32>>,
+    ) {
         if !state.physics_enabled || state.data.nodes.is_empty() {
             return;
         }
 
-        let node_ids: Vec<String> = state.data.nodes.iter().map(|n| n.id.clone()).collect();
+        // Filter to only visible nodes if filter is active
+        let node_ids: Vec<String> = state
+            .data
+            .nodes
+            .iter()
+            .filter(|n| visible_nodes.map_or(true, |v| v.contains(&n.id)))
+            .map(|n| n.id.clone())
+            .collect();
 
-        // Calculate forces for each node
+        if node_ids.is_empty() {
+            return;
+        }
+
+        // Build local index for filtered nodes (forces array indices)
+        let local_index: HashMap<String, usize> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+
+        // Calculate forces for each visible node
         let mut forces: Vec<Vec2> = vec![Vec2::ZERO; node_ids.len()];
 
+        // Compute node masses from sizes
+        // mass = 1.0 + weight * normalized_size (range: 1.0 to 1.0 + weight)
+        // At weight=0, all masses are 1.0 (uniform)
+        let (min_size, max_size) = if let Some(sizes) = node_sizes {
+            let min = sizes.values().cloned().fold(f32::MAX, f32::min);
+            let max = sizes.values().cloned().fold(0.0_f32, f32::max);
+            (min, max.max(min + 0.001)) // Avoid division by zero
+        } else {
+            (1.0, 1.0)
+        };
+
+        let node_masses: HashMap<String, f32> = node_ids
+            .iter()
+            .map(|id| {
+                let size = node_sizes
+                    .and_then(|s| s.get(id))
+                    .copied()
+                    .unwrap_or(1.0);
+                let normalized = (size - min_size) / (max_size - min_size);
+                let mass = 1.0 + self.size_physics_weight * normalized;
+                (id.clone(), mass.max(0.1)) // Floor to prevent instability
+            })
+            .collect();
+
         // Repulsion using Barnes-Hut quadtree - O(n log n) instead of O(n²)
+        // Only include visible nodes in the tree, with computed masses
         let positions_with_mass: Vec<(Pos2, f32)> = node_ids
             .iter()
-            .filter_map(|id| state.positions.get(id).map(|&pos| (pos, 1.0)))
+            .filter_map(|id| {
+                let pos = state.positions.get(id)?;
+                let mass = node_masses.get(id).copied().unwrap_or(1.0);
+                Some((*pos, mass))
+            })
             .collect();
 
         let tree = Quadtree::build(&positions_with_mass, 1.0); // theta = 1.0
@@ -77,15 +136,21 @@ impl ForceLayout {
         }
 
         // Separate temporal edges from regular edges for stochastic sampling
+        // Only include edges where BOTH endpoints are visible
+        let is_edge_visible = |e: &&super::types::GraphEdge| {
+            visible_nodes.map_or(true, |v| v.contains(&e.source) && v.contains(&e.target))
+        };
+
         let (temporal_edges, regular_edges): (Vec<_>, Vec<_>) = state
             .data
             .edges
             .iter()
+            .filter(is_edge_visible)
             .partition(|e| e.is_temporal);
 
         // Process ALL regular edges (structural edges are important)
         for edge in &regular_edges {
-            self.apply_edge_force(edge, state, &mut forces, 1.0);
+            self.apply_edge_force(edge, state, &local_index, &mut forces, 1.0, &node_masses);
         }
 
         // Stochastic sampling: process a random subset of temporal edges
@@ -102,7 +167,7 @@ impl ForceLayout {
                 .collect();
 
             for edge in sampled {
-                self.apply_edge_force(edge, state, &mut forces, scale);
+                self.apply_edge_force(edge, state, &local_index, &mut forces, scale, &node_masses);
             }
         }
 
@@ -114,11 +179,14 @@ impl ForceLayout {
             }
         }
 
-        // Apply forces and update positions
+        // Apply forces and update positions (only for visible nodes)
+        // F = ma, so a = F/m - lighter nodes accelerate more from the same force
         for (i, id) in node_ids.iter().enumerate() {
-            // Update velocity
+            // Update velocity (divide force by mass so light nodes move more)
             if let Some(vel) = state.velocities.get_mut(id) {
-                *vel = (*vel + forces[i]) * self.damping;
+                let mass = node_masses.get(id).copied().unwrap_or(1.0);
+                let acceleration = forces[i] / mass;
+                *vel = (*vel + acceleration) * self.damping;
 
                 // Clamp velocity
                 if vel.length() > self.max_velocity {
@@ -134,25 +202,34 @@ impl ForceLayout {
     }
 
     /// Check if the simulation has settled
-    pub fn is_settled(&self, state: &GraphState) -> bool {
-        let total_velocity: f32 = state.velocities.values().map(|v| v.length()).sum();
-        let avg_velocity = total_velocity / state.data.nodes.len().max(1) as f32;
+    /// If `visible_nodes` is Some, only check velocity of visible nodes
+    pub fn is_settled(&self, state: &GraphState, visible_nodes: Option<&HashSet<String>>) -> bool {
+        let (total_velocity, count): (f32, usize) = state
+            .velocities
+            .iter()
+            .filter(|(id, _)| visible_nodes.map_or(true, |v| v.contains(*id)))
+            .fold((0.0, 0), |(sum, cnt), (_, v)| (sum + v.length(), cnt + 1));
+        let avg_velocity = total_velocity / count.max(1) as f32;
         avg_velocity < 0.5
     }
 
     /// Apply attraction force for a single edge
+    /// Uses `node_index` to map node IDs to force array indices
+    /// Edge force is scaled by geometric mean of node masses (small-small edges are weak)
     fn apply_edge_force(
         &self,
         edge: &super::types::GraphEdge,
         state: &GraphState,
+        node_index: &HashMap<String, usize>,
         forces: &mut [Vec2],
         scale: f32,
+        node_masses: &HashMap<String, f32>,
     ) {
-        let source_idx = match state.node_index.get(&edge.source) {
+        let source_idx = match node_index.get(&edge.source) {
             Some(&i) => i,
             None => return,
         };
-        let target_idx = match state.node_index.get(&edge.target) {
+        let target_idx = match node_index.get(&edge.target) {
             Some(&i) => i,
             None => return,
         };
@@ -182,7 +259,13 @@ impl ForceLayout {
             1.0
         };
 
-        let force_magnitude = self.attraction * displacement * edge_multiplier * scale;
+        // Scale edge force by geometric mean of node masses
+        // This makes small↔small edges weak, big↔big edges strong
+        let mass_source = node_masses.get(&edge.source).copied().unwrap_or(1.0);
+        let mass_target = node_masses.get(&edge.target).copied().unwrap_or(1.0);
+        let mass_factor = (mass_source * mass_target).sqrt();
+
+        let force_magnitude = self.attraction * displacement * edge_multiplier * mass_factor * scale;
 
         let force = delta.normalized() * force_magnitude;
         forces[source_idx] += force;
