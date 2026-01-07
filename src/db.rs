@@ -57,7 +57,7 @@ struct SummaryRow {
 /// Row returned from semantic filter matches query
 #[derive(Debug, FromRow)]
 struct FilterMatchRow {
-    message_id: i32,
+    message_id: i64,  // bigint in DB
     filter_id: i32,
 }
 
@@ -258,7 +258,10 @@ impl DbClient {
                     // Build message_id -> filter_ids mapping
                     let mut matches_map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
                     for row in filter_matches {
-                        matches_map.entry(row.message_id).or_default().push(row.filter_id);
+                        // message_id is i64 in DB but i32 in nodes, convert safely
+                        if let Ok(msg_id) = i32::try_from(row.message_id) {
+                            matches_map.entry(msg_id).or_default().push(row.filter_id);
+                        }
                     }
 
                     // Update nodes with their filter matches
