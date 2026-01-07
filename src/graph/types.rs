@@ -8,9 +8,11 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SemanticFilterMode {
     #[default]
-    Off,      // Don't apply this filter
-    Include,  // Only show nodes that MATCH
-    Exclude,  // Hide nodes that MATCH
+    Off,          // Don't apply this filter
+    Exclude,      // Hide nodes that MATCH
+    Include,      // Only show nodes that MATCH
+    IncludePlus1, // Show matching nodes + their direct neighbors (BFS depth 1)
+    IncludePlus2, // Show matching nodes + neighbors up to depth 2
 }
 
 /// Role of a message in the conversation
