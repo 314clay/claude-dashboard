@@ -69,6 +69,21 @@ impl TimeRange {
             TimeRange::Month3
         }
     }
+
+    /// Get the bin duration in seconds for histogram view
+    /// Aims for ~12-30 bins depending on range
+    fn bin_duration_secs(&self) -> f64 {
+        match self {
+            TimeRange::Hour1 => 5.0 * 60.0,       // 5 min bins (12 bins)
+            TimeRange::Hour6 => 30.0 * 60.0,      // 30 min bins (12 bins)
+            TimeRange::Hour24 => 60.0 * 60.0,     // 1 hr bins (24 bins)
+            TimeRange::Day3 => 3.0 * 60.0 * 60.0, // 3 hr bins (24 bins)
+            TimeRange::Week1 => 6.0 * 60.0 * 60.0,   // 6 hr bins (28 bins)
+            TimeRange::Week2 => 12.0 * 60.0 * 60.0,  // 12 hr bins (28 bins)
+            TimeRange::Month1 => 24.0 * 60.0 * 60.0, // 1 day bins (30 bins)
+            TimeRange::Month3 => 7.0 * 24.0 * 60.0 * 60.0, // 1 week bins (~13 bins)
+        }
+    }
 }
 
 /// Importance scoring statistics
@@ -95,6 +110,7 @@ pub struct DashboardApp {
     show_arrows: bool,
     loading: bool,
     timeline_enabled: bool,
+    timeline_histogram_mode: bool,
 
     // Node sizing (unified formula)
     sizing_preset: SizingPreset,
@@ -172,6 +188,9 @@ pub struct DashboardApp {
     semantic_filter_loading: bool,
     categorizing_filter_id: Option<i32>,
     categorization_receiver: Option<Receiver<Result<(), String>>>,
+
+    // Cached semantic filter visible set (invalidate on filter change or data load)
+    semantic_filter_cache: Option<HashSet<String>>,
 }
 
 impl DashboardApp {
@@ -212,6 +231,7 @@ impl DashboardApp {
             show_arrows: settings.show_arrows,
             loading: false,
             timeline_enabled: settings.timeline_enabled,
+            timeline_histogram_mode: false, // Default to notch view
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
             w_tokens: settings.w_tokens,
@@ -275,6 +295,7 @@ impl DashboardApp {
             semantic_filter_loading: false,
             categorizing_filter_id: None,
             categorization_receiver: None,
+            semantic_filter_cache: None,
         };
 
         // Load initial data if connected
@@ -385,6 +406,7 @@ impl DashboardApp {
                 );
                 self.graph.load(data, bounds);
                 self.loading = false;
+                self.semantic_filter_cache = None;  // Invalidate cache
 
                 // Extract available projects from nodes
                 let projects: HashSet<String> = self.graph.data.nodes.iter()
@@ -601,8 +623,8 @@ impl DashboardApp {
             return None;
         }
 
-        // Pre-compute semantic filter visible set (handles +1/+2 expansion)
-        let semantic_visible = self.compute_semantic_filter_visible_set();
+        // Use cached semantic filter visible set (computed once per frame in update())
+        let semantic_visible = self.semantic_filter_cache.clone();
 
         let mut visible = HashSet::new();
         for node in &self.graph.data.nodes {
@@ -838,8 +860,8 @@ impl DashboardApp {
     fn get_visible_session_ids(&self) -> Vec<String> {
         let mut session_ids: HashSet<String> = HashSet::new();
 
-        // Pre-compute semantic filter visible set
-        let semantic_visible = self.compute_semantic_filter_visible_set();
+        // Use cached semantic filter visible set
+        let semantic_visible = self.semantic_filter_cache.clone();
 
         for node in &self.graph.data.nodes {
             // Check timeline filter
@@ -1263,8 +1285,8 @@ impl DashboardApp {
                 }
 
                 ui.add_space(5.0);
-                ui.label("Color by:");
                 ui.horizontal(|ui| {
+                    ui.label("Color by:");
                     if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
                         self.graph.color_by_project = true;
                         self.mark_settings_dirty();
@@ -1272,6 +1294,10 @@ impl DashboardApp {
                     if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
                         self.graph.color_by_project = false;
                         self.mark_settings_dirty();
+                    }
+                    ui.separator();
+                    if ui.button("🎲").on_hover_text("Randomize hues").clicked() {
+                        self.graph.randomize_hue_offset();
                     }
                 });
             });
@@ -1487,6 +1513,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Off);
+                                self.semantic_filter_cache = None;
                             }
 
                             // Exclude button (-)
@@ -1496,6 +1523,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
+                                self.semantic_filter_cache = None;
                             }
 
                             // Include button (+)
@@ -1505,6 +1533,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
+                                self.semantic_filter_cache = None;
                             }
 
                             // Include +1 button (show matching + direct neighbors)
@@ -1514,6 +1543,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus1);
+                                self.semantic_filter_cache = None;
                             }
 
                             // Include +2 button (show matching + neighbors up to depth 2)
@@ -1523,6 +1553,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus2);
+                                self.semantic_filter_cache = None;
                             }
 
                             // Filter name and match count
@@ -1854,8 +1885,8 @@ impl DashboardApp {
             center + centered * zoom + pan_offset
         };
 
-        // Pre-compute semantic filter visible set once for both edge and node rendering
-        let semantic_visible = self.compute_semantic_filter_visible_set();
+        // Use cached semantic filter visible set (computed once per frame in update())
+        let semantic_visible = self.semantic_filter_cache.clone();
 
         // Draw edges first (behind nodes)
         for edge in &self.graph.data.edges {
@@ -2216,6 +2247,8 @@ impl DashboardApp {
         let timestamps: Vec<f64> = self.graph.timeline.timestamps.clone();
         let min_time = self.graph.timeline.min_time;
         let max_time = self.graph.timeline.max_time;
+        let histogram_mode = self.timeline_histogram_mode;
+        let bin_duration = self.time_range.bin_duration_secs();
 
         // Helper to calculate position from time
         let position_at_time = |t: f64| -> f32 {
@@ -2264,6 +2297,15 @@ impl DashboardApp {
                     self.graph.timeline.speed = speed;
                 }
             }
+
+            ui.separator();
+
+            // View mode toggle (notch vs histogram)
+            let view_label = if histogram_mode { "📊" } else { "┃┃" };
+            let view_tooltip = if histogram_mode { "Histogram view (click for notches)" } else { "Notch view (click for histogram)" };
+            if ui.button(view_label).on_hover_text(view_tooltip).clicked() {
+                self.timeline_histogram_mode = !self.timeline_histogram_mode;
+            }
         });
 
         ui.add_space(4.0);
@@ -2292,15 +2334,68 @@ impl DashboardApp {
             Color32::from_rgb(30, 33, 40)
         );
 
-        // Draw notches for each node timestamp
-        let notch_color = Color32::from_rgb(60, 65, 75);
-        for &t in &timestamps {
-            let pos = position_at_time(t);
-            let x = rect.left() + pos * rect.width();
-            painter.line_segment(
-                [Pos2::new(x, rect.top() + 5.0), Pos2::new(x, rect.bottom() - 5.0)],
-                Stroke::new(1.0, notch_color)
-            );
+        // Draw either notches or histogram based on mode
+        if histogram_mode {
+            // Histogram mode: bin timestamps and draw bars
+            let time_span = max_time - min_time;
+            if time_span > 0.0 && bin_duration > 0.0 {
+                let num_bins = ((time_span / bin_duration).ceil() as usize).max(1);
+                let mut bin_counts: Vec<usize> = vec![0; num_bins];
+
+                // Count messages per bin
+                for &t in &timestamps {
+                    let bin_idx = ((t - min_time) / bin_duration) as usize;
+                    let bin_idx = bin_idx.min(num_bins - 1);
+                    bin_counts[bin_idx] += 1;
+                }
+
+                // Find max count for normalization
+                let max_count = bin_counts.iter().copied().max().unwrap_or(1).max(1);
+
+                // Draw histogram bars
+                let bar_color = Color32::from_rgb(80, 90, 110);
+                let bar_highlight = Color32::from_rgb(100, 120, 150);
+                let track_height = rect.height() - 10.0; // Leave padding
+
+                for (i, &count) in bin_counts.iter().enumerate() {
+                    if count == 0 {
+                        continue;
+                    }
+
+                    let bin_start_time = min_time + (i as f64) * bin_duration;
+                    let bin_end_time = (bin_start_time + bin_duration).min(max_time);
+
+                    let x_start = rect.left() + position_at_time(bin_start_time) * rect.width();
+                    let x_end = rect.left() + position_at_time(bin_end_time) * rect.width();
+                    let bar_width = (x_end - x_start - 2.0).max(2.0); // Min 2px, 1px gap
+
+                    let height_ratio = (count as f32) / (max_count as f32);
+                    let bar_height = height_ratio * track_height;
+
+                    let bar_rect = egui::Rect::from_min_size(
+                        Pos2::new(x_start + 1.0, rect.bottom() - 5.0 - bar_height),
+                        Vec2::new(bar_width, bar_height),
+                    );
+
+                    // Highlight bars in selected range
+                    let bar_in_range = position_at_time(bin_start_time) >= start_pos
+                        && position_at_time(bin_end_time) <= end_pos;
+                    let color = if bar_in_range { bar_highlight } else { bar_color };
+
+                    painter.rect_filled(bar_rect, 1.0, color);
+                }
+            }
+        } else {
+            // Notch mode: draw individual lines for each timestamp
+            let notch_color = Color32::from_rgb(60, 65, 75);
+            for &t in &timestamps {
+                let pos = position_at_time(t);
+                let x = rect.left() + pos * rect.width();
+                painter.line_segment(
+                    [Pos2::new(x, rect.top() + 5.0), Pos2::new(x, rect.bottom() - 5.0)],
+                    Stroke::new(1.0, notch_color)
+                );
+            }
         }
 
         // Draw selected range
@@ -2373,6 +2468,11 @@ impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_fps();
         self.maybe_save_settings();
+
+        // Refresh semantic filter cache once per frame if needed
+        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
+            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        }
 
         // Check for point-in-time summary result from background thread
         if let Some(ref rx) = self.summary_receiver {

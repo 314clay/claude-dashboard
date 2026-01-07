@@ -357,6 +357,8 @@ pub struct GraphState {
     pub parent_hues: HashMap<String, f32>,
     /// Sibling counts per parent (for offset calculation)
     pub sibling_counts: HashMap<String, usize>,
+    /// Global hue offset for randomizing colors while preserving relationships
+    pub hue_offset: f32,
     /// Color mode: true = by project, false = by session
     pub color_by_project: bool,
     /// Is physics simulation running?
@@ -388,6 +390,7 @@ impl GraphState {
             project_colors: HashMap::new(),
             parent_hues: HashMap::new(),
             sibling_counts: HashMap::new(),
+            hue_offset: 0.0,
             color_by_project: true, // Default to project coloring
             physics_enabled: true,
             hovered_node: None,
@@ -679,14 +682,25 @@ impl GraphState {
         self.node_index.get(id).map(|&i| &self.data.nodes[i])
     }
 
+    /// Apply global hue offset, wrapping around 360°
+    fn apply_hue_offset(&self, hue: f32) -> f32 {
+        (hue + self.hue_offset) % 360.0
+    }
+
+    /// Randomize the global hue offset (preserves relative color relationships)
+    pub fn randomize_hue_offset(&mut self) {
+        use rand::Rng;
+        self.hue_offset = rand::thread_rng().gen_range(0.0..360.0);
+    }
+
     /// Get the color for a node based on current color mode
     pub fn node_color(&self, node: &GraphNode) -> egui::Color32 {
         if self.color_by_project && !node.project.is_empty() {
             let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.55)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.55)
         } else {
             let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.5)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.5)
         }
     }
 
@@ -694,10 +708,10 @@ impl GraphState {
     pub fn node_color_light(&self, node: &GraphNode) -> egui::Color32 {
         if self.color_by_project && !node.project.is_empty() {
             let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.6, 0.75)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.6, 0.75)
         } else {
             let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.6, 0.7)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.6, 0.7)
         }
     }
 
@@ -714,16 +728,16 @@ impl GraphState {
             if let Some(node) = self.get_node(&edge.source) {
                 if !node.project.is_empty() {
                     let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-                    return hsl_to_rgb(hue, 0.5, 0.4);
+                    return hsl_to_rgb(self.apply_hue_offset(hue), 0.5, 0.4);
                 }
             }
             // Fallback to session color
             let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.5, 0.4)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.5, 0.4)
         } else {
             // Session-based color
             let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.5)
+            hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.5)
         }
     }
 }
