@@ -2,7 +2,7 @@
 
 use crate::api::{ApiClient, RescoreResult};
 use crate::db::DbClient;
-use crate::graph::types::{PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
+use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::settings::{Preset, Settings, SizingPreset};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
@@ -209,7 +209,7 @@ impl DashboardApp {
         // Create graph state with saved settings
         let mut graph = GraphState::new();
         graph.physics_enabled = settings.physics_enabled;
-        graph.color_by_project = settings.color_by_project;
+        graph.color_mode = settings.color_mode;
         graph.temporal_attraction_enabled = settings.temporal_attraction_enabled;
         graph.temporal_window_secs = settings.temporal_window_mins as f64 * 60.0;
         graph.max_temporal_edges = settings.max_temporal_edges;
@@ -332,7 +332,7 @@ impl DashboardApp {
         self.settings.node_size = self.node_size;
         self.settings.show_arrows = self.show_arrows;
         self.settings.timeline_enabled = self.timeline_enabled;
-        self.settings.color_by_project = self.graph.color_by_project;
+        self.settings.color_mode = self.graph.color_mode;
         self.settings.importance_threshold = self.importance_threshold;
         self.settings.importance_filter_enabled = self.importance_filter_enabled;
         self.settings.sizing_preset = self.sizing_preset;
@@ -358,7 +358,7 @@ impl DashboardApp {
         self.node_size = self.settings.node_size;
         self.show_arrows = self.settings.show_arrows;
         self.timeline_enabled = self.settings.timeline_enabled;
-        self.graph.color_by_project = self.settings.color_by_project;
+        self.graph.color_mode = self.settings.color_mode;
         self.graph.timeline.speed = self.settings.timeline_speed;
         self.importance_threshold = self.settings.importance_threshold;
         self.importance_filter_enabled = self.settings.importance_filter_enabled;
@@ -1287,12 +1287,25 @@ impl DashboardApp {
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     ui.label("Color by:");
-                    if ui.selectable_label(self.graph.color_by_project, "Project").clicked() {
-                        self.graph.color_by_project = true;
+                    if ui.selectable_label(self.graph.color_mode == ColorMode::Project, "Project")
+                        .on_hover_text("All sessions in same project share the same color")
+                        .clicked()
+                    {
+                        self.graph.color_mode = ColorMode::Project;
                         self.mark_settings_dirty();
                     }
-                    if ui.selectable_label(!self.graph.color_by_project, "Session").clicked() {
-                        self.graph.color_by_project = false;
+                    if ui.selectable_label(self.graph.color_mode == ColorMode::Hybrid, "Hybrid")
+                        .on_hover_text("Project hue + session shade (older=lighter, newer=darker)")
+                        .clicked()
+                    {
+                        self.graph.color_mode = ColorMode::Hybrid;
+                        self.mark_settings_dirty();
+                    }
+                    if ui.selectable_label(self.graph.color_mode == ColorMode::Session, "Session")
+                        .on_hover_text("Each session gets its own unique color")
+                        .clicked()
+                    {
+                        self.graph.color_mode = ColorMode::Session;
                         self.mark_settings_dirty();
                     }
                     ui.separator();
@@ -1800,8 +1813,8 @@ impl DashboardApp {
 
         // Legend
         ui.separator();
-        if self.graph.color_by_project {
-            ui.label("Projects");
+        if self.graph.color_mode != ColorMode::Session {
+            ui.label(if self.graph.color_mode == ColorMode::Hybrid { "Projects (Hybrid)" } else { "Projects" });
             // Show top projects by color
             let mut projects: Vec<_> = self.graph.project_colors.iter().collect();
             projects.sort_by(|a, b| a.0.cmp(b.0));

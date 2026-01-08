@@ -1,5 +1,6 @@
 //! Persistent settings for the dashboard app.
 
+use crate::graph::types::ColorMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -61,7 +62,8 @@ pub struct Preset {
     pub node_size: f32,
     pub show_arrows: bool,
     pub timeline_enabled: bool,
-    pub color_by_project: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
     pub timeline_speed: f32,
 
     // Node Sizing
@@ -97,7 +99,7 @@ impl Preset {
             node_size: settings.node_size,
             show_arrows: settings.show_arrows,
             timeline_enabled: settings.timeline_enabled,
-            color_by_project: settings.color_by_project,
+            color_mode: settings.color_mode,
             timeline_speed: settings.timeline_speed,
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
@@ -124,7 +126,7 @@ impl Preset {
         settings.node_size = self.node_size;
         settings.show_arrows = self.show_arrows;
         settings.timeline_enabled = self.timeline_enabled;
-        settings.color_by_project = self.color_by_project;
+        settings.color_mode = self.color_mode;
         settings.timeline_speed = self.timeline_speed;
         settings.sizing_preset = self.sizing_preset;
         settings.w_importance = self.w_importance;
@@ -156,7 +158,8 @@ pub struct Settings {
     pub node_size: f32,
     pub show_arrows: bool,
     pub timeline_enabled: bool,
-    pub color_by_project: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
 
     // Node Sizing (unified formula)
     #[serde(default)]
@@ -231,7 +234,7 @@ impl Default for Settings {
             node_size: 15.0,
             show_arrows: true,
             timeline_enabled: true,
-            color_by_project: true,
+            color_mode: ColorMode::Project,
             timeline_spacing_even: false,
             timeline_speed: 1.0,
 
