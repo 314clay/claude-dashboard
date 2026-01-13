@@ -1,6 +1,6 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, RescoreResult};
+use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
@@ -111,6 +111,7 @@ pub struct DashboardApp {
     loading: bool,
     timeline_enabled: bool,
     timeline_histogram_mode: bool,
+    hover_scrubs_timeline: bool,
 
     // Node sizing (unified formula)
     sizing_preset: SizingPreset,
@@ -127,8 +128,9 @@ pub struct DashboardApp {
     importance_filter_enabled: bool,
     importance_stats: Option<ImportanceStats>,
     rescore_loading: bool,
-    rescore_receiver: Option<Receiver<Result<RescoreResult, String>>>,
+    rescore_receiver: Option<Receiver<RescoreEvent>>,
     rescore_result: Option<RescoreResult>,
+    rescore_progress: Option<RescoreProgress>,
 
     // Project filtering
     project_filter_enabled: bool,
@@ -191,6 +193,10 @@ pub struct DashboardApp {
 
     // Cached semantic filter visible set (invalidate on filter change or data load)
     semantic_filter_cache: Option<HashSet<String>>,
+
+    // Summary caches (populated on double-click, shown in tooltip)
+    point_in_time_summary_cache: HashMap<String, PartialSummaryData>,  // node_id -> summary
+    session_summary_cache: HashMap<String, SessionSummaryData>,        // session_id -> summary
 }
 
 impl DashboardApp {
@@ -232,6 +238,7 @@ impl DashboardApp {
             loading: false,
             timeline_enabled: settings.timeline_enabled,
             timeline_histogram_mode: false, // Default to notch view
+            hover_scrubs_timeline: settings.hover_scrubs_timeline,
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
             w_tokens: settings.w_tokens,
@@ -244,6 +251,7 @@ impl DashboardApp {
             rescore_loading: false,
             rescore_receiver: None,
             rescore_result: None,
+            rescore_progress: None,
             project_filter_enabled: false,
             selected_projects: HashSet::new(),
             available_projects: Vec::new(),
@@ -296,6 +304,10 @@ impl DashboardApp {
             categorizing_filter_id: None,
             categorization_receiver: None,
             semantic_filter_cache: None,
+
+            // Summary caches
+            point_in_time_summary_cache: HashMap::new(),
+            session_summary_cache: HashMap::new(),
         };
 
         // Load initial data if connected
@@ -332,6 +344,7 @@ impl DashboardApp {
         self.settings.node_size = self.node_size;
         self.settings.show_arrows = self.show_arrows;
         self.settings.timeline_enabled = self.timeline_enabled;
+        self.settings.hover_scrubs_timeline = self.hover_scrubs_timeline;
         self.settings.color_mode = self.graph.color_mode;
         self.settings.importance_threshold = self.importance_threshold;
         self.settings.importance_filter_enabled = self.importance_filter_enabled;
@@ -358,6 +371,7 @@ impl DashboardApp {
         self.node_size = self.settings.node_size;
         self.show_arrows = self.settings.show_arrows;
         self.timeline_enabled = self.settings.timeline_enabled;
+        self.hover_scrubs_timeline = self.settings.hover_scrubs_timeline;
         self.graph.color_mode = self.settings.color_mode;
         self.graph.timeline.speed = self.settings.timeline_speed;
         self.importance_threshold = self.settings.importance_threshold;
@@ -832,7 +846,7 @@ impl DashboardApp {
         self.categorization_receiver = Some(rx);
     }
 
-    /// Start rescoring importance for visible nodes (runs in background)
+    /// Start rescoring importance for visible nodes (runs in background with progress)
     fn start_rescore_visible(&mut self) {
         // Collect unique session IDs from visible nodes
         let session_ids: Vec<String> = self.get_visible_session_ids();
@@ -843,14 +857,16 @@ impl DashboardApp {
 
         self.rescore_loading = true;
         self.rescore_result = None;
+        self.rescore_progress = None;
 
-        // Run rescore in background thread
+        // Run rescore in background thread with streaming progress
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             let api = ApiClient::new();
-            let result = api.rescore_importance(session_ids);
-            let _ = tx.send(result);
+            if let Err(e) = api.rescore_importance_stream(session_ids, tx.clone()) {
+                let _ = tx.send(RescoreEvent::Error(e));
+            }
         });
 
         self.rescore_receiver = Some(rx);
@@ -1215,7 +1231,7 @@ impl DashboardApp {
                             if ui.selectable_value(&mut self.selected_preset_index, Some(i), name).changed() {
                                 // Apply the preset immediately on selection
                                 if let Some(preset) = self.settings.presets.get(i).cloned() {
-                                    preset.apply_to(&mut self.settings);
+                                    preset.apply_to(&mut self.settings, &mut self.graph);
                                     self.sync_ui_from_settings();
                                     self.mark_settings_dirty();
                                 }
@@ -1237,11 +1253,11 @@ impl DashboardApp {
                         // Check if preset with this name exists
                         if let Some(idx) = self.settings.presets.iter().position(|p| p.name == name) {
                             // Update existing
-                            self.settings.presets[idx] = Preset::from_settings(name, &self.settings);
+                            self.settings.presets[idx] = Preset::from_settings(name, &self.settings, &self.graph);
                             self.selected_preset_index = Some(idx);
                         } else {
                             // Add new
-                            let preset = Preset::from_settings(name, &self.settings);
+                            let preset = Preset::from_settings(name, &self.settings, &self.graph);
                             self.settings.presets.push(preset);
                             self.selected_preset_index = Some(self.settings.presets.len() - 1);
                         }
@@ -1282,6 +1298,11 @@ impl DashboardApp {
                 }
                 if ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber").changed() {
                     self.mark_settings_dirty();
+                }
+                if self.timeline_enabled {
+                    if ui.checkbox(&mut self.hover_scrubs_timeline, "Hover scrubs timeline").changed() {
+                        self.mark_settings_dirty();
+                    }
                 }
 
                 ui.add_space(5.0);
@@ -1419,13 +1440,28 @@ impl DashboardApp {
                     if ui.add_enabled(button_enabled, egui::Button::new("Rescore Visible")).clicked() {
                         self.start_rescore_visible();
                     }
-                    if self.rescore_loading {
-                        ui.spinner();
-                    }
                 });
 
-                // Show rescore result
-                if let Some(ref result) = self.rescore_result {
+                // Show rescore progress or result
+                if self.rescore_loading {
+                    if let Some(ref progress) = self.rescore_progress {
+                        // Show progress bar and text
+                        let fraction = if progress.total > 0 {
+                            (progress.current + 1) as f32 / progress.total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(fraction)
+                            .text(format!("{}/{}", progress.current + 1, progress.total)));
+                        ui.label(format!("Session {}... ({} msgs)",
+                            progress.session_id, progress.messages_so_far));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Starting...");
+                        });
+                    }
+                } else if let Some(ref result) = self.rescore_result {
                     if result.errors.is_empty() {
                         ui.label(format!("Rescored {} msgs in {} sessions",
                             result.messages_rescored, result.sessions_processed));
@@ -1903,10 +1939,8 @@ impl DashboardApp {
 
         // Draw edges first (behind nodes)
         for edge in &self.graph.data.edges {
-            // Skip edges for hidden nodes when timeline is enabled
-            if self.timeline_enabled && !self.graph.is_edge_visible(edge) {
-                continue;
-            }
+            // Check if edge is dimmed (timeline-hidden) vs fully hidden (other filters)
+            let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_edge_visible(edge);
 
             // Skip edges where either endpoint is below importance threshold
             if self.importance_filter_enabled {
@@ -1953,7 +1987,12 @@ impl DashboardApp {
             } else {
                 0.5
             };
-            let color = self.graph.edge_color(edge).gamma_multiply(base_opacity);
+
+            // Use greyscale and reduced opacity for timeline-dimmed edges
+            let mut color = self.graph.edge_color(edge).gamma_multiply(base_opacity);
+            if is_timeline_dimmed {
+                color = crate::graph::types::to_greyscale(color).gamma_multiply(0.4);
+            }
             let stroke = Stroke::new(1.5 * self.zoom, color);
 
             painter.line_segment([source_pos, target_pos], stroke);
@@ -1977,16 +2016,13 @@ impl DashboardApp {
             }
         }
 
-        // Detect hover - always select closest visible node to cursor
+        // Detect hover - select closest node to cursor
+        // Note: Timeline-dimmed nodes are hoverable (they're greyed out, not hidden)
         let mut new_hovered = None;
         if let Some(hover_pos) = response.hover_pos() {
             let mut closest: Option<(String, f32)> = None; // (node_id, distance)
 
             for node in &self.graph.data.nodes {
-                // Skip hidden nodes when timeline is enabled
-                if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
-                    continue;
-                }
                 // Skip nodes below importance threshold when filter is enabled
                 if self.importance_filter_enabled {
                     if let Some(score) = node.importance_score {
@@ -2017,18 +2053,33 @@ impl DashboardApp {
 
             new_hovered = closest.map(|(id, _)| id);
         }
+
+        // Hover-to-scrub: move timeline playhead to hovered node's timestamp
+        let prev_hovered = self.graph.hovered_node.clone();
         self.graph.hovered_node = new_hovered;
+
+        if self.hover_scrubs_timeline && self.timeline_enabled && self.graph.hovered_node != prev_hovered {
+            if let Some(ref hovered_id) = self.graph.hovered_node {
+                // Cache the timestamp to avoid borrow issues
+                let node_time = self.graph.get_node(hovered_id).and_then(|n| n.timestamp_secs());
+                if let Some(t) = node_time {
+                    let new_pos = self.graph.timeline.position_at_time(t);
+                    // Move timeline to hovered node (allows clicking on dimmed nodes to bring them into focus)
+                    self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
+                    self.graph.update_visible_nodes();
+                }
+            }
+        }
 
         // Two-pass node rendering:
         // Pass 1: Compute all size multipliers and find max
-        let mut node_multipliers: Vec<(usize, f32)> = Vec::new();
+        // Tuple: (index, multiplier, is_timeline_dimmed)
+        let mut node_multipliers: Vec<(usize, f32, bool)> = Vec::new();
         let mut max_multiplier: f32 = 0.001; // Avoid division by zero
 
         for (idx, node) in self.graph.data.nodes.iter().enumerate() {
-            // Skip hidden nodes when timeline is enabled
-            if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
-                continue;
-            }
+            // Check if node is timeline-dimmed (visible but greyed out)
+            let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_node_visible(&node.id);
 
             // Skip nodes below importance threshold when filter is enabled
             if self.importance_filter_enabled {
@@ -2080,16 +2131,53 @@ impl DashboardApp {
 
                 // Combine factors multiplicatively
                 let raw_multiplier = imp_factor * tok_factor * time_factor;
-                node_multipliers.push((idx, raw_multiplier));
-                max_multiplier = max_multiplier.max(raw_multiplier);
+                node_multipliers.push((idx, raw_multiplier, is_timeline_dimmed));
+                // Only include non-dimmed nodes in max calculation for normalization
+                if !is_timeline_dimmed {
+                    max_multiplier = max_multiplier.max(raw_multiplier);
+                }
             }
         }
 
-        // Compute normalization scale: largest node gets max_node_multiplier
+        // Compute normalization scale: largest visible node gets max_node_multiplier
         let scale = self.max_node_multiplier / max_multiplier;
 
         // Pass 2: Draw nodes with normalized sizes
-        for (idx, raw_multiplier) in node_multipliers {
+        // Draw dimmed nodes first (behind active nodes)
+        for &(idx, _raw_multiplier, is_dimmed) in &node_multipliers {
+            if !is_dimmed {
+                continue; // Skip active nodes in this pass
+            }
+            let node = &self.graph.data.nodes[idx];
+            if let Some(pos) = self.graph.get_pos(&node.id) {
+                let screen_pos = transform(pos);
+
+                // Dimmed nodes use a fixed smaller size
+                let size = self.node_size * self.zoom * 0.5;
+
+                // Use greyscale color with reduced opacity
+                let base_color = self.graph.node_color(node);
+                let color = crate::graph::types::to_greyscale(base_color).gamma_multiply(0.4);
+
+                // Draw node
+                painter.circle_filled(screen_pos, size, color);
+
+                // Draw inner circle for Claude responses (also greyscale)
+                if node.role == crate::graph::types::Role::Assistant {
+                    let inner_size = size * 0.4;
+                    painter.circle_filled(screen_pos, inner_size, Color32::from_gray(30));
+                }
+
+                // Minimal border for dimmed nodes
+                painter.circle_stroke(screen_pos, size, Stroke::new(1.0, color.gamma_multiply(0.7)));
+            }
+        }
+
+        // Pass 2b: Draw active (non-dimmed) nodes on top
+        for (idx, raw_multiplier, is_dimmed) in node_multipliers {
+            if is_dimmed {
+                continue; // Already drawn in previous pass
+            }
             let node = &self.graph.data.nodes[idx];
             if let Some(pos) = self.graph.get_pos(&node.id) {
                 let screen_pos = transform(pos);
@@ -2196,15 +2284,38 @@ impl DashboardApp {
 
                     let timestamp_str = node.timestamp.as_deref().unwrap_or("N/A");
 
+                    // Build summary preview from cache (if available)
+                    let summary_str = {
+                        // Try point-in-time summary first (more specific to this node)
+                        if let Some(pit_summary) = self.point_in_time_summary_cache.get(hovered_id) {
+                            if !pit_summary.summary.is_empty() {
+                                format!("\n\n--- Summary ---\n{}", truncate_lines(&pit_summary.summary, 2, 120))
+                            } else {
+                                String::new()
+                            }
+                        }
+                        // Fall back to session summary
+                        else if let Some(session_summary) = self.session_summary_cache.get(&node.session_id) {
+                            if let Some(ref summary) = session_summary.summary {
+                                format!("\n\n--- Session ---\n{}", truncate_lines(summary, 2, 120))
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    };
+
                     let tooltip_text = format!(
-                        "{}\n{}\n\nTime: {}\nSession: {}\nProject: {}\nImportance: {}{}",
+                        "{}\n{}\n\nTime: {}\nSession: {}\nProject: {}\nImportance: {}{}{}",
                         node.role.label(),
                         truncate(&node.content_preview, 80),
                         timestamp_str,
                         node.session_short,
                         node.project,
                         importance_str,
-                        token_str
+                        token_str,
+                        summary_str
                     );
 
                     let galley = painter.layout_no_wrap(
@@ -2491,6 +2602,10 @@ impl eframe::App for DashboardApp {
         if let Some(ref rx) = self.summary_receiver {
             match rx.try_recv() {
                 Ok(Ok(data)) => {
+                    // Cache for tooltip display
+                    if let Some(ref node_id) = self.summary_node_id {
+                        self.point_in_time_summary_cache.insert(node_id.clone(), data.clone());
+                    }
                     self.summary_data = Some(data);
                     self.summary_loading = false;
                     self.summary_receiver = None;
@@ -2516,6 +2631,12 @@ impl eframe::App for DashboardApp {
         if let Some(ref rx) = self.session_summary_receiver {
             match rx.try_recv() {
                 Ok(Ok(data)) => {
+                    // Cache for tooltip display (if we have a valid summary)
+                    if data.exists {
+                        if let Some(ref session_id) = self.summary_session_id {
+                            self.session_summary_cache.insert(session_id.clone(), data.clone());
+                        }
+                    }
                     self.session_summary_data = Some(data);
                     self.session_summary_loading = false;
                     self.session_summary_receiver = None;
@@ -2564,29 +2685,44 @@ impl eframe::App for DashboardApp {
             }
         }
 
-        // Check for rescore result from background thread
+        // Check for rescore events from background thread
         if let Some(ref rx) = self.rescore_receiver {
-            match rx.try_recv() {
-                Ok(Ok(result)) => {
-                    // Rescore completed - store result and reload graph
-                    self.rescore_result = Some(result);
-                    self.rescore_loading = false;
-                    self.rescore_receiver = None;
-                    // Reload graph to get updated importance scores
-                    self.load_graph();
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Rescore failed: {}", e);
-                    self.rescore_loading = false;
-                    self.rescore_receiver = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still loading, request repaint to check again
-                    ctx.request_repaint();
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.rescore_loading = false;
-                    self.rescore_receiver = None;
+            // Drain all available events (multiple progress updates may be pending)
+            loop {
+                match rx.try_recv() {
+                    Ok(RescoreEvent::Progress(progress)) => {
+                        // Update progress display
+                        self.rescore_progress = Some(progress);
+                        ctx.request_repaint();
+                    }
+                    Ok(RescoreEvent::Complete(result)) => {
+                        // Rescore completed - store result and reload graph
+                        self.rescore_result = Some(result);
+                        self.rescore_loading = false;
+                        self.rescore_progress = None;
+                        self.rescore_receiver = None;
+                        // Reload graph to get updated importance scores
+                        self.load_graph();
+                        break;
+                    }
+                    Ok(RescoreEvent::Error(e)) => {
+                        eprintln!("Rescore failed: {}", e);
+                        self.rescore_loading = false;
+                        self.rescore_progress = None;
+                        self.rescore_receiver = None;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // No more events, request repaint to check again
+                        ctx.request_repaint();
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.rescore_loading = false;
+                        self.rescore_progress = None;
+                        self.rescore_receiver = None;
+                        break;
+                    }
                 }
             }
         }
@@ -2666,5 +2802,29 @@ fn truncate(s: &str, max_chars: usize) -> String {
         format!("{}...", truncated)
     } else {
         s.to_string()
+    }
+}
+
+/// Truncate to a limited number of lines, each with a max character count
+fn truncate_lines(s: &str, max_lines: usize, max_chars_per_line: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let truncated_lines: Vec<String> = lines
+        .iter()
+        .take(max_lines)
+        .map(|line| {
+            if line.chars().count() > max_chars_per_line {
+                let truncated: String = line.chars().take(max_chars_per_line).collect();
+                format!("{}...", truncated)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    let result = truncated_lines.join("\n");
+    if lines.len() > max_lines {
+        format!("{}...", result)
+    } else {
+        result
     }
 }

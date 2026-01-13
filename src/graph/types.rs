@@ -362,10 +362,10 @@ pub struct GraphState {
     pub session_colors: HashMap<String, f32>,
     /// Project colors (project_name -> hue)
     pub project_colors: HashMap<String, f32>,
-    /// Parent directory hues (top-level dir -> base hue) for tree-based coloring
-    pub parent_hues: HashMap<String, f32>,
-    /// Sibling counts per parent (for offset calculation)
-    pub sibling_counts: HashMap<String, usize>,
+    /// Tracks how many children we've seen for each parent path
+    pub child_counts: HashMap<String, usize>,
+    /// Maps "parent:child" to the child's sibling index
+    pub child_indices: HashMap<String, usize>,
     /// Global hue offset for randomizing colors while preserving relationships
     pub hue_offset: f32,
     /// Color mode for graph visualization
@@ -400,8 +400,8 @@ impl GraphState {
             node_index: HashMap::new(),
             session_colors: HashMap::new(),
             project_colors: HashMap::new(),
-            parent_hues: HashMap::new(),
-            sibling_counts: HashMap::new(),
+            child_counts: HashMap::new(),
+            child_indices: HashMap::new(),
             hue_offset: 0.0,
             color_mode: ColorMode::Project, // Default to project coloring
             project_sessions: HashMap::new(),
@@ -428,55 +428,52 @@ impl GraphState {
     }
 
     /// Compute hue for a project based on its position in the directory tree.
-    /// Projects under the same parent directory get similar hues (within ±20°).
-    /// Different top-level directories get distinct hues (golden ratio spacing).
+    /// Tree distance maps to hue distance:
+    /// - Siblings at each level get golden-ratio-spaced hues
+    /// - Children inherit parent's base hue + smaller offset
+    /// - Deeper nesting = tighter clustering (diminishing hue range)
     fn compute_project_hue(&mut self, project: &str) -> f32 {
-        // Extract path after ~/w/ (or just use first component if different structure)
-        let path = project.trim_start_matches("~/w/").trim_start_matches("~/");
+        // Normalize consistently - just strip ~/
+        let path = project.trim_start_matches("~/");
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
         if parts.is_empty() {
-            // Fallback for empty/weird paths
-            return (self.project_colors.len() as f32 * 137.5) % 360.0;
+            return 0.0;
         }
 
-        // Top-level directory determines base hue
-        let top_level = parts[0].to_string();
+        let mut hue = 0.0;
+        let mut parent_path = String::new();
 
-        // Get or assign base hue for this top-level directory
-        let base_hue = if let Some(&hue) = self.parent_hues.get(&top_level) {
-            hue
-        } else {
-            // New top-level: assign using golden ratio for good distribution
-            let hue = (self.parent_hues.len() as f32 * 137.5) % 360.0;
-            self.parent_hues.insert(top_level.clone(), hue);
-            hue
-        };
+        for (depth, part) in parts.iter().enumerate() {
+            // Build current path
+            let current_path = if parent_path.is_empty() {
+                part.to_string()
+            } else {
+                format!("{}/{}", parent_path, part)
+            };
 
-        // If this is the top-level itself (no subdirs), return base hue
-        if parts.len() == 1 {
-            return base_hue;
+            // Get or assign sibling index for this child under its parent
+            let sibling_key = format!("{}:{}", parent_path, part);
+            let sibling_idx = if let Some(&idx) = self.child_indices.get(&sibling_key) {
+                idx
+            } else {
+                let parent_child_count = self.child_counts.entry(parent_path.clone()).or_insert(0);
+                let idx = *parent_child_count;
+                *parent_child_count += 1;
+                self.child_indices.insert(sibling_key, idx);
+                idx
+            };
+
+            // Golden ratio offset, scaled by depth
+            // Depth 0: 360° range, depth 1: 180° range, depth 2: 90° range, etc.
+            let range = 360.0 / (1 << depth) as f32;
+            let offset = (sibling_idx as f32 * 137.5) % range;
+
+            hue += offset;
+            parent_path = current_path;
         }
 
-        // For subdirectories, offset slightly from parent hue
-        // Each sibling gets a 8° offset, wrapping within ±30° of base
-        let sibling_idx = *self.sibling_counts.get(&top_level).unwrap_or(&0);
-        self.sibling_counts.insert(top_level, sibling_idx + 1);
-
-        // Offset pattern: 0, 8, -8, 16, -16, 24, -24, ...
-        // This spreads siblings around the base hue
-        let offset = if sibling_idx == 0 {
-            0.0
-        } else {
-            let magnitude = ((sibling_idx + 1) / 2) as f32 * 8.0;
-            if sibling_idx % 2 == 1 { magnitude } else { -magnitude }
-        };
-
-        // Clamp offset to ±30° so siblings stay visually grouped
-        let clamped_offset = offset.clamp(-30.0, 30.0);
-
-        // Return final hue, wrapping around 360°
-        (base_hue + clamped_offset + 360.0) % 360.0
+        hue % 360.0
     }
 
     /// Load new graph data, initializing positions randomly
@@ -490,8 +487,8 @@ impl GraphState {
         self.node_index.clear();
         self.session_colors.clear();
         self.project_colors.clear();
-        self.parent_hues.clear();
-        self.sibling_counts.clear();
+        self.child_counts.clear();
+        self.child_indices.clear();
         self.project_sessions.clear();
 
         // Build node index and initialize positions
@@ -874,4 +871,14 @@ pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> egui::Color32 {
         ((g + m) * 255.0) as u8,
         ((b + m) * 255.0) as u8,
     )
+}
+
+/// Convert a color to greyscale (using luminosity method)
+pub fn to_greyscale(color: egui::Color32) -> egui::Color32 {
+    let r = color.r() as f32;
+    let g = color.g() as f32;
+    let b = color.b() as f32;
+    // Luminosity formula for perceived brightness
+    let grey = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+    egui::Color32::from_rgba_unmultiplied(grey, grey, grey, color.a())
 }
