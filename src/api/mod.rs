@@ -2,4 +2,4 @@
 
 mod client;
 
-pub use client::{ApiClient, ImportanceStats, RescoreResult};
+pub use client::{ApiClient, ImportanceStats, RescoreEvent, RescoreProgress, RescoreResult};

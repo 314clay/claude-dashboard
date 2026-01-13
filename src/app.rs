@@ -308,6 +308,7 @@ impl DashboardApp {
             // Summary caches
             point_in_time_summary_cache: HashMap::new(),
             session_summary_cache: HashMap::new(),
+
         };
 
         // Load initial data if connected
@@ -1300,7 +1301,10 @@ impl DashboardApp {
                     self.mark_settings_dirty();
                 }
                 if self.timeline_enabled {
-                    if ui.checkbox(&mut self.hover_scrubs_timeline, "Hover scrubs timeline").changed() {
+                    if ui.checkbox(&mut self.hover_scrubs_timeline, "Hover scrubs timeline")
+                        .on_hover_text("Same-session hover scrubs instantly; click to jump to cross-session nodes")
+                        .changed()
+                    {
                         self.mark_settings_dirty();
                     }
                 }
@@ -2055,19 +2059,22 @@ impl DashboardApp {
         }
 
         // Hover-to-scrub: move timeline playhead to hovered node's timestamp
+        // Same-session nodes switch instantly; cross-session requires click
         let prev_hovered = self.graph.hovered_node.clone();
         self.graph.hovered_node = new_hovered;
 
-        if self.hover_scrubs_timeline && self.timeline_enabled && self.graph.hovered_node != prev_hovered {
+        if self.hover_scrubs_timeline && self.timeline_enabled {
             if let Some(ref hovered_id) = self.graph.hovered_node {
-                // Cache the timestamp to avoid borrow issues
-                let node_time = self.graph.get_node(hovered_id).and_then(|n| n.timestamp_secs());
-                if let Some(t) = node_time {
-                    let new_pos = self.graph.timeline.position_at_time(t);
-                    // Move timeline to hovered node (allows clicking on dimmed nodes to bring them into focus)
-                    self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
-                    self.graph.update_visible_nodes();
+                // Only instant-scrub for same-session (visible) nodes
+                if self.graph.is_node_visible(hovered_id) && self.graph.hovered_node != prev_hovered {
+                    let node_time = self.graph.get_node(hovered_id).and_then(|n| n.timestamp_secs());
+                    if let Some(t) = node_time {
+                        let new_pos = self.graph.timeline.position_at_time(t);
+                        self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
+                        self.graph.update_visible_nodes();
+                    }
                 }
+                // Cross-session (dimmed) nodes: do nothing on hover, handled by click
             }
         }
 
@@ -2174,6 +2181,13 @@ impl DashboardApp {
         }
 
         // Pass 2b: Draw active (non-dimmed) nodes on top
+        // Get current scrubber time for "future node" desaturation
+        let scrubber_time = if self.timeline_enabled {
+            Some(self.graph.timeline.time_at_position(self.graph.timeline.position))
+        } else {
+            None
+        };
+
         for (idx, raw_multiplier, is_dimmed) in node_multipliers {
             if is_dimmed {
                 continue; // Already drawn in previous pass
@@ -2194,7 +2208,17 @@ impl DashboardApp {
                 };
 
                 // Use project or session color based on mode
-                let color = self.graph.node_color(node);
+                let base_color = self.graph.node_color(node);
+
+                // Desaturate "future" nodes (in session but after scrubber position)
+                let is_future = scrubber_time
+                    .and_then(|st| node.timestamp_secs().map(|nt| nt > st))
+                    .unwrap_or(false);
+                let color = if is_future && !is_hovered && !is_selected {
+                    crate::graph::types::desaturate(base_color, 0.7)
+                } else {
+                    base_color
+                };
 
                 // Draw node
                 painter.circle_filled(screen_pos, size, color);
@@ -2226,8 +2250,20 @@ impl DashboardApp {
         if response.clicked() {
             let clicked_node = self.graph.hovered_node.clone();
 
-            // Check for double-click (same node within 500ms)
             if let Some(ref node_id) = clicked_node {
+                // Cross-session click: if clicking on a dimmed (non-visible) node, jump timeline to it
+                if self.hover_scrubs_timeline && self.timeline_enabled {
+                    if !self.graph.is_node_visible(node_id) {
+                        let node_time = self.graph.get_node(node_id).and_then(|n| n.timestamp_secs());
+                        if let Some(t) = node_time {
+                            let new_pos = self.graph.timeline.position_at_time(t);
+                            self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
+                            self.graph.update_visible_nodes();
+                        }
+                    }
+                }
+
+                // Check for double-click (same node within 500ms)
                 let now = Instant::now();
                 let elapsed = now.duration_since(self.last_click_time).as_millis();
                 let same_node = self.last_click_node.as_ref() == Some(node_id);

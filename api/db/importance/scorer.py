@@ -13,7 +13,7 @@ from .context import SessionContext
 
 # LiteLLM proxy configuration
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-1234")  # Placeholder
+LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
 MODEL_NAME = os.environ.get("SUMMARY_MODEL", "gemini-2.5-flash")
 
 

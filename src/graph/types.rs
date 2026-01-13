@@ -882,3 +882,14 @@ pub fn to_greyscale(color: egui::Color32) -> egui::Color32 {
     let grey = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
     egui::Color32::from_rgba_unmultiplied(grey, grey, grey, color.a())
 }
+
+/// Desaturate a color by blending it towards grey
+/// amount: 0.0 = original color, 1.0 = fully grey
+pub fn desaturate(color: egui::Color32, amount: f32) -> egui::Color32 {
+    let grey = to_greyscale(color);
+    let inv = 1.0 - amount;
+    let r = (color.r() as f32 * inv + grey.r() as f32 * amount) as u8;
+    let g = (color.g() as f32 * inv + grey.g() as f32 * amount) as u8;
+    let b = (color.b() as f32 * inv + grey.b() as f32 * amount) as u8;
+    egui::Color32::from_rgba_unmultiplied(r, g, b, color.a())
+}

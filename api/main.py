@@ -4,7 +4,9 @@ Provides REST endpoints for the Rust desktop app to fetch graph data.
 """
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from typing import Optional
+import json
 import uvicorn
 
 # Import from local db module (self-contained)
@@ -39,6 +41,11 @@ from db.semantic_filters import (
 from db.semantic_filter_scorer import (
     categorize_messages,
     get_filter_stats,
+)
+from db.health_ingest import (
+    ingest_payload as health_ingest_payload,
+    get_recent_sleep,
+    get_health_stats,
 )
 from pydantic import BaseModel
 
@@ -283,6 +290,72 @@ def importance_rescore(
     return rescore_sessions(body.session_ids, batch_size)
 
 
+def rescore_stream_generator(session_ids: list[str], batch_size: int):
+    """Generator that yields SSE events for rescore progress."""
+    from db.importance.context import SessionContextManager
+    from db.importance.scorer import ImportanceScorer
+
+    manager = SessionContextManager(staleness_days=0)
+    scorer = ImportanceScorer()
+
+    total = len(session_ids)
+    messages_rescored = 0
+    sessions_processed = 0
+    errors = []
+
+    for i, session_id in enumerate(session_ids):
+        # Yield progress event
+        progress = {
+            "type": "progress",
+            "current": i,
+            "total": total,
+            "session_id": session_id[:8],
+            "messages_so_far": messages_rescored,
+        }
+        yield f"data: {json.dumps(progress)}\n\n"
+
+        try:
+            context, _ = manager.get_or_create_context(session_id)
+            if context is None:
+                errors.append(f"{session_id[:8]}: failed to create context")
+                continue
+
+            scores = scorer.score_session(
+                session_id, context, batch_size=batch_size, force=True
+            )
+            sessions_processed += 1
+            messages_rescored += len(scores)
+
+        except Exception as e:
+            errors.append(f"{session_id[:8]}: {str(e)}")
+
+    # Yield final result
+    result = {
+        "type": "complete",
+        "sessions_processed": sessions_processed,
+        "messages_rescored": messages_rescored,
+        "errors": errors,
+    }
+    yield f"data: {json.dumps(result)}\n\n"
+
+
+@app.post("/importance/rescore/stream")
+def importance_rescore_stream(
+    body: RescoreRequest,
+    batch_size: int = Query(default=30, description="Messages per LLM call"),
+):
+    """Rescore importance with streaming progress updates.
+
+    Yields SSE events:
+    - progress: { type: "progress", current, total, session_id, messages_so_far }
+    - complete: { type: "complete", sessions_processed, messages_rescored, errors }
+    """
+    return StreamingResponse(
+        rescore_stream_generator(body.session_ids, batch_size),
+        media_type="text/event-stream",
+    )
+
+
 # ==== Semantic Filter Endpoints ====
 
 @app.get("/semantic-filters")
@@ -362,5 +435,60 @@ def semantic_filter_stats():
     return get_filter_stats()
 
 
+# ==== Health Auto Export Endpoints ====
+
+@app.post("/health/ingest")
+async def health_ingest(payload: dict):
+    """Ingest health data from Health Auto Export iOS app.
+
+    Accepts webhook payloads from Health Auto Export and stores them
+    in the health schema (sleep_analysis, metrics tables).
+
+    Expected payload format:
+    {
+        "data": {
+            "metrics": [
+                {"name": "sleep_analysis", "data": [...]},
+                {"name": "heart_rate", "units": "bpm", "data": [...]}
+            ],
+            "workouts": [...]
+        }
+    }
+
+    Returns: { status, ingest_id, sleep_records, metric_records }
+    """
+    try:
+        result = health_ingest_payload(payload)
+        return result
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/health/sleep")
+def health_sleep(days: int = 7):
+    """Get recent sleep data.
+
+    Returns sleep records from the last N days.
+    """
+    records = get_recent_sleep(days)
+    # Convert datetimes to ISO strings
+    for r in records:
+        for k, v in r.items():
+            if hasattr(v, 'isoformat'):
+                r[k] = v.isoformat()
+    return {"records": records, "count": len(records)}
+
+
+@app.get("/health/stats")
+def health_stats():
+    """Get health data statistics.
+
+    Returns counts of ingests, sleep records, and metrics.
+    """
+    return get_health_stats()
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Bind to 0.0.0.0 to allow access via Tailscale
+    # Port 10800 for dashboard API / health ingest
+    uvicorn.run(app, host="0.0.0.0", port=10800)
