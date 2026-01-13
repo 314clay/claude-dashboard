@@ -4,6 +4,26 @@ use egui::Pos2;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+/// Mode for semantic filter application
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SemanticFilterMode {
+    #[default]
+    Off,          // Don't apply this filter
+    Exclude,      // Hide nodes that MATCH
+    Include,      // Only show nodes that MATCH
+    IncludePlus1, // Show matching nodes + their direct neighbors (BFS depth 1)
+    IncludePlus2, // Show matching nodes + neighbors up to depth 2
+}
+
+/// Color mode for graph visualization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ColorMode {
+    #[default]
+    Project,  // All sessions in same project share same hue
+    Session,  // Each session gets its own hue
+    Hybrid,   // Project hue + session S/L variation (temporally similar = similar shade)
+}
+
 /// Role of a message in the conversation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +77,8 @@ pub struct GraphNode {
     pub cache_read_tokens: Option<i32>,
     #[serde(default)]
     pub cache_creation_tokens: Option<i32>,
+    #[serde(default)]
+    pub semantic_filter_matches: Vec<i32>,
 }
 
 impl GraphNode {
@@ -203,6 +225,19 @@ pub struct SessionSummaryData {
     pub error: Option<String>,
 }
 
+/// A semantic filter for categorizing messages
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticFilter {
+    pub id: i32,
+    pub name: String,
+    pub query_text: String,
+    pub is_active: bool,
+    #[serde(default)]
+    pub total_scored: i64,
+    #[serde(default)]
+    pub matches: i64,
+}
+
 /// Timeline state for scrubbing through time
 #[derive(Debug, Clone)]
 pub struct TimelineState {
@@ -327,8 +362,17 @@ pub struct GraphState {
     pub session_colors: HashMap<String, f32>,
     /// Project colors (project_name -> hue)
     pub project_colors: HashMap<String, f32>,
-    /// Color mode: true = by project, false = by session
-    pub color_by_project: bool,
+    /// Tracks how many children we've seen for each parent path
+    pub child_counts: HashMap<String, usize>,
+    /// Maps "parent:child" to the child's sibling index
+    pub child_indices: HashMap<String, usize>,
+    /// Global hue offset for randomizing colors while preserving relationships
+    pub hue_offset: f32,
+    /// Color mode for graph visualization
+    pub color_mode: ColorMode,
+    /// Sessions within each project, sorted by timestamp: project -> [(session_id, timestamp)]
+    /// Used for hybrid coloring to give temporally close sessions similar shades
+    pub project_sessions: HashMap<String, Vec<(String, f64)>>,
     /// Is physics simulation running?
     pub physics_enabled: bool,
     /// Currently hovered node
@@ -356,7 +400,11 @@ impl GraphState {
             node_index: HashMap::new(),
             session_colors: HashMap::new(),
             project_colors: HashMap::new(),
-            color_by_project: true, // Default to project coloring
+            child_counts: HashMap::new(),
+            child_indices: HashMap::new(),
+            hue_offset: 0.0,
+            color_mode: ColorMode::Project, // Default to project coloring
+            project_sessions: HashMap::new(),
             physics_enabled: true,
             hovered_node: None,
             selected_node: None,
@@ -379,6 +427,55 @@ impl GraphState {
         (tokens + 1.0).ln() / (max + 1.0).ln()
     }
 
+    /// Compute hue for a project based on its position in the directory tree.
+    /// Tree distance maps to hue distance:
+    /// - Siblings at each level get golden-ratio-spaced hues
+    /// - Children inherit parent's base hue + smaller offset
+    /// - Deeper nesting = tighter clustering (diminishing hue range)
+    fn compute_project_hue(&mut self, project: &str) -> f32 {
+        // Normalize consistently - just strip ~/
+        let path = project.trim_start_matches("~/");
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if parts.is_empty() {
+            return 0.0;
+        }
+
+        let mut hue = 0.0;
+        let mut parent_path = String::new();
+
+        for (depth, part) in parts.iter().enumerate() {
+            // Build current path
+            let current_path = if parent_path.is_empty() {
+                part.to_string()
+            } else {
+                format!("{}/{}", parent_path, part)
+            };
+
+            // Get or assign sibling index for this child under its parent
+            let sibling_key = format!("{}:{}", parent_path, part);
+            let sibling_idx = if let Some(&idx) = self.child_indices.get(&sibling_key) {
+                idx
+            } else {
+                let parent_child_count = self.child_counts.entry(parent_path.clone()).or_insert(0);
+                let idx = *parent_child_count;
+                *parent_child_count += 1;
+                self.child_indices.insert(sibling_key, idx);
+                idx
+            };
+
+            // Golden ratio offset, scaled by depth
+            // Depth 0: 360° range, depth 1: 180° range, depth 2: 90° range, etc.
+            let range = 360.0 / (1 << depth) as f32;
+            let offset = (sibling_idx as f32 * 137.5) % range;
+
+            hue += offset;
+            parent_path = current_path;
+        }
+
+        hue % 360.0
+    }
+
     /// Load new graph data, initializing positions randomly
     pub fn load(&mut self, data: GraphData, bounds: egui::Rect) {
         use rand::Rng;
@@ -390,6 +487,9 @@ impl GraphState {
         self.node_index.clear();
         self.session_colors.clear();
         self.project_colors.clear();
+        self.child_counts.clear();
+        self.child_indices.clear();
+        self.project_sessions.clear();
 
         // Build node index and initialize positions
         for (i, node) in data.nodes.iter().enumerate() {
@@ -407,12 +507,42 @@ impl GraphState {
                 self.session_colors.insert(node.session_id.clone(), hue);
             }
 
-            // Assign project color if not already assigned
+            // Assign project color using tree-based hue assignment
+            // Projects under the same parent directory get similar hues
             if !node.project.is_empty() && !self.project_colors.contains_key(&node.project) {
-                // Use golden ratio for better color distribution
-                let hue = (self.project_colors.len() as f32 * 137.5) % 360.0;
+                let hue = self.compute_project_hue(&node.project);
                 self.project_colors.insert(node.project.clone(), hue);
             }
+        }
+
+        // Build project_sessions mapping for hybrid coloring
+        // Track earliest timestamp per session within each project
+        let mut session_timestamps: HashMap<String, (String, f64)> = HashMap::new(); // session_id -> (project, min_ts)
+        for node in data.nodes.iter() {
+            if node.project.is_empty() {
+                continue;
+            }
+            if let Some(ts) = node.timestamp_secs() {
+                session_timestamps
+                    .entry(node.session_id.clone())
+                    .and_modify(|(_, existing_ts)| {
+                        if ts < *existing_ts {
+                            *existing_ts = ts;
+                        }
+                    })
+                    .or_insert((node.project.clone(), ts));
+            }
+        }
+        // Group sessions by project
+        for (session_id, (project, ts)) in session_timestamps {
+            self.project_sessions
+                .entry(project)
+                .or_default()
+                .push((session_id, ts));
+        }
+        // Sort sessions within each project by timestamp
+        for sessions in self.project_sessions.values_mut() {
+            sessions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         }
 
         // Compute max tokens for normalization
@@ -593,25 +723,75 @@ impl GraphState {
         self.node_index.get(id).map(|&i| &self.data.nodes[i])
     }
 
+    /// Apply global hue offset, wrapping around 360°
+    fn apply_hue_offset(&self, hue: f32) -> f32 {
+        (hue + self.hue_offset) % 360.0
+    }
+
+    /// Randomize the global hue offset (preserves relative color relationships)
+    pub fn randomize_hue_offset(&mut self) {
+        use rand::Rng;
+        self.hue_offset = rand::thread_rng().gen_range(0.0..360.0);
+    }
+
+    /// Get the position (0.0-1.0) of a session within its project's timeline.
+    /// Used for hybrid coloring: earlier sessions = 0.0, later sessions = 1.0.
+    fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
+        if let Some(sessions) = self.project_sessions.get(project) {
+            if sessions.len() <= 1 {
+                return 0.5; // Single session, use middle
+            }
+            if let Some(idx) = sessions.iter().position(|(sid, _)| sid == session_id) {
+                return idx as f32 / (sessions.len() - 1) as f32;
+            }
+        }
+        0.5 // Default to middle if not found
+    }
+
     /// Get the color for a node based on current color mode
     pub fn node_color(&self, node: &GraphNode) -> egui::Color32 {
-        if self.color_by_project && !node.project.is_empty() {
-            let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.55)
-        } else {
-            let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.5)
+        match self.color_mode {
+            ColorMode::Project if !node.project.is_empty() => {
+                let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.55)
+            }
+            ColorMode::Hybrid if !node.project.is_empty() => {
+                // Project hue + session position determines S/L
+                let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                let t = self.session_position_in_project(&node.session_id, &node.project);
+                // Older sessions: lighter, less saturated (faded)
+                // Newer sessions: darker, more saturated (prominent)
+                let sat = 0.5 + t * 0.4;    // 0.5 -> 0.9
+                let light = 0.65 - t * 0.2; // 0.65 -> 0.45
+                hsl_to_rgb(self.apply_hue_offset(hue), sat, light)
+            }
+            _ => {
+                // Session mode (or fallback for empty project)
+                let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.5)
+            }
         }
     }
 
     /// Get a lighter version of node color (for fills)
     pub fn node_color_light(&self, node: &GraphNode) -> egui::Color32 {
-        if self.color_by_project && !node.project.is_empty() {
-            let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.6, 0.75)
-        } else {
-            let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.6, 0.7)
+        match self.color_mode {
+            ColorMode::Project if !node.project.is_empty() => {
+                let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.apply_hue_offset(hue), 0.6, 0.75)
+            }
+            ColorMode::Hybrid if !node.project.is_empty() => {
+                let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                let t = self.session_position_in_project(&node.session_id, &node.project);
+                // Lighter variant: shift both S and L up slightly
+                let sat = 0.4 + t * 0.3;    // 0.4 -> 0.7
+                let light = 0.8 - t * 0.15; // 0.8 -> 0.65
+                hsl_to_rgb(self.apply_hue_offset(hue), sat, light)
+            }
+            _ => {
+                let hue = self.session_colors.get(&node.session_id).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.apply_hue_offset(hue), 0.6, 0.7)
+            }
         }
     }
 
@@ -623,21 +803,39 @@ impl GraphState {
             egui::Color32::from_rgb(34, 197, 94) // Green
         } else if edge.is_obsidian {
             egui::Color32::from_rgb(155, 89, 182) // Purple
-        } else if self.color_by_project {
-            // Find source node's project for edge color
-            if let Some(node) = self.get_node(&edge.source) {
-                if !node.project.is_empty() {
-                    let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
-                    return hsl_to_rgb(hue, 0.5, 0.4);
+        } else {
+            match self.color_mode {
+                ColorMode::Project => {
+                    // Find source node's project for edge color
+                    if let Some(node) = self.get_node(&edge.source) {
+                        if !node.project.is_empty() {
+                            let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                            return hsl_to_rgb(self.apply_hue_offset(hue), 0.5, 0.4);
+                        }
+                    }
+                    // Fallback to session color
+                    let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
+                    hsl_to_rgb(self.apply_hue_offset(hue), 0.5, 0.4)
+                }
+                ColorMode::Hybrid => {
+                    // Use source node's hybrid coloring
+                    if let Some(node) = self.get_node(&edge.source) {
+                        if !node.project.is_empty() {
+                            let hue = self.project_colors.get(&node.project).copied().unwrap_or(0.0);
+                            let t = self.session_position_in_project(&node.session_id, &node.project);
+                            let sat = 0.4 + t * 0.3;
+                            let light = 0.5 - t * 0.15;
+                            return hsl_to_rgb(self.apply_hue_offset(hue), sat, light);
+                        }
+                    }
+                    let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
+                    hsl_to_rgb(self.apply_hue_offset(hue), 0.5, 0.4)
+                }
+                ColorMode::Session => {
+                    let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
+                    hsl_to_rgb(self.apply_hue_offset(hue), 0.7, 0.5)
                 }
             }
-            // Fallback to session color
-            let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.5, 0.4)
-        } else {
-            // Session-based color
-            let hue = self.session_colors.get(&edge.session_id).copied().unwrap_or(0.0);
-            hsl_to_rgb(hue, 0.7, 0.5)
         }
     }
 }
@@ -673,4 +871,25 @@ pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> egui::Color32 {
         ((g + m) * 255.0) as u8,
         ((b + m) * 255.0) as u8,
     )
+}
+
+/// Convert a color to greyscale (using luminosity method)
+pub fn to_greyscale(color: egui::Color32) -> egui::Color32 {
+    let r = color.r() as f32;
+    let g = color.g() as f32;
+    let b = color.b() as f32;
+    // Luminosity formula for perceived brightness
+    let grey = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+    egui::Color32::from_rgba_unmultiplied(grey, grey, grey, color.a())
+}
+
+/// Desaturate a color by blending it towards grey
+/// amount: 0.0 = original color, 1.0 = fully grey
+pub fn desaturate(color: egui::Color32, amount: f32) -> egui::Color32 {
+    let grey = to_greyscale(color);
+    let inv = 1.0 - amount;
+    let r = (color.r() as f32 * inv + grey.r() as f32 * amount) as u8;
+    let g = (color.g() as f32 * inv + grey.g() as f32 * amount) as u8;
+    let b = (color.b() as f32 * inv + grey.b() as f32 * amount) as u8;
+    egui::Color32::from_rgba_unmultiplied(r, g, b, color.a())
 }

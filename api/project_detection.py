@@ -2,19 +2,35 @@
 
 Extracts project names from file paths touched during Claude Code sessions.
 """
+import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Optional
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
+from db.queries import get_connection
 
-# Known project roots to extract from
-PROJECT_ROOTS = [
-    r'/Users/clayarnold/w/([^/]+)/',
-    r'/Users/clayarnold/Documents/GitHub/([^/]+)/',
-    r'/Users/clayarnold/Documents/github/([^/]+)/',
-]
+# Get home directory dynamically
+HOME_DIR = os.environ.get("USER_HOME", str(Path.home()))
+
+# Build project root patterns dynamically based on home directory
+# These are common locations where code projects live
+def _build_project_roots():
+    """Build project root patterns based on current user's home directory."""
+    home = HOME_DIR.rstrip('/')
+
+    # Common project directories - customize via PROJECT_DIRS env var
+    project_dirs = os.environ.get("PROJECT_DIRS", "w,Documents/GitHub,Documents/github,Projects,code").split(",")
+
+    patterns = []
+    for dir_name in project_dirs:
+        # Pattern to extract project name (first path component after the project dir)
+        pattern = rf'{re.escape(home)}/{re.escape(dir_name.strip())}/([^/]+)/'
+        patterns.append(pattern)
+
+    return patterns
+
+PROJECT_ROOTS = _build_project_roots()
 
 # Directories that aren't real projects
 EXCLUDED_NAMES = {
@@ -28,23 +44,12 @@ EXCLUDED_NAMES = {
 }
 
 
-def get_connection():
-    """Get database connection."""
-    return psycopg2.connect(
-        host="localhost",
-        port=5433,
-        user="clayarnold",
-        dbname="connectingservices",
-        cursor_factory=RealDictCursor,
-    )
-
-
 def extract_project_from_path(path: str) -> Optional[str]:
     """Extract project name from a file path.
 
     Examples:
-        /Users/clayarnold/w/connect/dashboard/app.py -> 'connect'
-        /Users/clayarnold/Documents/GitHub/AnkiThings/src/main.ts -> 'AnkiThings'
+        ~/w/connect/dashboard/app.py -> 'connect'
+        ~/Documents/GitHub/AnkiThings/src/main.ts -> 'AnkiThings'
     """
     if not path:
         return None
@@ -104,6 +109,24 @@ def detect_project_for_session(session_id: str) -> Optional[str]:
         conn.close()
 
 
+def _build_sql_case_expression():
+    """Build a SQL CASE expression for project detection based on PROJECT_ROOTS."""
+    home = HOME_DIR.rstrip('/')
+    project_dirs = os.environ.get("PROJECT_DIRS", "w,Documents/GitHub,Documents/github,Projects,code").split(",")
+
+    cases = []
+    for dir_name in project_dirs:
+        dir_path = f"{home}/{dir_name.strip()}"
+        # SQL LIKE pattern needs %% for literal %
+        like_pattern = f"{dir_path}/%"
+        # Use split_part to extract the project name
+        cases.append(f"""
+            WHEN file_path LIKE '{like_pattern}' THEN
+                split_part(replace(file_path, '{dir_path}/', ''), '/', 1)""")
+
+    return "CASE" + "".join(cases) + "\n                        ELSE NULL\n                    END"
+
+
 def detect_all_projects() -> dict[str, str]:
     """Detect projects for all sessions with tool_usages.
 
@@ -113,9 +136,12 @@ def detect_all_projects() -> dict[str, str]:
     conn = get_connection()
     cur = conn.cursor()
 
+    case_expr = _build_sql_case_expression()
+    excluded_list = ", ".join(f"'{name}'" for name in EXCLUDED_NAMES)
+
     try:
         # Get all file paths grouped by session
-        cur.execute("""
+        query = f"""
             WITH file_paths AS (
                 SELECT
                     m.session_id,
@@ -130,15 +156,7 @@ def detect_all_projects() -> dict[str, str]:
             extracted AS (
                 SELECT
                     session_id,
-                    CASE
-                        WHEN file_path LIKE '/Users/clayarnold/w/%%' THEN
-                            split_part(replace(file_path, '/Users/clayarnold/w/', ''), '/', 1)
-                        WHEN file_path LIKE '/Users/clayarnold/Documents/GitHub/%%' THEN
-                            split_part(replace(file_path, '/Users/clayarnold/Documents/GitHub/', ''), '/', 1)
-                        WHEN file_path LIKE '/Users/clayarnold/Documents/github/%%' THEN
-                            split_part(replace(file_path, '/Users/clayarnold/Documents/github/', ''), '/', 1)
-                        ELSE NULL
-                    END as project
+                    {case_expr} as project
                 FROM file_paths
             ),
             project_counts AS (
@@ -149,7 +167,7 @@ def detect_all_projects() -> dict[str, str]:
                 FROM extracted
                 WHERE project IS NOT NULL
                   AND project != ''
-                  AND project NOT IN ('PATHS.md', 'docs', '.git', '.vscode', 'node_modules')
+                  AND project NOT IN ({excluded_list})
                 GROUP BY session_id, project
             ),
             ranked AS (
@@ -162,7 +180,8 @@ def detect_all_projects() -> dict[str, str]:
             SELECT session_id, project
             FROM ranked
             WHERE rn = 1
-        """)
+        """
+        cur.execute(query)
 
         return {row['session_id']: row['project'] for row in cur.fetchall()}
 
@@ -272,6 +291,8 @@ if __name__ == "__main__":
     import json
 
     print("Detecting projects from file paths...\n")
+    print(f"Home directory: {HOME_DIR}")
+    print(f"Project roots: {PROJECT_ROOTS}\n")
 
     # Dry run first
     result = backfill_detected_projects(dry_run=True)

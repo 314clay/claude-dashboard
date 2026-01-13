@@ -1,2 +1,14 @@
+# API Server
 fastapi>=0.104.0
 uvicorn>=0.24.0
+
+# Database
+psycopg2-binary>=2.9.9
+pandas>=2.0.0
+
+# LLM Integration (for summaries and importance scoring)
+# Uses OpenAI client to talk to LiteLLM proxy or direct API
+openai>=1.0.0
+
+# Optional: for direct Gemini API access (if not using LiteLLM proxy)
+# google-generativeai>=0.8.0

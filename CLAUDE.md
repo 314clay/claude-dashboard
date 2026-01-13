@@ -142,11 +142,69 @@ if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
 - FPS counter in sidebar shows actual frame rate
 - Release build (`--release`) is ~10x faster than debug
 
+## Importance Scoring
+
+Scores messages 0.0-1.0 based on **decisions made**, not actions taken.
+
+### Scoring Criteria
+
+| Score | Category | Examples |
+|-------|----------|----------|
+| 0.8-1.0 | Major Decisions | Architecture choices, technology picks, "let's use X approach" |
+| 0.6-0.8 | Minor Decisions | Implementation choices, API design, tradeoff resolutions |
+| 0.5-0.7 | Task Definitions | Defining what to build, scoping work, requirements |
+| 0.3-0.5 | Context | Background info, explanations, clarifications |
+| 0.1-0.3 | Execution | Running commands, building, testing - NO decision made |
+| 0.0-0.2 | Filler | "thanks", "got it", "ok", acknowledgments |
+
+**Key insight**: Code/commands are LOW importance unless they represent a DECISION. "Run the build" = 0.2. "Let's add caching with Redis" = 0.8.
+
+### Architecture
+
+Two-phase approach in `dashboard/components/importance/`:
+
+1. **Context Creation** (`context.py`): Generate session summary via LLM for scoring context
+2. **Scoring** (`scorer.py`): Score messages in batches using the context
+
+Orchestrated by `backfill.py` with parallel support via ThreadPoolExecutor.
+
+### API Endpoints
+
+```
+GET  /importance/stats                    # Coverage statistics
+POST /importance/backfill?parallel=20     # Batch scoring (parallel workers)
+POST /importance/session/{id}             # Score specific session
+```
+
+### Backfill Parameters
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| max_sessions | 50 | Sessions to process per call |
+| staleness_days | 1.0 | Days inactive before scoring |
+| batch_size | 100 | Messages per LLM call |
+| parallel | 1 | Concurrent workers (max ~20 for Gemini) |
+| since_days | None | Only recent sessions |
+
+### Common Issues
+
+1. **LLM JSON parsing errors**: Reduce `batch_size` (25 is safe, 100+ can truncate)
+2. **Context creation failures**: Some sessions have unusual content; skip them
+3. **Token limits**: Large batches hit output token limits, causing truncated JSON
+
+### Database Columns
+
+Messages table additions:
+- `importance_score`: float 0.0-1.0
+- `importance_reason`: brief explanation (max 255 chars)
+- `importance_scored_at`: timestamp
+
 ## Database
 
 PostgreSQL on port 5433, schema `claude_sessions`:
 - `sessions`: session_id, cwd, start_time, end_time
-- `messages`: id, session_id, role, content, timestamp, sequence_num
+- `messages`: id, session_id, role, content, timestamp, sequence_num, importance_score
 - `tool_usages`: tool_name, tool_input, timestamp, message_id
 - `session_summaries`: summary, topics, detected_project
+- `session_contexts`: session_id, summary, completed_work, topics (for importance scoring)
 - `session_embeddings`: embedding (pgvector)

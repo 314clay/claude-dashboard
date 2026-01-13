@@ -1,6 +1,8 @@
 //! Persistent settings for the dashboard app.
 
+use crate::graph::types::ColorMode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Preset configurations for node sizing formula
@@ -61,7 +63,8 @@ pub struct Preset {
     pub node_size: f32,
     pub show_arrows: bool,
     pub timeline_enabled: bool,
-    pub color_by_project: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
     pub timeline_speed: f32,
 
     // Node Sizing
@@ -80,22 +83,36 @@ pub struct Preset {
     pub repulsion: f32,
     pub attraction: f32,
     pub centering: f32,
+    #[serde(default)]
+    pub size_physics_weight: f32,
     pub temporal_strength: f32,
     pub temporal_attraction_enabled: bool,
     pub temporal_window_mins: f32,
     pub temporal_edge_opacity: f32,
     pub max_temporal_edges: usize,
+
+    // Color Snapshot
+    #[serde(default)]
+    pub hue_offset: f32,
+    #[serde(default)]
+    pub project_colors: HashMap<String, f32>,
+    #[serde(default)]
+    pub session_colors: HashMap<String, f32>,
 }
 
 impl Preset {
-    /// Create a preset from current settings
-    pub fn from_settings(name: String, settings: &Settings) -> Self {
+    /// Create a preset from current settings and graph state
+    pub fn from_settings(
+        name: String,
+        settings: &Settings,
+        graph: &crate::graph::types::GraphState,
+    ) -> Self {
         Self {
             name,
             node_size: settings.node_size,
             show_arrows: settings.show_arrows,
             timeline_enabled: settings.timeline_enabled,
-            color_by_project: settings.color_by_project,
+            color_mode: settings.color_mode,
             timeline_speed: settings.timeline_speed,
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
@@ -108,20 +125,25 @@ impl Preset {
             repulsion: settings.repulsion,
             attraction: settings.attraction,
             centering: settings.centering,
+            size_physics_weight: settings.size_physics_weight,
             temporal_strength: settings.temporal_strength,
             temporal_attraction_enabled: settings.temporal_attraction_enabled,
             temporal_window_mins: settings.temporal_window_mins,
             temporal_edge_opacity: settings.temporal_edge_opacity,
             max_temporal_edges: settings.max_temporal_edges,
+            // Color snapshot
+            hue_offset: graph.hue_offset,
+            project_colors: graph.project_colors.clone(),
+            session_colors: graph.session_colors.clone(),
         }
     }
 
-    /// Apply this preset to settings
-    pub fn apply_to(&self, settings: &mut Settings) {
+    /// Apply this preset to settings and restore colors to graph
+    pub fn apply_to(&self, settings: &mut Settings, graph: &mut crate::graph::types::GraphState) {
         settings.node_size = self.node_size;
         settings.show_arrows = self.show_arrows;
         settings.timeline_enabled = self.timeline_enabled;
-        settings.color_by_project = self.color_by_project;
+        settings.color_mode = self.color_mode;
         settings.timeline_speed = self.timeline_speed;
         settings.sizing_preset = self.sizing_preset;
         settings.w_importance = self.w_importance;
@@ -134,11 +156,21 @@ impl Preset {
         settings.repulsion = self.repulsion;
         settings.attraction = self.attraction;
         settings.centering = self.centering;
+        settings.size_physics_weight = self.size_physics_weight;
         settings.temporal_strength = self.temporal_strength;
         settings.temporal_attraction_enabled = self.temporal_attraction_enabled;
         settings.temporal_window_mins = self.temporal_window_mins;
         settings.temporal_edge_opacity = self.temporal_edge_opacity;
         settings.max_temporal_edges = self.max_temporal_edges;
+
+        // Restore colors (merge: saved colors take precedence over current)
+        graph.hue_offset = self.hue_offset;
+        for (k, v) in &self.project_colors {
+            graph.project_colors.insert(k.clone(), *v);
+        }
+        for (k, v) in &self.session_colors {
+            graph.session_colors.insert(k.clone(), *v);
+        }
     }
 }
 
@@ -152,7 +184,8 @@ pub struct Settings {
     pub node_size: f32,
     pub show_arrows: bool,
     pub timeline_enabled: bool,
-    pub color_by_project: bool,
+    #[serde(default)]
+    pub color_mode: ColorMode,
 
     // Node Sizing (unified formula)
     #[serde(default)]
@@ -169,6 +202,8 @@ pub struct Settings {
     pub timeline_spacing_even: bool,
     #[serde(default = "default_timeline_speed")]
     pub timeline_speed: f32,
+    #[serde(default = "default_hover_scrubs_timeline")]
+    pub hover_scrubs_timeline: bool,
 
     // Filtering
     pub importance_threshold: f32,
@@ -179,7 +214,8 @@ pub struct Settings {
     pub repulsion: f32,
     pub attraction: f32,
     pub centering: f32,
-    pub size_repulsion_weight: f32,
+    /// How much visual size affects physics (0 = uniform, higher = more differentiation)
+    pub size_physics_weight: f32,
     pub temporal_strength: f32,
     pub temporal_attraction_enabled: bool,
     pub temporal_window_mins: f32,
@@ -194,6 +230,10 @@ pub struct Settings {
 
 fn default_timeline_speed() -> f32 {
     1.0
+}
+
+fn default_hover_scrubs_timeline() -> bool {
+    true
 }
 
 fn default_max_temporal_edges() -> usize {
@@ -226,9 +266,10 @@ impl Default for Settings {
             node_size: 15.0,
             show_arrows: true,
             timeline_enabled: true,
-            color_by_project: true,
+            color_mode: ColorMode::Project,
             timeline_spacing_even: false,
             timeline_speed: 1.0,
+            hover_scrubs_timeline: true,
 
             // Node Sizing
             sizing_preset: SizingPreset::Balanced,
@@ -246,7 +287,7 @@ impl Default for Settings {
             repulsion: 10000.0,
             attraction: 0.1,
             centering: 0.0001,
-            size_repulsion_weight: 0.0,
+            size_physics_weight: 0.0,
             temporal_strength: 0.5,
             temporal_attraction_enabled: true,
             temporal_window_mins: 5.0,
