@@ -293,15 +293,65 @@ impl TimelineState {
 
     /// Format a time as a human-readable string
     pub fn format_time(&self, time: f64) -> String {
-        // Convert epoch seconds back to readable format
-        let total_secs = time as i64;
-        let days = total_secs / 86400;
-        let hours = (total_secs % 86400) / 3600;
-        let mins = (total_secs % 3600) / 60;
+        // Get current time for relative formatting
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        // Calculate date from days since epoch
+        let timestamp = time as i64;
+        let diff_secs = now - timestamp;
+
+        // Relative time for recent events
+        if diff_secs < 60 {
+            return "Just now".to_string();
+        } else if diff_secs < 3600 {
+            let mins = diff_secs / 60;
+            return format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" });
+        } else if diff_secs < 86400 {
+            let hours = diff_secs / 3600;
+            return format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" });
+        }
+
+        // Calculate date components
+        let days = timestamp / 86400;
+        let hours = (timestamp % 86400) / 3600;
+        let mins = (timestamp % 3600) / 60;
         let (year, month, day) = civil_from_days(days);
-        format!("{:04}-{:02}-{:02} {:02}:{:02}", year, month, day, hours, mins)
+
+        // Convert to 12-hour format
+        let (hour_12, am_pm) = if hours == 0 {
+            (12, "AM")
+        } else if hours < 12 {
+            (hours, "AM")
+        } else if hours == 12 {
+            (12, "PM")
+        } else {
+            (hours - 12, "PM")
+        };
+
+        // Format based on how old it is
+        let now_days = now / 86400;
+        let day_diff = now_days - days;
+
+        if day_diff == 0 {
+            format!("Today at {}:{:02} {}", hour_12, mins, am_pm)
+        } else if day_diff == 1 {
+            format!("Yesterday at {}:{:02} {}", hour_12, mins, am_pm)
+        } else if day_diff < 7 {
+            let weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            let day_of_week = ((days + 4) % 7) as usize; // Jan 1, 1970 was Thursday
+            format!("{} at {}:{:02} {}", weekday[day_of_week], hour_12, mins, am_pm)
+        } else {
+            let month_name = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            let current_year = civil_from_days(now_days).0;
+            if year == current_year {
+                format!("{} {} at {}:{:02} {}", month_name[(month - 1) as usize], day, hour_12, mins, am_pm)
+            } else {
+                format!("{} {}, {} at {}:{:02} {}", month_name[(month - 1) as usize], day, year, hour_12, mins, am_pm)
+            }
+        }
     }
 
     /// Get the index of the nearest notch (node) to a position

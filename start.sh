@@ -16,31 +16,37 @@ echo -e "${GREEN}Starting Claude Activity Dashboard (Native)${NC}"
 
 # Find Python - check multiple options
 find_python() {
-    # 1. Check for local venv
+    # 1. Check for project-wide venv (preferred for ConnectingServices)
+    if [ -f "/Users/clayarnold/w/connect/venv/bin/python" ]; then
+        echo "/Users/clayarnold/w/connect/venv/bin/python"
+        return
+    fi
+
+    # 2. Check for local venv
     if [ -f "venv/bin/python" ]; then
         echo "venv/bin/python"
         return
     fi
 
-    # 2. Check for .venv (common alternative)
+    # 3. Check for .venv (common alternative)
     if [ -f ".venv/bin/python" ]; then
         echo ".venv/bin/python"
         return
     fi
 
-    # 3. Check VIRTUAL_ENV if set
+    # 4. Check VIRTUAL_ENV if set
     if [ -n "$VIRTUAL_ENV" ] && [ -f "$VIRTUAL_ENV/bin/python" ]; then
         echo "$VIRTUAL_ENV/bin/python"
         return
     fi
 
-    # 4. Check for uvicorn in PATH
+    # 5. Check for uvicorn in PATH
     if command -v uvicorn &> /dev/null; then
         echo "python"
         return
     fi
 
-    # 5. Try system Python
+    # 6. Try system Python
     if command -v python3 &> /dev/null; then
         echo "python3"
         return

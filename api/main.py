@@ -42,11 +42,12 @@ from db.semantic_filter_scorer import (
     categorize_messages,
     get_filter_stats,
 )
-from db.health_ingest import (
-    ingest_payload as health_ingest_payload,
-    get_recent_sleep,
-    get_health_stats,
-)
+# Commented out - health_ingest module not present
+# from db.health_ingest import (
+#     ingest_payload as health_ingest_payload,
+#     get_recent_sleep,
+#     get_health_stats,
+# )
 from pydantic import BaseModel
 
 app = FastAPI(
@@ -436,56 +437,57 @@ def semantic_filter_stats():
 
 
 # ==== Health Auto Export Endpoints ====
+# Commented out - health_ingest module not present
 
-@app.post("/health/ingest")
-async def health_ingest(payload: dict):
-    """Ingest health data from Health Auto Export iOS app.
-
-    Accepts webhook payloads from Health Auto Export and stores them
-    in the health schema (sleep_analysis, metrics tables).
-
-    Expected payload format:
-    {
-        "data": {
-            "metrics": [
-                {"name": "sleep_analysis", "data": [...]},
-                {"name": "heart_rate", "units": "bpm", "data": [...]}
-            ],
-            "workouts": [...]
-        }
-    }
-
-    Returns: { status, ingest_id, sleep_records, metric_records }
-    """
-    try:
-        result = health_ingest_payload(payload)
-        return result
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-@app.get("/health/sleep")
-def health_sleep(days: int = 7):
-    """Get recent sleep data.
-
-    Returns sleep records from the last N days.
-    """
-    records = get_recent_sleep(days)
-    # Convert datetimes to ISO strings
-    for r in records:
-        for k, v in r.items():
-            if hasattr(v, 'isoformat'):
-                r[k] = v.isoformat()
-    return {"records": records, "count": len(records)}
-
-
-@app.get("/health/stats")
-def health_stats():
-    """Get health data statistics.
-
-    Returns counts of ingests, sleep records, and metrics.
-    """
-    return get_health_stats()
+# @app.post("/health/ingest")
+# async def health_ingest(payload: dict):
+#     """Ingest health data from Health Auto Export iOS app.
+#
+#     Accepts webhook payloads from Health Auto Export and stores them
+#     in the health schema (sleep_analysis, metrics tables).
+#
+#     Expected payload format:
+#     {
+#         "data": {
+#             "metrics": [
+#                 {"name": "sleep_analysis", "data": [...]},
+#                 {"name": "heart_rate", "units": "bpm", "data": [...]}
+#             ],
+#             "workouts": [...]
+#         }
+#     }
+#
+#     Returns: { status, ingest_id, sleep_records, metric_records }
+#     """
+#     try:
+#         result = health_ingest_payload(payload)
+#         return result
+#     except Exception as e:
+#         return {"status": "error", "message": str(e)}
+#
+#
+# @app.get("/health/sleep")
+# def health_sleep(days: int = 7):
+#     """Get recent sleep data.
+#
+#     Returns sleep records from the last N days.
+#     """
+#     records = get_recent_sleep(days)
+#     # Convert datetimes to ISO strings
+#     for r in records:
+#         for k, v in r.items():
+#             if hasattr(v, 'isoformat'):
+#                 r[k] = v.isoformat()
+#     return {"records": records, "count": len(records)}
+#
+#
+# @app.get("/health/stats")
+# def health_stats():
+#     """Get health data statistics.
+#
+#     Returns counts of ingests, sleep records, and metrics.
+#     """
+#     return get_health_stats()
 
 
 if __name__ == "__main__":

@@ -628,6 +628,59 @@ impl DashboardApp {
             .any(|mode| matches!(mode, SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2))
     }
 
+    /// Check if a node is a "same-project future node" (outside timeline but same project as selected/hovered)
+    fn is_same_project_future_node(&self, node: &crate::graph::types::GraphNode) -> bool {
+        // Must be outside timeline window (future)
+        if self.graph.is_node_visible(&node.id) {
+            return false;
+        }
+
+        // Check if same project as selected or hovered node
+        let reference_project = self.graph.selected_node.as_ref()
+            .or(self.graph.hovered_node.as_ref())
+            .and_then(|id| self.graph.get_node(id))
+            .map(|n| &n.project);
+
+        if let Some(ref_project) = reference_project {
+            return &node.project == ref_project;
+        }
+
+        false
+    }
+
+    /// Check if a node is before the playhead and outside the current session
+    fn is_past_different_session_node(&self, node: &crate::graph::types::GraphNode) -> bool {
+        // Must be outside timeline window
+        if self.graph.is_node_visible(&node.id) {
+            return false;
+        }
+
+        // Get timeline start position
+        let start_time = self.graph.timeline.time_at_position(self.graph.timeline.start_position);
+
+        // Check if node is BEFORE the timeline window (not after)
+        if let Some(node_time) = node.timestamp_secs() {
+            // Node must be before the start of the timeline window
+            if node_time >= start_time {
+                return false;
+            }
+        } else {
+            return false; // No timestamp = can't determine
+        }
+
+        // Check if different session from selected or hovered node
+        let reference_session = self.graph.selected_node.as_ref()
+            .or(self.graph.hovered_node.as_ref())
+            .and_then(|id| self.graph.get_node(id))
+            .map(|n| &n.session_id);
+
+        if let Some(ref_session) = reference_session {
+            return &node.session_id != ref_session;
+        }
+
+        false // No reference node = not applicable
+    }
+
     /// Compute which nodes should participate in physics simulation
     /// Returns None if no filtering is active (simulate all nodes)
     /// Returns Some(HashSet) with visible node IDs when filtering is active
@@ -667,6 +720,14 @@ impl DashboardApp {
             }
             visible.insert(node.id.clone());
         }
+
+        // Add same-project future nodes to physics simulation
+        for node in &self.graph.data.nodes {
+            if self.is_same_project_future_node(node) {
+                visible.insert(node.id.clone());
+            }
+        }
+
         Some(visible)
     }
 
@@ -1814,18 +1875,26 @@ impl DashboardApp {
                 ui.label(closest_node.role.label());
             });
             if let Some(ref ts) = closest_node.timestamp {
-                // Show just the time portion
-                let time_display = if let Some(t_idx) = ts.find('T') {
-                    let time_part = &ts[t_idx + 1..];
-                    if let Some(plus_idx) = time_part.find('+') {
-                        &time_part[..plus_idx.min(8)]
-                    } else {
-                        &time_part[..8.min(time_part.len())]
-                    }
+                // Format timestamp using the timeline's format_time function for consistency
+                if let Some(epoch_secs) = closest_node.timestamp_secs() {
+                    let formatted = self.graph.timeline.format_time(epoch_secs);
+                    ui.label(format!("Time: {}", formatted));
                 } else {
-                    ts.as_str()
-                };
-                ui.label(format!("Time: {}", time_display));
+                    // Debug: parsing failed, show what we got
+                    eprintln!("Failed to parse timestamp: {}", ts);
+                    // Fallback: show just the time portion if parsing fails
+                    let time_display = if let Some(t_idx) = ts.find('T') {
+                        let time_part = &ts[t_idx + 1..];
+                        if let Some(plus_idx) = time_part.find('+') {
+                            &time_part[..plus_idx.min(8)]
+                        } else {
+                            &time_part[..8.min(time_part.len())]
+                        }
+                    } else {
+                        ts.as_str()
+                    };
+                    ui.label(format!("Time: {}", time_display));
+                }
             }
             ui.label(format!("Session: {}", closest_node.session_short));
             if !closest_node.project.is_empty() {
@@ -2027,22 +2096,27 @@ impl DashboardApp {
             let mut closest: Option<(String, f32)> = None; // (node_id, distance)
 
             for node in &self.graph.data.nodes {
-                // Skip nodes below importance threshold when filter is enabled
-                if self.importance_filter_enabled {
-                    if let Some(score) = node.importance_score {
-                        if score < self.importance_threshold {
-                            continue;
+                // Check if this is a past-different-session node (bypasses filters)
+                let is_past_diff_session = self.is_past_different_session_node(node);
+
+                if !is_past_diff_session {
+                    // Skip nodes below importance threshold when filter is enabled
+                    if self.importance_filter_enabled {
+                        if let Some(score) = node.importance_score {
+                            if score < self.importance_threshold {
+                                continue;
+                            }
                         }
                     }
-                }
-                // Skip nodes not in selected projects when filter is enabled
-                if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                    continue;
-                }
-                // Skip nodes that don't pass semantic filters
-                if let Some(ref sem_visible) = semantic_visible {
-                    if !sem_visible.contains(&node.id) {
+                    // Skip nodes not in selected projects when filter is enabled
+                    if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                         continue;
+                    }
+                    // Skip nodes that don't pass semantic filters
+                    if let Some(ref sem_visible) = semantic_visible {
+                        if !sem_visible.contains(&node.id) {
+                            continue;
+                        }
                     }
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
@@ -2080,32 +2154,37 @@ impl DashboardApp {
 
         // Two-pass node rendering:
         // Pass 1: Compute all size multipliers and find max
-        // Tuple: (index, multiplier, is_timeline_dimmed)
-        let mut node_multipliers: Vec<(usize, f32, bool)> = Vec::new();
+        // Tuple: (index, multiplier, is_timeline_dimmed, is_same_project_future)
+        let mut node_multipliers: Vec<(usize, f32, bool, bool)> = Vec::new();
         let mut max_multiplier: f32 = 0.001; // Avoid division by zero
 
         for (idx, node) in self.graph.data.nodes.iter().enumerate() {
             // Check if node is timeline-dimmed (visible but greyed out)
             let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_node_visible(&node.id);
+            let is_same_project_future = self.is_same_project_future_node(node);
+            let is_past_diff_session = self.is_past_different_session_node(node);
 
-            // Skip nodes below importance threshold when filter is enabled
-            if self.importance_filter_enabled {
-                if let Some(score) = node.importance_score {
-                    if score < self.importance_threshold {
-                        continue;
+            // Past-different-session nodes bypass all filters (so we can see them in red)
+            if !is_past_diff_session {
+                // Skip nodes below importance threshold when filter is enabled
+                if self.importance_filter_enabled {
+                    if let Some(score) = node.importance_score {
+                        if score < self.importance_threshold {
+                            continue;
+                        }
                     }
                 }
-            }
 
-            // Skip nodes not in selected projects when filter is enabled
-            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                continue;
-            }
-
-            // Skip nodes that don't pass semantic filters
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&node.id) {
+                // Skip nodes not in selected projects when filter is enabled
+                if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                     continue;
+                }
+
+                // Skip nodes that don't pass semantic filters
+                if let Some(ref sem_visible) = semantic_visible {
+                    if !sem_visible.contains(&node.id) {
+                        continue;
+                    }
                 }
             }
 
@@ -2138,9 +2217,17 @@ impl DashboardApp {
 
                 // Combine factors multiplicatively
                 let raw_multiplier = imp_factor * tok_factor * time_factor;
-                node_multipliers.push((idx, raw_multiplier, is_timeline_dimmed));
-                // Only include non-dimmed nodes in max calculation for normalization
-                if !is_timeline_dimmed {
+
+                // Handle three cases:
+                // 1. Regular dimmed nodes: add with flag, don't calculate size (fixed 0.5x)
+                // 2. Same-project future nodes: add with flag, calculate full size
+                // 3. Active nodes: add with flag, calculate full size
+                if is_timeline_dimmed && !is_same_project_future {
+                    // Regular dimmed node - skip size calculation
+                    node_multipliers.push((idx, 0.0, true, false));
+                } else {
+                    // Active or same-project future - calculate size normally
+                    node_multipliers.push((idx, raw_multiplier, false, is_same_project_future));
                     max_multiplier = max_multiplier.max(raw_multiplier);
                 }
             }
@@ -2151,9 +2238,13 @@ impl DashboardApp {
 
         // Pass 2: Draw nodes with normalized sizes
         // Draw dimmed nodes first (behind active nodes)
-        for &(idx, _raw_multiplier, is_dimmed) in &node_multipliers {
+        for &(idx, _raw_multiplier, is_dimmed, is_same_project_future) in &node_multipliers {
             if !is_dimmed {
                 continue; // Skip active nodes in this pass
+            }
+            // Skip same-project future nodes - they'll be rendered in pass 2b
+            if is_same_project_future {
+                continue;
             }
             let node = &self.graph.data.nodes[idx];
             if let Some(pos) = self.graph.get_pos(&node.id) {
@@ -2162,17 +2253,32 @@ impl DashboardApp {
                 // Dimmed nodes use a fixed smaller size
                 let size = self.node_size * self.zoom * 0.5;
 
-                // Use greyscale color with reduced opacity
-                let base_color = self.graph.node_color(node);
-                let color = crate::graph::types::to_greyscale(base_color).gamma_multiply(0.4);
+                // Check if this is a past-different-session node
+                let is_past_diff_session = self.is_past_different_session_node(node);
+
+                // Use desaturated color for past-different-session nodes, greyscale for others
+                let color = if is_past_diff_session {
+                    let base_color = self.graph.node_color(node);
+                    crate::graph::types::desaturate(base_color, 0.7)
+                } else {
+                    let base_color = self.graph.node_color(node);
+                    crate::graph::types::to_greyscale(base_color).gamma_multiply(0.4)
+                };
 
                 // Draw node
                 painter.circle_filled(screen_pos, size, color);
 
-                // Draw inner circle for Claude responses (also greyscale)
+                // Draw inner circle for Claude responses
                 if node.role == crate::graph::types::Role::Assistant {
                     let inner_size = size * 0.4;
-                    painter.circle_filled(screen_pos, inner_size, Color32::from_gray(30));
+                    let inner_color = if is_past_diff_session {
+                        // Desaturated inner circle for past-different-session
+                        let base_inner = self.graph.node_color(node);
+                        crate::graph::types::desaturate(base_inner, 0.5).gamma_multiply(0.4)
+                    } else {
+                        Color32::from_gray(30)
+                    };
+                    painter.circle_filled(screen_pos, inner_size, inner_color);
                 }
 
                 // Minimal border for dimmed nodes
@@ -2188,7 +2294,7 @@ impl DashboardApp {
             None
         };
 
-        for (idx, raw_multiplier, is_dimmed) in node_multipliers {
+        for (idx, raw_multiplier, is_dimmed, is_same_project_future) in node_multipliers {
             if is_dimmed {
                 continue; // Already drawn in previous pass
             }
@@ -2210,38 +2316,57 @@ impl DashboardApp {
                 // Use project or session color based on mode
                 let base_color = self.graph.node_color(node);
 
-                // Desaturate "future" nodes (in session but after scrubber position)
-                let is_future = scrubber_time
-                    .and_then(|st| node.timestamp_secs().map(|nt| nt > st))
-                    .unwrap_or(false);
-                let color = if is_future && !is_hovered && !is_selected {
-                    crate::graph::types::desaturate(base_color, 0.7)
+                // Determine color based on node type
+                let color = if is_same_project_future {
+                    // Greyscale for same-project future nodes
+                    crate::graph::types::to_greyscale(base_color)
                 } else {
-                    base_color
+                    // Desaturate "future" nodes (in session but after scrubber position)
+                    let is_future = scrubber_time
+                        .and_then(|st| node.timestamp_secs().map(|nt| nt > st))
+                        .unwrap_or(false);
+                    if is_future && !is_hovered && !is_selected {
+                        crate::graph::types::desaturate(base_color, 0.7)
+                    } else {
+                        base_color
+                    }
                 };
 
-                // Draw node
-                painter.circle_filled(screen_pos, size, color);
+                // Draw node differently for same-project future nodes (hollow circles)
+                if is_same_project_future {
+                    // Hollow circle (stroke only, no fill)
+                    painter.circle_stroke(screen_pos, size, Stroke::new(3.0, color));
 
-                // Draw inner black circle for Claude responses
-                if node.role == crate::graph::types::Role::Assistant {
-                    let inner_size = size * 0.4;
-                    painter.circle_filled(screen_pos, inner_size, Color32::BLACK);
+                    // Hollow inner circle for Claude responses
+                    if node.role == crate::graph::types::Role::Assistant {
+                        let inner_size = size * 0.4;
+                        painter.circle_stroke(screen_pos, inner_size, Stroke::new(2.0, Color32::from_gray(150)));
+                    }
+                } else {
+                    // Regular filled circle
+                    painter.circle_filled(screen_pos, size, color);
+
+                    // Draw inner black circle for Claude responses
+                    if node.role == crate::graph::types::Role::Assistant {
+                        let inner_size = size * 0.4;
+                        painter.circle_filled(screen_pos, inner_size, Color32::BLACK);
+                    }
+
+                    // Draw border - cyan for summary node, yellow for selected, white for hovered
+                    // (skip for same-project future to avoid double-stroke)
+                    let is_summary_node = self.summary_node_id.as_ref() == Some(&node.id);
+                    let border_color = if is_summary_node {
+                        Color32::from_rgb(0, 255, 255) // Cyan for summary node
+                    } else if is_selected {
+                        Color32::YELLOW
+                    } else if is_hovered {
+                        Color32::WHITE
+                    } else {
+                        color.gamma_multiply(0.7)
+                    };
+                    let border_width = if is_summary_node { 4.0 } else { 2.0 };
+                    painter.circle_stroke(screen_pos, size, Stroke::new(border_width, border_color));
                 }
-
-                // Draw border - cyan for summary node, yellow for selected, white for hovered
-                let is_summary_node = self.summary_node_id.as_ref() == Some(&node.id);
-                let border_color = if is_summary_node {
-                    Color32::from_rgb(0, 255, 255) // Cyan for summary node
-                } else if is_selected {
-                    Color32::YELLOW
-                } else if is_hovered {
-                    Color32::WHITE
-                } else {
-                    color.gamma_multiply(0.7)
-                };
-                let border_width = if is_summary_node { 4.0 } else { 2.0 };
-                painter.circle_stroke(screen_pos, size, Stroke::new(border_width, border_color));
             }
         }
 
