@@ -226,6 +226,12 @@ pub struct Settings {
     // Saved presets
     #[serde(default)]
     pub presets: Vec<Preset>,
+
+    // Refresh & sync
+    #[serde(default = "default_auto_refresh_enabled")]
+    pub auto_refresh_enabled: bool,
+    #[serde(default = "default_auto_refresh_interval_secs")]
+    pub auto_refresh_interval_secs: f32,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -254,6 +260,14 @@ fn default_w_time() -> f32 {
 
 fn default_max_node_multiplier() -> f32 {
     10.0
+}
+
+fn default_auto_refresh_enabled() -> bool {
+    false
+}
+
+fn default_auto_refresh_interval_secs() -> f32 {
+    5.0
 }
 
 impl Default for Settings {
@@ -296,6 +310,10 @@ impl Default for Settings {
 
             // Presets
             presets: Vec::new(),
+
+            // Refresh & sync
+            auto_refresh_enabled: false,
+            auto_refresh_interval_secs: 5.0,
         }
     }
 }

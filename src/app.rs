@@ -8,7 +8,7 @@ use crate::settings::{Preset, Settings, SizingPreset};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 /// Time range options for filtering
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,6 +197,11 @@ pub struct DashboardApp {
     // Summary caches (populated on double-click, shown in tooltip)
     point_in_time_summary_cache: HashMap<String, PartialSummaryData>,  // node_id -> summary
     session_summary_cache: HashMap<String, SessionSummaryData>,        // session_id -> summary
+
+    // Refresh & sync state
+    last_synced: Option<Instant>,
+    beads_last_check: Instant,
+    beads_last_mtime: Option<SystemTime>,
 }
 
 impl DashboardApp {
@@ -309,6 +314,10 @@ impl DashboardApp {
             point_in_time_summary_cache: HashMap::new(),
             session_summary_cache: HashMap::new(),
 
+            // Refresh & sync state
+            last_synced: None,
+            beads_last_check: Instant::now(),
+            beads_last_mtime: None,
         };
 
         // Load initial data if connected
@@ -444,12 +453,70 @@ impl DashboardApp {
 
                 // Load semantic filters from API
                 self.load_semantic_filters();
+
+                // Update last synced timestamp
+                self.last_synced = Some(Instant::now());
             }
             Err(e) => {
                 self.db_error = Some(e);
                 self.loading = false;
             }
         }
+    }
+
+    /// Check if .beads/ directory has changed since last check
+    /// Returns true if changes detected and we should reload
+    fn check_beads_changed(&mut self) -> bool {
+        // Only check if auto-refresh is enabled
+        if !self.settings.auto_refresh_enabled {
+            return false;
+        }
+
+        // Check if enough time has passed since last check
+        let now = Instant::now();
+        let interval = std::time::Duration::from_secs_f32(self.settings.auto_refresh_interval_secs);
+        if now.duration_since(self.beads_last_check) < interval {
+            return false;
+        }
+        self.beads_last_check = now;
+
+        // Try to get the modification time of the .beads/ directory
+        // We look for a common file like the redirect or any files in the directory
+        let beads_path = std::path::Path::new(".beads");
+        if !beads_path.exists() {
+            return false;
+        }
+
+        // Get the latest modification time from any file in .beads/
+        let current_mtime = match std::fs::read_dir(beads_path) {
+            Ok(entries) => {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .filter_map(|m| m.modified().ok())
+                    .max()
+            }
+            Err(_) => None,
+        };
+
+        // If we can't get mtime, fall back to directory mtime
+        let current_mtime = current_mtime.or_else(|| {
+            std::fs::metadata(beads_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+        });
+
+        // Compare with previous
+        let changed = match (current_mtime, self.beads_last_mtime) {
+            (Some(current), Some(previous)) => current > previous,
+            (Some(_), None) => true, // First check, consider changed to trigger initial state
+            _ => false,
+        };
+
+        // Update stored mtime
+        self.beads_last_mtime = current_mtime;
+
+        changed
     }
 
     fn update_fps(&mut self) {
@@ -1275,6 +1342,41 @@ impl DashboardApp {
                         self.load_graph();
                     }
                 });
+
+                // Last synced timestamp
+                if let Some(last_synced) = self.last_synced {
+                    let elapsed = last_synced.elapsed();
+                    let elapsed_str = if elapsed.as_secs() < 60 {
+                        format!("{}s ago", elapsed.as_secs())
+                    } else if elapsed.as_secs() < 3600 {
+                        format!("{}m ago", elapsed.as_secs() / 60)
+                    } else {
+                        format!("{}h ago", elapsed.as_secs() / 3600)
+                    };
+                    ui.label(format!("Last synced: {}", elapsed_str));
+                }
+
+                // Auto-refresh toggle
+                ui.add_space(5.0);
+                let mut auto_refresh = self.settings.auto_refresh_enabled;
+                if ui.checkbox(&mut auto_refresh, "Auto-refresh").changed() {
+                    self.settings.auto_refresh_enabled = auto_refresh;
+                    self.mark_settings_dirty();
+                }
+                if self.settings.auto_refresh_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Interval:");
+                        let mut interval = self.settings.auto_refresh_interval_secs;
+                        if ui.add(egui::DragValue::new(&mut interval)
+                            .range(1.0..=60.0)
+                            .suffix("s")
+                            .speed(0.5)
+                        ).changed() {
+                            self.settings.auto_refresh_interval_secs = interval;
+                            self.mark_settings_dirty();
+                        }
+                    });
+                }
             });
 
         // Presets section
@@ -2745,6 +2847,11 @@ impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_fps();
         self.maybe_save_settings();
+
+        // Check for .beads/ changes and auto-refresh if needed
+        if self.check_beads_changed() && !self.loading {
+            self.load_graph();
+        }
 
         // Refresh semantic filter cache once per frame if needed
         if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
