@@ -7,6 +7,7 @@ mod app;
 mod db;
 mod graph;
 mod settings;
+mod theme;
 
 use eframe::egui;
 use tracing_subscriber;

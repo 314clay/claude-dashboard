@@ -5,6 +5,7 @@ use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::settings::{Preset, Settings, SizingPreset};
+use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver};
@@ -1067,8 +1068,11 @@ impl DashboardApp {
                                 ui.spinner();
                                 ui.label("Generating summary...");
                             });
+                            ui.add_space(8.0);
+                            // Skeleton preview of content
+                            theme::skeleton_lines(ui, 3, ui.available_width() * 0.9);
                         } else if let Some(ref error) = self.summary_error.clone() {
-                            ui.colored_label(Color32::RED, format!("Error: {}", error));
+                            ui.colored_label(theme::state::ERROR, format!("Error: {}", error));
                             if ui.button("Dismiss").clicked() {
                                 self.summary_error = None;
                                 self.summary_node_id = None;
@@ -1100,7 +1104,7 @@ impl DashboardApp {
 
                             // Completed Work
                             if !data.completed_work.is_empty() {
-                                ui.label(egui::RichText::new("Completed").strong().color(Color32::GREEN));
+                                ui.label(egui::RichText::new("Completed").strong().color(theme::state::SUCCESS));
                                 egui::ScrollArea::vertical()
                                     .max_height(60.0)
                                     .id_salt("window_completed_scroll")
@@ -1156,16 +1160,19 @@ impl DashboardApp {
                                 ui.spinner();
                                 ui.label("Generating summary...");
                             });
+                            ui.add_space(8.0);
+                            // Skeleton preview of summary content
+                            theme::skeleton_lines(ui, 4, ui.available_width() * 0.9);
                         } else if let Some(ref data) = self.session_summary_data.clone() {
                             // Check for errors first
                             if let Some(ref err) = data.error {
-                                ui.colored_label(Color32::RED, format!("Error: {}", err));
+                                ui.colored_label(theme::state::ERROR, format!("Error: {}", err));
                             } else if !data.exists {
                                 ui.label("No summary in database for this session.");
                             } else {
                                 // Show "just generated" badge if applicable
                                 if data.generated {
-                                    ui.colored_label(Color32::from_rgb(34, 197, 94), "✓ Just generated");
+                                    ui.colored_label(theme::state::SUCCESS, "✓ Just generated");
                                     ui.add_space(5.0);
                                 }
 
@@ -1205,7 +1212,7 @@ impl DashboardApp {
                                 // Completed work
                                 if let Some(ref completed) = data.completed_work {
                                     if !completed.is_empty() {
-                                        ui.label(egui::RichText::new("Completed Work").strong().color(Color32::GREEN));
+                                        ui.label(egui::RichText::new("Completed Work").strong().color(theme::state::SUCCESS));
                                         egui::ScrollArea::vertical()
                                             .max_height(80.0)
                                             .id_salt("window_session_completed_scroll")
@@ -1271,9 +1278,9 @@ impl DashboardApp {
         // Database status
         ui.horizontal(|ui| {
             if self.db_connected {
-                ui.colored_label(Color32::GREEN, "● DB Connected");
+                ui.colored_label(theme::state::SUCCESS, "● DB Connected");
             } else {
-                ui.colored_label(Color32::RED, "● DB Disconnected");
+                ui.colored_label(theme::state::ERROR, "● DB Disconnected");
                 if ui.button("Retry").clicked() {
                     self.reconnect_db();
                     if self.db_connected {
@@ -1284,7 +1291,7 @@ impl DashboardApp {
         });
 
         if let Some(ref err) = self.db_error {
-            ui.colored_label(Color32::RED, format!("Error: {}", err));
+            ui.colored_label(theme::state::ERROR, format!("Error: {}", err));
         }
 
         ui.add_space(10.0);
@@ -1685,12 +1692,21 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Semantic Filters")
             .default_open(false)
             .show(ui, |ui| {
-                // Loading indicator
+                // Loading indicator with skeleton
                 if self.semantic_filter_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Loading filters...");
                     });
+                    ui.add_space(4.0);
+                    // Skeleton filter items
+                    for _ in 0..2 {
+                        ui.horizontal(|ui| {
+                            theme::skeleton_rect(ui, 60.0, 18.0);
+                            ui.add_space(4.0);
+                            theme::skeleton_rect(ui, 80.0, 18.0);
+                        });
+                    }
                 }
 
                 // Categorization in progress indicator
@@ -1716,12 +1732,12 @@ impl DashboardApp {
                                 .copied()
                                 .unwrap_or(SemanticFilterMode::Off);
 
-                            let inactive = Color32::from_rgb(50, 50, 60);
-                            let active_neutral = Color32::from_rgb(100, 100, 120);
-                            let active_green = Color32::from_rgb(34, 197, 94);
-                            let active_blue = Color32::from_rgb(59, 130, 246);
-                            let active_purple = Color32::from_rgb(139, 92, 246);
-                            let active_red = Color32::from_rgb(239, 68, 68);
+                            let inactive = theme::filter::INACTIVE;
+                            let active_neutral = theme::filter::ACTIVE;
+                            let active_green = theme::filter::INCLUDE;
+                            let active_blue = theme::filter::INCLUDE_PLUS1;
+                            let active_purple = theme::filter::INCLUDE_PLUS2;
+                            let active_red = theme::filter::EXCLUDE;
 
                             // Off button (O)
                             let off_color = if current_mode == SemanticFilterMode::Off { active_neutral } else { inactive };
@@ -2436,15 +2452,21 @@ impl DashboardApp {
                 if !is_same_project_future {
                     let is_summary_node = self.summary_node_id.as_ref() == Some(&node.id);
                     let border_color = if is_summary_node {
-                        Color32::from_rgb(0, 255, 255) // Cyan for summary node
+                        theme::state::ACTIVE // Cyan for summary node
                     } else if is_selected {
-                        Color32::YELLOW
+                        theme::state::SELECTED
                     } else if is_hovered {
-                        Color32::WHITE
+                        theme::state::HOVER
                     } else {
                         color.gamma_multiply(0.7)
                     };
-                    let border_width = if is_summary_node { 4.0 } else { 2.0 };
+                    let border_width = if is_summary_node {
+                        theme::stroke_width::ACTIVE
+                    } else if is_selected || is_hovered {
+                        theme::stroke_width::SELECTED
+                    } else {
+                        theme::stroke_width::NORMAL
+                    };
                     painter.circle_stroke(screen_pos, size, Stroke::new(border_width, border_color));
                 }
             }
@@ -2594,15 +2616,41 @@ impl DashboardApp {
             }
         }
 
-        // Loading indicator
+        // Loading indicator with skeleton animation
         if self.loading {
+            // Animated loading pulse
+            let time = ui.ctx().input(|i| i.time);
+            let pulse = ((time * 2.0).sin() * 0.5 + 0.5) as f32;
+            let text_color = Color32::from_rgba_unmultiplied(
+                240,
+                240,
+                245,
+                (150.0 + pulse * 105.0) as u8
+            );
+
             painter.text(
                 center,
                 egui::Align2::CENTER_CENTER,
                 "Loading...",
                 egui::FontId::proportional(24.0),
-                Color32::WHITE,
+                text_color,
             );
+
+            // Draw skeleton nodes for preview
+            let skeleton_positions = [
+                center + Vec2::new(-100.0, -50.0),
+                center + Vec2::new(80.0, -30.0),
+                center + Vec2::new(-60.0, 60.0),
+                center + Vec2::new(120.0, 40.0),
+            ];
+            for (i, pos) in skeleton_positions.iter().enumerate() {
+                let size = 8.0 + (i as f32 * 2.0);
+                let phase = ((time * 1.5 + i as f64 * 0.5).sin() * 0.5 + 0.5) as f32;
+                let alpha = (100.0 + phase * 80.0) as u8;
+                painter.circle_filled(*pos, size, Color32::from_rgba_unmultiplied(80, 85, 100, alpha));
+            }
+
+            ui.ctx().request_repaint(); // Keep animating
         }
     }
 
@@ -2710,7 +2758,7 @@ impl DashboardApp {
         painter.rect_filled(
             rect,
             4.0,
-            Color32::from_rgb(30, 33, 40)
+            theme::bg::TIMELINE_TRACK
         );
 
         // Draw either notches or histogram based on mode
@@ -2732,8 +2780,8 @@ impl DashboardApp {
                 let max_count = bin_counts.iter().copied().max().unwrap_or(1).max(1);
 
                 // Draw histogram bars
-                let bar_color = Color32::from_rgb(80, 90, 110);
-                let bar_highlight = Color32::from_rgb(100, 120, 150);
+                let bar_color = theme::timeline::BAR_INACTIVE;
+                let bar_highlight = theme::timeline::BAR_HIGHLIGHT;
                 let track_height = rect.height() - 10.0; // Leave padding
 
                 for (i, &count) in bin_counts.iter().enumerate() {
@@ -2766,7 +2814,7 @@ impl DashboardApp {
             }
         } else {
             // Notch mode: draw individual lines for each timestamp
-            let notch_color = Color32::from_rgb(60, 65, 75);
+            let notch_color = theme::timeline::NOTCH;
             for &t in &timestamps {
                 let pos = position_at_time(t);
                 let x = rect.left() + pos * rect.width();
@@ -2787,7 +2835,7 @@ impl DashboardApp {
         painter.rect_filled(
             range_rect,
             2.0,
-            Color32::from_rgba_unmultiplied(255, 149, 0, 80)
+            theme::accent::orange_subtle()
         );
 
         // Draw start handle
@@ -2796,14 +2844,14 @@ impl DashboardApp {
             Pos2::new(start_x, rect.center().y),
             Vec2::new(handle_width, rect.height() - 4.0)
         );
-        painter.rect_filled(start_handle_rect, 2.0, Color32::from_rgb(100, 100, 120));
+        painter.rect_filled(start_handle_rect, 2.0, theme::timeline::HANDLE_START);
 
         // Draw end/position handle (main scrubber)
         let end_handle_rect = egui::Rect::from_center_size(
             Pos2::new(end_x, rect.center().y),
             Vec2::new(handle_width, rect.height() - 4.0)
         );
-        painter.rect_filled(end_handle_rect, 2.0, Color32::from_rgb(255, 149, 0));
+        painter.rect_filled(end_handle_rect, 2.0, theme::timeline::HANDLE_END);
 
         // Handle interaction
         if response.dragged() {
@@ -3032,14 +3080,14 @@ impl eframe::App for DashboardApp {
             if let Some(node) = self.graph.data.nodes.iter().find(|n| &n.id == hovered_id) {
                 egui::TopBottomPanel::top("session_id_display")
                     .frame(egui::Frame::none()
-                        .fill(Color32::from_rgb(20, 22, 28))
+                        .fill(theme::bg::PANEL)
                         .inner_margin(egui::Margin::symmetric(12.0, 8.0)))
                     .show(ctx, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("Session: {} | Project: {}", node.session_id, node.project))
                                     .size(14.0)
-                                    .color(Color32::from_rgb(180, 180, 180))
+                                    .color(theme::text::SECONDARY)
                             );
                         });
                     });
@@ -3051,7 +3099,7 @@ impl eframe::App for DashboardApp {
             egui::TopBottomPanel::bottom("timeline")
                 .min_height(80.0)
                 .frame(egui::Frame::none()
-                    .fill(Color32::from_rgb(20, 22, 28))
+                    .fill(theme::bg::PANEL)
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0)))
                 .show(ctx, |ui| {
                     self.render_timeline(ui);
@@ -3060,7 +3108,7 @@ impl eframe::App for DashboardApp {
 
         // Main graph area
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_rgb(14, 17, 23)))
+            .frame(egui::Frame::none().fill(theme::bg::GRAPH))
             .show(ctx, |ui| {
                 self.render_graph(ui);
             });
