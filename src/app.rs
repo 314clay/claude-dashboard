@@ -203,6 +203,10 @@ pub struct DashboardApp {
     last_synced: Option<Instant>,
     beads_last_check: Instant,
     beads_last_mtime: Option<SystemTime>,
+
+    // Collapsible side panels
+    beads_panel_open: bool,
+    mail_panel_open: bool,
 }
 
 impl DashboardApp {
@@ -293,6 +297,10 @@ impl DashboardApp {
             last_click_time: Instant::now(),
             last_click_node: None,
 
+            // Collapsible side panels (read before settings move)
+            beads_panel_open: settings.beads_panel_open,
+            mail_panel_open: settings.mail_panel_open,
+
             // Settings persistence
             settings,
             settings_dirty: false,
@@ -374,6 +382,8 @@ impl DashboardApp {
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
         self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
+        self.settings.beads_panel_open = self.beads_panel_open;
+        self.settings.mail_panel_open = self.mail_panel_open;
     }
 
     /// Copy settings values to UI fields (used when loading a preset)
@@ -1269,6 +1279,98 @@ impl DashboardApp {
                 self.summary_window_dragged = true;
             }
         }
+    }
+
+    /// Render the beads panel (issues/tasks)
+    fn render_beads_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Beads");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("B to toggle")
+                        .small()
+                        .color(theme::text::MUTED)
+                );
+            });
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Placeholder content - beads data integration would go here
+            ui.label(
+                egui::RichText::new("Issue tracking panel")
+                    .color(theme::text::SECONDARY)
+            );
+            ui.add_space(16.0);
+
+            // Sample structure showing what the panel would contain
+            ui.label(egui::RichText::new("Ready").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No ready issues")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("In Progress").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No issues in progress")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("Blocked").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No blocked issues")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+        });
+    }
+
+    /// Render the mail panel (inbox/outbox)
+    fn render_mail_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Mail");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("M to toggle")
+                        .small()
+                        .color(theme::text::MUTED)
+                );
+            });
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Tab selection for Inbox/Outbox (placeholder - actual tab state would go here)
+        ui.horizontal(|ui| {
+            let _ = ui.selectable_label(true, "Inbox");
+            let _ = ui.selectable_label(false, "Outbox");
+        });
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Placeholder content - mail data integration would go here
+            ui.label(
+                egui::RichText::new("Mail panel")
+                    .color(theme::text::SECONDARY)
+            );
+            ui.add_space(16.0);
+
+            ui.label(
+                egui::RichText::new("No messages")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+        });
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2896,6 +2998,21 @@ impl eframe::App for DashboardApp {
         self.update_fps();
         self.maybe_save_settings();
 
+        // Handle keyboard shortcuts for panel toggles
+        // Only trigger when no text input is focused
+        ctx.input(|i| {
+            if !i.focused {
+                if i.key_pressed(egui::Key::B) {
+                    self.beads_panel_open = !self.beads_panel_open;
+                    self.mark_settings_dirty();
+                }
+                if i.key_pressed(egui::Key::M) {
+                    self.mail_panel_open = !self.mail_panel_open;
+                    self.mark_settings_dirty();
+                }
+            }
+        });
+
         // Check for .beads/ changes and auto-refresh if needed
         if self.check_beads_changed() && !self.loading {
             self.load_graph();
@@ -3103,6 +3220,32 @@ impl eframe::App for DashboardApp {
                     .inner_margin(egui::Margin::symmetric(12.0, 8.0)))
                 .show(ctx, |ui| {
                     self.render_timeline(ui);
+                });
+        }
+
+        // Beads panel (right side, toggled with B)
+        if self.beads_panel_open {
+            egui::SidePanel::right("beads_panel")
+                .min_width(280.0)
+                .max_width(400.0)
+                .frame(egui::Frame::none()
+                    .fill(theme::bg::PANEL)
+                    .inner_margin(egui::Margin::same(12.0)))
+                .show(ctx, |ui| {
+                    self.render_beads_panel(ui);
+                });
+        }
+
+        // Mail panel (right side, toggled with M)
+        if self.mail_panel_open {
+            egui::SidePanel::right("mail_panel")
+                .min_width(280.0)
+                .max_width(400.0)
+                .frame(egui::Frame::none()
+                    .fill(theme::bg::PANEL)
+                    .inner_margin(egui::Margin::same(12.0)))
+                .show(ctx, |ui| {
+                    self.render_mail_panel(ui);
                 });
         }
 
