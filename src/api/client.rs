@@ -106,6 +106,8 @@ impl ApiClient {
         Ok(GraphData {
             nodes: graph_resp.nodes,
             edges: graph_resp.edges,
+            beads: Vec::new(),
+            mail: Vec::new(),
         })
     }
 

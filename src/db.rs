@@ -275,7 +275,7 @@ impl DbClient {
                 }
             }
 
-            Ok(GraphData { nodes, edges })
+            Ok(GraphData { nodes, edges, beads: Vec::new(), mail: Vec::new() })
         })
     }
 
