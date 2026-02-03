@@ -232,6 +232,12 @@ pub struct Settings {
     pub auto_refresh_enabled: bool,
     #[serde(default = "default_auto_refresh_interval_secs")]
     pub auto_refresh_interval_secs: f32,
+
+    // Panel visibility (collapsible side panels)
+    #[serde(default = "default_beads_panel_open")]
+    pub beads_panel_open: bool,
+    #[serde(default = "default_mail_panel_open")]
+    pub mail_panel_open: bool,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -268,6 +274,14 @@ fn default_auto_refresh_enabled() -> bool {
 
 fn default_auto_refresh_interval_secs() -> f32 {
     5.0
+}
+
+fn default_beads_panel_open() -> bool {
+    false
+}
+
+fn default_mail_panel_open() -> bool {
+    false
 }
 
 impl Default for Settings {
@@ -314,6 +328,10 @@ impl Default for Settings {
             // Refresh & sync
             auto_refresh_enabled: false,
             auto_refresh_interval_secs: 5.0,
+
+            // Panel visibility
+            beads_panel_open: false,
+            mail_panel_open: false,
         }
     }
 }
