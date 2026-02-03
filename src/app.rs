@@ -4,6 +4,7 @@ use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
+use crate::mail::{MailNetworkState, render_mail_network};
 use crate::settings::{Preset, Settings, SizingPreset};
 use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
@@ -203,6 +204,11 @@ pub struct DashboardApp {
     last_synced: Option<Instant>,
     beads_last_check: Instant,
     beads_last_mtime: Option<SystemTime>,
+
+    // Mail network graph (agent communication)
+    mail_network_state: Option<MailNetworkState>,
+    mail_network_loading: bool,
+    mail_network_error: Option<String>,
 }
 
 impl DashboardApp {
@@ -319,6 +325,11 @@ impl DashboardApp {
             last_synced: None,
             beads_last_check: Instant::now(),
             beads_last_mtime: None,
+
+            // Mail network graph
+            mail_network_state: None,
+            mail_network_loading: false,
+            mail_network_error: None,
         };
 
         // Load initial data if connected
@@ -518,6 +529,27 @@ impl DashboardApp {
         self.beads_last_mtime = current_mtime;
 
         changed
+    }
+
+    /// Load mail network data from API
+    fn load_mail_network(&mut self) {
+        self.mail_network_loading = true;
+        self.mail_network_error = None;
+
+        let api = ApiClient::new();
+        match api.fetch_mail_network() {
+            Ok(data) => {
+                // Initialize state with positions in a circle
+                let center = Pos2::new(125.0, 100.0);  // Center of mini-panel
+                let radius = 60.0;
+                self.mail_network_state = Some(MailNetworkState::new(data, center, radius));
+                self.mail_network_loading = false;
+            }
+            Err(e) => {
+                self.mail_network_error = Some(e);
+                self.mail_network_loading = false;
+            }
+        }
     }
 
     fn update_fps(&mut self) {
@@ -1383,6 +1415,35 @@ impl DashboardApp {
                             self.mark_settings_dirty();
                         }
                     });
+                }
+            });
+
+        // Mail Network Graph section
+        egui::CollapsingHeader::new("Mail Network")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Agent Communication").size(11.0).color(Color32::GRAY));
+
+                // Load button
+                if self.mail_network_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading...");
+                    });
+                } else if ui.button("Load Mail Network").clicked() {
+                    self.load_mail_network();
+                }
+
+                // Error message
+                if let Some(ref err) = self.mail_network_error {
+                    ui.colored_label(Color32::RED, format!("Error: {}", err));
+                }
+
+                // Render the mail network graph
+                if let Some(ref mut state) = self.mail_network_state {
+                    ui.add_space(5.0);
+                    let size = Vec2::new(ui.available_width().min(250.0), 200.0);
+                    render_mail_network(ui, state, size);
                 }
             });
 

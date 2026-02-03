@@ -42,6 +42,7 @@ from db.semantic_filter_scorer import (
     categorize_messages,
     get_filter_stats,
 )
+from db.mail import get_mail_network
 # Commented out - health_ingest module not present
 # from db.health_ingest import (
 #     ingest_payload as health_ingest_payload,
@@ -434,6 +435,22 @@ def semantic_filter_stats():
     Returns: { total_messages, filters: [{ id, name, scored_count, match_count }] }
     """
     return get_filter_stats()
+
+
+# ==== Mail Network Endpoints ====
+
+@app.get("/mail/network")
+def mail_network():
+    """Get mail network graph for agent communication visualization.
+
+    Returns a force-directed graph representation:
+    - nodes: agents (polecats, witness, mayor, etc.)
+    - edges: message counts between agents (directed)
+    - stats: summary statistics
+
+    Used by the mini network graph widget in the sidebar.
+    """
+    return get_mail_network()
 
 
 # ==== Health Auto Export Endpoints ====

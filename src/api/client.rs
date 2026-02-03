@@ -1,6 +1,7 @@
 //! HTTP client for the dashboard API.
 
 use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SemanticFilter, SessionSummaryData};
+use crate::mail::MailNetworkData;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -196,6 +197,28 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(stats)
+    }
+
+    /// Fetch mail network graph data for agent communication visualization.
+    pub fn fetch_mail_network(&self) -> Result<MailNetworkData, String> {
+        let url = format!("{}/mail/network", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let data: MailNetworkData = resp
+            .json()
+            .map_err(|e| format!("Failed to parse mail network: {}", e))?;
+
+        Ok(data)
     }
 
     /// Rescore importance for messages in specified sessions

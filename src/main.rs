@@ -6,6 +6,7 @@ mod api;
 mod app;
 mod db;
 mod graph;
+mod mail;
 mod settings;
 mod theme;
 
