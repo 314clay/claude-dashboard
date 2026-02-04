@@ -3086,14 +3086,14 @@ impl DashboardApp {
                 return;
             }
 
-            // Scrollable histogram
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            // Scrollable histogram (horizontal scroll, time on X axis)
+            egui::ScrollArea::horizontal().show(ui, |ui| {
                 self.render_histogram_bars(ui, &bins);
             });
         });
     }
 
-    /// Render the histogram bars
+    /// Render the histogram bars (time on X axis, vertical bars)
     fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
         if bins.is_empty() {
             return;
@@ -3105,101 +3105,107 @@ impl DashboardApp {
             .max()
             .unwrap_or(1);
 
-        let bar_width = 60.0;
-        let bar_max_height = 100.0;
-        let bar_spacing = 10.0;
+        let bar_width = 40.0;
+        let bar_spacing = 8.0;
+        let available_height = ui.available_height() - 40.0; // Leave room for labels
 
-        for (i, bin) in bins.iter().enumerate() {
-            ui.horizontal(|ui| {
-                // Time label
-                ui.label(format_timestamp(&bin.timestamp_start));
+        ui.horizontal(|ui| {
+            for (i, bin) in bins.iter().enumerate() {
+                ui.vertical(|ui| {
+                    // Calculate total height for this bar
+                    let total = bin.input_tokens + bin.output_tokens + bin.cache_read_tokens + bin.cache_creation_tokens;
 
-                ui.add_space(10.0);
-
-                // Bar area
-                let (rect, response) = ui.allocate_exact_size(
-                    egui::vec2(bar_width, bar_max_height),
-                    egui::Sense::hover(),
-                );
-
-                // Track hovered bin
-                if response.hovered() {
-                    self.histogram_hovered_bin = Some(i);
-                } else if self.histogram_hovered_bin == Some(i) && !response.hovered() {
-                    self.histogram_hovered_bin = None;
-                }
-
-                // Calculate heights
-                let total = bin.input_tokens + bin.output_tokens + bin.cache_read_tokens + bin.cache_creation_tokens;
-                if total == 0 {
-                    return;
-                }
-
-                let scale = bar_max_height / max_total as f32;
-
-                // Draw stacked segments (bottom to top: input, output, cache read, cache create)
-                let mut y_offset = 0.0;
-
-                // Input (bottom)
-                if bin.input_tokens > 0 {
-                    let height = bin.input_tokens as f32 * scale;
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                        egui::vec2(bar_width, height),
+                    // Bar area
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(bar_width, available_height),
+                        egui::Sense::hover(),
                     );
-                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::INPUT);
-                    y_offset += height;
-                }
 
-                // Output
-                if bin.output_tokens > 0 {
-                    let height = bin.output_tokens as f32 * scale;
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                        egui::vec2(bar_width, height),
+                    // Track hovered bin
+                    if response.hovered() {
+                        self.histogram_hovered_bin = Some(i);
+                    } else if self.histogram_hovered_bin == Some(i) && !response.hovered() {
+                        self.histogram_hovered_bin = None;
+                    }
+
+                    if total > 0 {
+                        let scale = available_height / max_total as f32;
+
+                        // Draw stacked segments (bottom to top: input, output, cache read, cache create)
+                        let mut y_offset = 0.0;
+
+                        // Input (bottom)
+                        if bin.input_tokens > 0 {
+                            let height = bin.input_tokens as f32 * scale;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                                egui::vec2(bar_width, height),
+                            );
+                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::INPUT);
+                            y_offset += height;
+                        }
+
+                        // Output
+                        if bin.output_tokens > 0 {
+                            let height = bin.output_tokens as f32 * scale;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                                egui::vec2(bar_width, height),
+                            );
+                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::OUTPUT);
+                            y_offset += height;
+                        }
+
+                        // Cache read
+                        if bin.cache_read_tokens > 0 {
+                            let height = bin.cache_read_tokens as f32 * scale;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                                egui::vec2(bar_width, height),
+                            );
+                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::CACHE_READ);
+                            y_offset += height;
+                        }
+
+                        // Cache creation (top)
+                        if bin.cache_creation_tokens > 0 {
+                            let height = bin.cache_creation_tokens as f32 * scale;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                                egui::vec2(bar_width, height),
+                            );
+                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::CACHE_CREATE);
+                        }
+                    }
+
+                    // Hover tooltip
+                    response.on_hover_ui(|ui| {
+                        ui.label(format!("{} - {}",
+                            format_timestamp(&bin.timestamp_start),
+                            format_timestamp(&bin.timestamp_end)
+                        ));
+                        ui.separator();
+                        ui.label(format!("Input: {} tokens", bin.input_tokens));
+                        ui.label(format!("Output: {} tokens", bin.output_tokens));
+                        ui.label(format!("Cache Read: {} tokens", bin.cache_read_tokens));
+                        ui.label(format!("Cache Create: {} tokens", bin.cache_creation_tokens));
+                        ui.label(format!("Total: {} tokens", total));
+                    });
+
+                    // Time label below bar
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format_timestamp(&bin.timestamp_start))
+                            .size(9.0)
+                            .color(theme::text::SECONDARY)
                     );
-                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::OUTPUT);
-                    y_offset += height;
-                }
-
-                // Cache read
-                if bin.cache_read_tokens > 0 {
-                    let height = bin.cache_read_tokens as f32 * scale;
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                        egui::vec2(bar_width, height),
-                    );
-                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::CACHE_READ);
-                    y_offset += height;
-                }
-
-                // Cache creation
-                if bin.cache_creation_tokens > 0 {
-                    let height = bin.cache_creation_tokens as f32 * scale;
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                        egui::vec2(bar_width, height),
-                    );
-                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::CACHE_CREATE);
-                }
-
-                // Hover tooltip
-                response.on_hover_ui(|ui| {
-                    ui.label(format!("{} - {}",
-                        format_timestamp(&bin.timestamp_start),
-                        format_timestamp(&bin.timestamp_end)
-                    ));
-                    ui.separator();
-                    ui.label(format!("Input: {} tokens", bin.input_tokens));
-                    ui.label(format!("Output: {} tokens", bin.output_tokens));
-                    ui.label(format!("Cache Read: {} tokens", bin.cache_read_tokens));
-                    ui.label(format!("Cache Create: {} tokens", bin.cache_creation_tokens));
-                    ui.label(format!("Total: {} tokens", total));
                 });
-            });
 
-            ui.add_space(bar_spacing);
-        }
+                if i < bins.len() - 1 {
+                    ui.add_space(bar_spacing);
+                }
+            }
+        });
     }
 
     /// Aggregate token usage into time bins
