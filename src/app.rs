@@ -3204,13 +3204,19 @@ impl DashboardApp {
         });
     }
 
-    /// Aggregate token usage into time bins
+    /// Aggregate token usage into time bins (respects timeline visibility)
     fn aggregate_token_bins(&self) -> Vec<TokenBin> {
         use chrono::{DateTime, Utc};
 
         // Collect all nodes with token data and valid timestamps
+        // Filter by timeline visibility if enabled
         let mut timestamped_nodes: Vec<_> = self.graph.data.nodes.iter()
             .filter_map(|node| {
+                // Skip nodes hidden by timeline
+                if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
+                    return None;
+                }
+
                 let ts = node.timestamp.as_ref()?;
                 let input = node.input_tokens.unwrap_or(0);
                 let output = node.output_tokens.unwrap_or(0);
