@@ -2,7 +2,7 @@
 
 use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
-use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
+use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData, ViewMode, ViewSettings};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
 use crate::settings::{Preset, Settings, SizingPreset};
@@ -114,6 +114,11 @@ pub struct DashboardApp {
     timeline_enabled: bool,
     timeline_histogram_mode: bool,
     hover_scrubs_timeline: bool,
+
+    // View mode (force-directed vs timeline)
+    view_mode: ViewMode,
+    force_directed_settings: ViewSettings,
+    timeline_settings: ViewSettings,
 
     // Node sizing (unified formula)
     sizing_preset: SizingPreset,
@@ -255,6 +260,9 @@ impl DashboardApp {
             timeline_enabled: settings.timeline_enabled,
             timeline_histogram_mode: false, // Default to notch view
             hover_scrubs_timeline: settings.hover_scrubs_timeline,
+            view_mode: ViewMode::ForceDirected,
+            force_directed_settings: ViewSettings::force_directed_defaults(),
+            timeline_settings: ViewSettings::timeline_defaults(),
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
             w_tokens: settings.w_tokens,
@@ -1670,6 +1678,25 @@ impl DashboardApp {
                     ui.separator();
                     if ui.button("🎲").on_hover_text("Randomize hues").clicked() {
                         self.graph.randomize_hue_offset();
+                    }
+                });
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label("View:");
+                    if ui.selectable_label(self.view_mode == ViewMode::ForceDirected, "🔮 Force")
+                        .on_hover_text("Force-directed physics layout")
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::ForceDirected;
+                        self.mark_settings_dirty();
+                    }
+                    if ui.selectable_label(self.view_mode == ViewMode::Timeline, "📊 Timeline")
+                        .on_hover_text("Timeline view: X = time, Y = attention distance from user")
+                        .clicked()
+                    {
+                        self.view_mode = ViewMode::Timeline;
+                        self.mark_settings_dirty();
                     }
                 });
             });
