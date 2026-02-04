@@ -2303,7 +2303,16 @@ impl DashboardApp {
         // Only simulate visible nodes (respects timeline + importance filters)
         let physics_visible = self.compute_physics_visible_nodes();
         let node_sizes = self.compute_node_sizes();
-        self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
+
+        // Choose physics algorithm based on view mode
+        match self.view_mode {
+            ViewMode::ForceDirected => {
+                self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
+            }
+            ViewMode::Timeline => {
+                self.layout.step_timeline(&mut self.graph, rect, physics_visible.as_ref(), node_sizes.as_ref());
+            }
+        }
 
         // Cache values for transform closure to avoid borrowing self
         let pan_offset = self.pan_offset;
