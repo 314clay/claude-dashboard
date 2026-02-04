@@ -470,6 +470,7 @@ impl DashboardApp {
         self.settings.save_to_active_view_settings();
 
         // Switch view mode
+        self.view_mode = new_mode;
         self.settings.view_mode = new_mode;
 
         // Apply new view's settings to main settings

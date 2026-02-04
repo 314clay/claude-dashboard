@@ -298,10 +298,10 @@ impl ForceLayout {
                     if let Some(pos) = state.positions.get_mut(id) {
                         pos.x = x;
 
-                        // Pin user messages at y_baseline
-                        if node.role == Role::User {
-                            pos.y = y_baseline;
-                        }
+                        // Pin user messages at y_baseline (disabled for now)
+                        // if node.role == Role::User {
+                        //     pos.y = y_baseline;
+                        // }
                     }
                 }
             }
@@ -315,14 +315,14 @@ impl ForceLayout {
             };
             let mass_i = node_masses.get(id_i).copied().unwrap_or(1.0);
 
-            // Check if this is a user node (pinned, doesn't receive forces)
-            let is_user_i = state.node_index.get(id_i)
-                .map(|&idx| state.data.nodes[idx].role == Role::User)
-                .unwrap_or(false);
-
-            if is_user_i {
-                continue; // User nodes don't move
-            }
+            // Check if this is a user node (pinned, doesn't receive forces) - disabled for now
+            // let is_user_i = state.node_index.get(id_i)
+            //     .map(|&idx| state.data.nodes[idx].role == Role::User)
+            //     .unwrap_or(false);
+            //
+            // if is_user_i {
+            //     continue; // User nodes don't move
+            // }
 
             for (j, id_j) in node_ids.iter().enumerate() {
                 if i >= j {
@@ -424,20 +424,20 @@ impl ForceLayout {
 
         // Apply forces (Y-only) with damping
         for (i, id) in node_ids.iter().enumerate() {
-            let is_user = state.node_index.get(id)
+            // Disabled for now - let user nodes float with physics
+            let _is_user = state.node_index.get(id)
                 .map(|&idx| state.data.nodes[idx].role == Role::User)
                 .unwrap_or(false);
-
-            if is_user {
-                // Ensure user nodes stay at baseline
-                if let Some(pos) = state.positions.get_mut(id) {
-                    pos.y = y_baseline;
-                }
-                if let Some(vel) = state.velocities.get_mut(id) {
-                    vel.y = 0.0;
-                }
-                continue;
-            }
+            // if is_user {
+            //     // Ensure user nodes stay at baseline
+            //     if let Some(pos) = state.positions.get_mut(id) {
+            //         pos.y = y_baseline;
+            //     }
+            //     if let Some(vel) = state.velocities.get_mut(id) {
+            //         vel.y = 0.0;
+            //     }
+            //     continue;
+            // }
 
             if let Some(vel) = state.velocities.get_mut(id) {
                 // Only update Y velocity
