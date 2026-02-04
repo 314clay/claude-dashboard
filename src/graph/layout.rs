@@ -222,6 +222,7 @@ impl ForceLayout {
         bounds: Rect,
         visible_nodes: Option<&HashSet<String>>,
         node_sizes: Option<&HashMap<String, f32>>,
+        even_spacing: bool,
     ) {
         if !state.physics_enabled || state.data.nodes.is_empty() {
             return;
@@ -286,22 +287,48 @@ impl ForceLayout {
         let x_offset = bounds.min.x + bounds.width() * 0.05;
         let y_baseline = bounds.center().y; // User messages go here
 
-        for (_i, id) in node_ids.iter().enumerate() {
-            if let Some(&node_idx) = state.node_index.get(id) {
-                let node = &state.data.nodes[node_idx];
+        if even_spacing {
+            // Even spacing mode: distribute nodes uniformly along X axis
+            let num_nodes = node_ids.len();
+            for (i, id) in node_ids.iter().enumerate() {
+                let normalized_position = if num_nodes > 1 {
+                    i as f32 / (num_nodes - 1) as f32
+                } else {
+                    0.5
+                };
+                let x = x_offset + normalized_position * graph_width;
 
-                // Calculate X from timestamp
-                if let Some(ts) = node.timestamp_secs() {
-                    let normalized_time = ((ts - min_time) / time_range) as f32;
-                    let x = x_offset + normalized_time * graph_width;
+                if let Some(pos) = state.positions.get_mut(id) {
+                    pos.x = x;
 
-                    if let Some(pos) = state.positions.get_mut(id) {
-                        pos.x = x;
+                    // Pin user messages at y_baseline (disabled for now)
+                    // if let Some(&node_idx) = state.node_index.get(id) {
+                    //     let node = &state.data.nodes[node_idx];
+                    //     if node.role == Role::User {
+                    //         pos.y = y_baseline;
+                    //     }
+                    // }
+                }
+            }
+        } else {
+            // Time-proportional spacing mode: use timestamps
+            for (_i, id) in node_ids.iter().enumerate() {
+                if let Some(&node_idx) = state.node_index.get(id) {
+                    let node = &state.data.nodes[node_idx];
 
-                        // Pin user messages at y_baseline (disabled for now)
-                        // if node.role == Role::User {
-                        //     pos.y = y_baseline;
-                        // }
+                    // Calculate X from timestamp
+                    if let Some(ts) = node.timestamp_secs() {
+                        let normalized_time = ((ts - min_time) / time_range) as f32;
+                        let x = x_offset + normalized_time * graph_width;
+
+                        if let Some(pos) = state.positions.get_mut(id) {
+                            pos.x = x;
+
+                            // Pin user messages at y_baseline (disabled for now)
+                            // if node.role == Role::User {
+                            //     pos.y = y_baseline;
+                            // }
+                        }
                     }
                 }
             }

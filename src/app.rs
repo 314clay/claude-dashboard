@@ -2423,7 +2423,13 @@ impl DashboardApp {
                 self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
             }
             ViewMode::Timeline => {
-                self.layout.step_timeline(&mut self.graph, rect, physics_visible.as_ref(), node_sizes.as_ref());
+                self.layout.step_timeline(
+                    &mut self.graph,
+                    rect,
+                    physics_visible.as_ref(),
+                    node_sizes.as_ref(),
+                    self.settings.timeline_spacing_even
+                );
             }
         }
 
@@ -3368,6 +3374,19 @@ impl DashboardApp {
             let view_tooltip = if histogram_mode { "Histogram view (click for notches)" } else { "Notch view (click for histogram)" };
             if ui.button(view_label).on_hover_text(view_tooltip).clicked() {
                 self.timeline_histogram_mode = !self.timeline_histogram_mode;
+            }
+
+            ui.separator();
+
+            // Spacing mode toggle
+            let spacing_label = if self.settings.timeline_spacing_even { "═" } else { "≈" };
+            let spacing_tooltip = if self.settings.timeline_spacing_even {
+                "Even spacing (click for time-proportional)"
+            } else {
+                "Time-proportional spacing (click for even)"
+            };
+            if ui.button(spacing_label).on_hover_text(spacing_tooltip).clicked() {
+                self.settings.timeline_spacing_even = !self.settings.timeline_spacing_even;
             }
         });
 
