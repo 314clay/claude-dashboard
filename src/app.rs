@@ -6,7 +6,7 @@ use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData, ViewMode, ViewSettings};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
-use crate::settings::{Preset, Settings, SizingPreset, ViewMode};
+use crate::settings::{Preset, Settings, SizingPreset};
 use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};

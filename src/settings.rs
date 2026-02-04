@@ -1,26 +1,9 @@
 //! Persistent settings for the dashboard app.
 
-use crate::graph::types::ColorMode;
+use crate::graph::types::{ColorMode, ViewMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-/// View mode for the graph visualization
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ViewMode {
-    #[default]
-    ForceDirected, // Standard force-directed layout
-    Timeline,      // X = time, Y = physics-based
-}
-
-impl ViewMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ViewMode::ForceDirected => "Force Directed",
-            ViewMode::Timeline => "Timeline",
-        }
-    }
-}
 
 /// Per-view physics and sizing settings
 /// These are the settings that change when switching between view modes
