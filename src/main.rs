@@ -4,6 +4,7 @@
 
 mod api;
 mod app;
+mod beads;
 mod db;
 mod graph;
 mod mail;

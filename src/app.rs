@@ -1,6 +1,7 @@
 //! Main application state and UI.
 
 use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
+use crate::beads::BeadLoader;
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData, ViewMode, ViewSettings};
 use crate::graph::{ForceLayout, GraphState};
@@ -223,6 +224,9 @@ pub struct DashboardApp {
     // Collapsible side panels
     beads_panel_open: bool,
     mail_panel_open: bool,
+
+    // Beads loader with caching (lazy loading, virtual scrolling)
+    bead_loader: BeadLoader,
 }
 
 impl DashboardApp {
@@ -354,6 +358,9 @@ impl DashboardApp {
             mail_network_state: None,
             mail_network_loading: false,
             mail_network_error: None,
+
+            // Beads loader with caching
+            bead_loader: BeadLoader::new(),
         };
 
         // Load initial data if connected
@@ -1329,57 +1336,9 @@ impl DashboardApp {
         }
     }
 
-    /// Render the beads panel (issues/tasks)
+    /// Render the beads panel (issues/tasks) with lazy loading and virtual scrolling
     fn render_beads_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Beads");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("B to toggle")
-                        .small()
-                        .color(theme::text::MUTED)
-                );
-            });
-        });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Placeholder content - beads data integration would go here
-            ui.label(
-                egui::RichText::new("Issue tracking panel")
-                    .color(theme::text::SECONDARY)
-            );
-            ui.add_space(16.0);
-
-            // Sample structure showing what the panel would contain
-            ui.label(egui::RichText::new("Ready").strong());
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("No ready issues")
-                    .color(theme::text::MUTED)
-                    .italics()
-            );
-
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("In Progress").strong());
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("No issues in progress")
-                    .color(theme::text::MUTED)
-                    .italics()
-            );
-
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("Blocked").strong());
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("No blocked issues")
-                    .color(theme::text::MUTED)
-                    .italics()
-            );
-        });
+        crate::beads::render_beads_panel(ui, &mut self.bead_loader, self.beads_panel_open);
     }
 
     /// Render the mail panel (inbox/outbox)
