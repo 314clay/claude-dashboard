@@ -6,7 +6,7 @@ use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData, ViewMode, ViewSettings};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
-use crate::settings::{Preset, Settings, SizingPreset};
+use crate::settings::{Preset, Settings, SizingPreset, ViewMode};
 use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -418,6 +418,10 @@ impl DashboardApp {
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
+
+        // Also save to the active view's per-view settings
+        // This ensures changes persist even without switching view modes
+        self.settings.save_to_active_view_settings();
     }
 
     /// Copy settings values to UI fields (used when loading a preset)
@@ -456,6 +460,31 @@ impl DashboardApp {
             self.settings_dirty = false;
             self.last_settings_save = Instant::now();
         }
+    }
+
+    /// Switch view mode, saving current settings and applying new view's settings
+    fn switch_view_mode(&mut self, new_mode: ViewMode) {
+        // First sync current UI to settings (to capture any pending changes)
+        self.sync_settings_from_ui();
+        // Save current settings to the current view's per-view settings
+        self.settings.save_to_active_view_settings();
+
+        // Switch view mode
+        self.settings.view_mode = new_mode;
+
+        // Apply new view's settings to main settings
+        self.settings.apply_active_view_settings();
+
+        // Sync settings to UI fields
+        self.sync_ui_from_settings();
+
+        // Handle temporal edges - toggle them based on new view mode
+        let temporal_enabled = self.settings.temporal_attraction_enabled;
+        if self.graph.temporal_attraction_enabled != temporal_enabled {
+            self.graph.set_temporal_attraction_enabled(temporal_enabled);
+        }
+
+        self.mark_settings_dirty();
     }
 
     fn load_graph(&mut self) {
@@ -1597,6 +1626,27 @@ impl DashboardApp {
                     ui.add_space(5.0);
                     ui.label("No saved presets yet");
                 }
+            });
+
+        // View Mode section
+        egui::CollapsingHeader::new("View Mode")
+            .default_open(true)
+            .show(ui, |ui| {
+                let current_mode = self.settings.view_mode;
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(current_mode == ViewMode::ForceDirected, ViewMode::ForceDirected.label())
+                        .on_hover_text("Standard force-directed layout with full physics simulation")
+                        .clicked() && current_mode != ViewMode::ForceDirected
+                    {
+                        self.switch_view_mode(ViewMode::ForceDirected);
+                    }
+                    if ui.selectable_label(current_mode == ViewMode::Timeline, ViewMode::Timeline.label())
+                        .on_hover_text("Timeline layout: X = time, Y = physics. Temporal edges disabled.")
+                        .clicked() && current_mode != ViewMode::Timeline
+                    {
+                        self.switch_view_mode(ViewMode::Timeline);
+                    }
+                });
             });
 
         // Display section

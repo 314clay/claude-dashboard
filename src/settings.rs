@@ -5,6 +5,119 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// View mode for the graph visualization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ViewMode {
+    #[default]
+    ForceDirected, // Standard force-directed layout
+    Timeline,      // X = time, Y = physics-based
+}
+
+impl ViewMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ViewMode::ForceDirected => "Force Directed",
+            ViewMode::Timeline => "Timeline",
+        }
+    }
+}
+
+/// Per-view physics and sizing settings
+/// These are the settings that change when switching between view modes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewSettings {
+    // Physics
+    pub repulsion: f32,
+    pub attraction: f32,
+    pub centering: f32,
+    pub temporal_strength: f32,
+    pub size_physics_weight: f32,
+    pub temporal_attraction_enabled: bool,
+    pub temporal_window_mins: f32,
+    pub temporal_edge_opacity: f32,
+    pub max_temporal_edges: usize,
+
+    // For timeline view: vertical repulsion multiplier
+    // (multiplied with repulsion for Y-axis spreading)
+    pub vertical_repulsion_multiplier: f32,
+
+    // Node sizing weights
+    pub w_importance: f32,
+    pub w_tokens: f32,
+    pub w_time: f32,
+    pub max_node_multiplier: f32,
+}
+
+impl ViewSettings {
+    /// Default settings for force-directed view (current tuned values)
+    pub fn force_directed_defaults() -> Self {
+        Self {
+            // Physics - current tuned values
+            repulsion: 10000.0,
+            attraction: 0.1,
+            centering: 0.0001,
+            temporal_strength: 0.5,
+            size_physics_weight: 0.0,
+            temporal_attraction_enabled: true,
+            temporal_window_mins: 5.0,
+            temporal_edge_opacity: 0.3,
+            max_temporal_edges: 100_000,
+
+            // Standard vertical repulsion (no multiplier)
+            vertical_repulsion_multiplier: 1.0,
+
+            // Node sizing - balanced defaults
+            w_importance: 0.5,
+            w_tokens: 0.3,
+            w_time: 0.5,
+            max_node_multiplier: 10.0,
+        }
+    }
+
+    /// Default settings for timeline view
+    /// - Temporal edges OFF (X axis already encodes time)
+    /// - Stronger vertical repulsion (to spread nodes vertically)
+    /// - Different sizing weights (time less important since X shows time)
+    pub fn timeline_defaults() -> Self {
+        Self {
+            // Physics tuned for timeline
+            repulsion: 10000.0,
+            attraction: 0.05, // Weaker attraction - less clustering
+            centering: 0.0001,
+            temporal_strength: 0.0, // Not used
+            size_physics_weight: 0.0,
+            temporal_attraction_enabled: false, // OFF - X axis is time
+            temporal_window_mins: 5.0,
+            temporal_edge_opacity: 0.0, // Hidden
+            max_temporal_edges: 0,
+
+            // Stronger vertical repulsion to spread nodes apart
+            vertical_repulsion_multiplier: 2.5,
+
+            // Node sizing - importance and tokens matter more, time less
+            // (since temporal position is already shown on X axis)
+            w_importance: 0.7,
+            w_tokens: 0.5,
+            w_time: 0.1, // Lower - time is shown via X position
+            max_node_multiplier: 8.0,
+        }
+    }
+
+    /// Get defaults for a given view mode
+    pub fn defaults_for(mode: ViewMode) -> Self {
+        match mode {
+            ViewMode::ForceDirected => Self::force_directed_defaults(),
+            ViewMode::Timeline => Self::timeline_defaults(),
+        }
+    }
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self::force_directed_defaults()
+    }
+}
+
 /// Preset configurations for node sizing formula
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SizingPreset {
@@ -187,7 +300,17 @@ pub struct Settings {
     #[serde(default)]
     pub color_mode: ColorMode,
 
-    // Node Sizing (unified formula)
+    // Current view mode
+    #[serde(default)]
+    pub view_mode: ViewMode,
+
+    // Per-view settings (stored separately so they persist across view switches)
+    #[serde(default = "ViewSettings::force_directed_defaults")]
+    pub force_directed_settings: ViewSettings,
+    #[serde(default = "ViewSettings::timeline_defaults")]
+    pub timeline_view_settings: ViewSettings,
+
+    // Node Sizing (unified formula) - these are the ACTIVE values, updated from view settings
     #[serde(default)]
     pub sizing_preset: SizingPreset,
     #[serde(default = "default_w_importance")]
@@ -209,7 +332,7 @@ pub struct Settings {
     pub importance_threshold: f32,
     pub importance_filter_enabled: bool,
 
-    // Physics
+    // Physics - these are the ACTIVE values, updated from view settings
     pub physics_enabled: bool,
     pub repulsion: f32,
     pub attraction: f32,
@@ -238,6 +361,73 @@ pub struct Settings {
     pub beads_panel_open: bool,
     #[serde(default = "default_mail_panel_open")]
     pub mail_panel_open: bool,
+}
+
+impl Settings {
+    /// Get the view settings for the current view mode
+    pub fn active_view_settings(&self) -> &ViewSettings {
+        match self.view_mode {
+            ViewMode::ForceDirected => &self.force_directed_settings,
+            ViewMode::Timeline => &self.timeline_view_settings,
+        }
+    }
+
+    /// Get mutable view settings for the current view mode
+    pub fn active_view_settings_mut(&mut self) -> &mut ViewSettings {
+        match self.view_mode {
+            ViewMode::ForceDirected => &mut self.force_directed_settings,
+            ViewMode::Timeline => &mut self.timeline_view_settings,
+        }
+    }
+
+    /// Apply the active view's settings to the main settings fields
+    /// Call this after switching view modes
+    pub fn apply_active_view_settings(&mut self) {
+        let view = self.active_view_settings().clone();
+        self.repulsion = view.repulsion;
+        self.attraction = view.attraction;
+        self.centering = view.centering;
+        self.temporal_strength = view.temporal_strength;
+        self.size_physics_weight = view.size_physics_weight;
+        self.temporal_attraction_enabled = view.temporal_attraction_enabled;
+        self.temporal_window_mins = view.temporal_window_mins;
+        self.temporal_edge_opacity = view.temporal_edge_opacity;
+        self.max_temporal_edges = view.max_temporal_edges;
+        self.w_importance = view.w_importance;
+        self.w_tokens = view.w_tokens;
+        self.w_time = view.w_time;
+        self.max_node_multiplier = view.max_node_multiplier;
+    }
+
+    /// Save current main settings back to the active view's settings
+    /// Call this before switching view modes to preserve changes
+    pub fn save_to_active_view_settings(&mut self) {
+        // Read existing vertical_repulsion_multiplier before building new settings
+        let vertical_mult = match self.view_mode {
+            ViewMode::ForceDirected => self.force_directed_settings.vertical_repulsion_multiplier,
+            ViewMode::Timeline => self.timeline_view_settings.vertical_repulsion_multiplier,
+        };
+        let view_settings = ViewSettings {
+            repulsion: self.repulsion,
+            attraction: self.attraction,
+            centering: self.centering,
+            temporal_strength: self.temporal_strength,
+            size_physics_weight: self.size_physics_weight,
+            temporal_attraction_enabled: self.temporal_attraction_enabled,
+            temporal_window_mins: self.temporal_window_mins,
+            temporal_edge_opacity: self.temporal_edge_opacity,
+            max_temporal_edges: self.max_temporal_edges,
+            vertical_repulsion_multiplier: vertical_mult,
+            w_importance: self.w_importance,
+            w_tokens: self.w_tokens,
+            w_time: self.w_time,
+            max_node_multiplier: self.max_node_multiplier,
+        };
+        match self.view_mode {
+            ViewMode::ForceDirected => self.force_directed_settings = view_settings,
+            ViewMode::Timeline => self.timeline_view_settings = view_settings,
+        }
+    }
 }
 
 fn default_timeline_speed() -> f32 {
@@ -286,6 +476,7 @@ fn default_mail_panel_open() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
+        let force_directed = ViewSettings::force_directed_defaults();
         Self {
             // Data Selection
             time_range_hours: 24.0,
@@ -299,28 +490,33 @@ impl Default for Settings {
             timeline_speed: 1.0,
             hover_scrubs_timeline: true,
 
-            // Node Sizing
+            // View mode
+            view_mode: ViewMode::ForceDirected,
+            force_directed_settings: ViewSettings::force_directed_defaults(),
+            timeline_view_settings: ViewSettings::timeline_defaults(),
+
+            // Node Sizing (initialized from force-directed defaults)
             sizing_preset: SizingPreset::Balanced,
-            w_importance: 0.5,
-            w_tokens: 0.3,
-            w_time: 0.5,
-            max_node_multiplier: 10.0,
+            w_importance: force_directed.w_importance,
+            w_tokens: force_directed.w_tokens,
+            w_time: force_directed.w_time,
+            max_node_multiplier: force_directed.max_node_multiplier,
 
             // Filtering
             importance_threshold: 0.0,
             importance_filter_enabled: false,
 
-            // Physics
+            // Physics (initialized from force-directed defaults)
             physics_enabled: true,
-            repulsion: 10000.0,
-            attraction: 0.1,
-            centering: 0.0001,
-            size_physics_weight: 0.0,
-            temporal_strength: 0.5,
-            temporal_attraction_enabled: true,
-            temporal_window_mins: 5.0,
-            temporal_edge_opacity: 0.3,
-            max_temporal_edges: 100_000,
+            repulsion: force_directed.repulsion,
+            attraction: force_directed.attraction,
+            centering: force_directed.centering,
+            size_physics_weight: force_directed.size_physics_weight,
+            temporal_strength: force_directed.temporal_strength,
+            temporal_attraction_enabled: force_directed.temporal_attraction_enabled,
+            temporal_window_mins: force_directed.temporal_window_mins,
+            temporal_edge_opacity: force_directed.temporal_edge_opacity,
+            max_temporal_edges: force_directed.max_temporal_edges,
 
             // Presets
             presets: Vec::new(),
