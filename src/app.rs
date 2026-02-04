@@ -120,6 +120,11 @@ pub struct DashboardApp {
     force_directed_settings: ViewSettings,
     timeline_settings: ViewSettings,
 
+    // Timeline view navigation (separate from graph pan/zoom)
+    time_zoom: f32,        // X-axis zoom (time scale)
+    attention_zoom: f32,   // Y-axis zoom (attention spread)
+    time_pan: f32,         // Horizontal pan offset (time position)
+
     // Node sizing (unified formula)
     sizing_preset: SizingPreset,
     w_importance: f32,
@@ -263,6 +268,9 @@ impl DashboardApp {
             view_mode: ViewMode::ForceDirected,
             force_directed_settings: ViewSettings::force_directed_defaults(),
             timeline_settings: ViewSettings::timeline_defaults(),
+            time_zoom: 1.0,
+            attention_zoom: 1.0,
+            time_pan: 0.0,
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
             w_tokens: settings.w_tokens,
@@ -1488,6 +1496,9 @@ impl DashboardApp {
                         self.layout.size_physics_weight = 0.0;
                         self.pan_offset = Vec2::ZERO;
                         self.zoom = 1.0;
+                        self.time_zoom = 1.0;
+                        self.attention_zoom = 1.0;
+                        self.time_pan = 0.0;
                         self.load_graph();
                     }
                 });
@@ -2168,8 +2179,17 @@ impl DashboardApp {
             if ui.button("Reset View").clicked() {
                 self.pan_offset = Vec2::ZERO;
                 self.zoom = 1.0;
+                self.time_zoom = 1.0;
+                self.attention_zoom = 1.0;
+                self.time_pan = 0.0;
             }
-            ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
+            // Show appropriate zoom based on view mode
+            if self.view_mode == ViewMode::Timeline {
+                ui.label(format!("Time: {:.0}% | Attn: {:.0}%",
+                    self.time_zoom * 100.0, self.attention_zoom * 100.0));
+            } else {
+                ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
+            }
         });
 
         ui.add_space(10.0);
@@ -2274,28 +2294,65 @@ impl DashboardApp {
         let zoom_delta = ui.input(|i| i.zoom_delta());
         let hover_pos = response.hover_pos();
 
-        // Handle click-drag pan (for mouse users)
-        if response.dragged_by(egui::PointerButton::Primary) {
-            self.pan_offset += response.drag_delta();
-        }
+        // Get modifier keys for alt navigation modes
+        let shift_held = ui.input(|i| i.modifiers.shift);
 
-        // Handle two-finger scroll pan (for trackpad users)
-        // Apply before zoom so cursor-anchored zoom works correctly
-        if scroll_delta != egui::Vec2::ZERO && response.hovered() {
-            self.pan_offset += scroll_delta;
-        }
+        // Handle input differently based on view mode
+        if self.view_mode == ViewMode::Timeline {
+            // Timeline mode: separate X (time) and Y (attention) navigation
 
-        // Handle pinch-to-zoom and Ctrl+scroll (cursor-anchored)
-        if let Some(cursor_pos) = hover_pos {
-            if zoom_delta != 1.0 {
-                let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
+            // Click-drag: horizontal = time pan, vertical = attention pan (for now, both adjust position)
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let drag = response.drag_delta();
+                // Convert screen drag to normalized time pan
+                // Negative because dragging right should show earlier time (move left in time)
+                self.time_pan += drag.x / (rect.width() * self.time_zoom);
+            }
 
-                // Zoom toward cursor: adjust pan so point under cursor stays fixed
-                let cursor_offset = cursor_pos - center - self.pan_offset;
-                let zoom_factor = 1.0 - new_zoom / self.zoom;
-                self.pan_offset += cursor_offset * zoom_factor;
+            // Two-finger scroll: horizontal = time pan, vertical = unused (or could pan Y)
+            if scroll_delta != egui::Vec2::ZERO && response.hovered() {
+                // Horizontal scroll pans through time
+                self.time_pan += scroll_delta.x / (rect.width() * self.time_zoom);
+            }
 
-                self.zoom = new_zoom;
+            // Pinch-to-zoom: default = time zoom, Shift = attention zoom
+            if let Some(_cursor_pos) = hover_pos {
+                if zoom_delta != 1.0 {
+                    if shift_held {
+                        // Shift+pinch: zoom attention axis (Y)
+                        self.attention_zoom = (self.attention_zoom * zoom_delta).clamp(0.1, 10.0);
+                    } else {
+                        // Normal pinch: zoom time axis (X)
+                        self.time_zoom = (self.time_zoom * zoom_delta).clamp(0.1, 10.0);
+                    }
+                }
+            }
+        } else {
+            // Force-directed mode: traditional pan/zoom behavior
+
+            // Handle click-drag pan (for mouse users)
+            if response.dragged_by(egui::PointerButton::Primary) {
+                self.pan_offset += response.drag_delta();
+            }
+
+            // Handle two-finger scroll pan (for trackpad users)
+            // Apply before zoom so cursor-anchored zoom works correctly
+            if scroll_delta != egui::Vec2::ZERO && response.hovered() {
+                self.pan_offset += scroll_delta;
+            }
+
+            // Handle pinch-to-zoom and Ctrl+scroll (cursor-anchored)
+            if let Some(cursor_pos) = hover_pos {
+                if zoom_delta != 1.0 {
+                    let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
+
+                    // Zoom toward cursor: adjust pan so point under cursor stays fixed
+                    let cursor_offset = cursor_pos - center - self.pan_offset;
+                    let zoom_factor = 1.0 - new_zoom / self.zoom;
+                    self.pan_offset += cursor_offset * zoom_factor;
+
+                    self.zoom = new_zoom;
+                }
             }
         }
 
@@ -2317,12 +2374,26 @@ impl DashboardApp {
         // Cache values for transform closure to avoid borrowing self
         let pan_offset = self.pan_offset;
         let zoom = self.zoom;
+        let view_mode = self.view_mode;
+        let time_zoom = self.time_zoom;
+        let attention_zoom = self.attention_zoom;
+        let time_pan = self.time_pan;
 
         // Transform helper: graph space -> screen space
-        // Pan is in screen space (applied after zoom) for 1:1 movement at any zoom level
+        // Behavior differs by view mode
         let transform = |pos: Pos2| -> Pos2 {
-            let centered = pos.to_vec2() - center.to_vec2();
-            center + centered * zoom + pan_offset
+            if view_mode == ViewMode::Timeline {
+                // Timeline mode: independent X (time) and Y (attention) transforms
+                let centered = pos.to_vec2() - center.to_vec2();
+                // Apply separate zoom factors and time pan (normalized, scaled by width)
+                let x = center.x + centered.x * time_zoom + time_pan * rect.width() * time_zoom;
+                let y = center.y + centered.y * attention_zoom;
+                Pos2::new(x, y)
+            } else {
+                // Force-directed mode: uniform zoom with pan
+                let centered = pos.to_vec2() - center.to_vec2();
+                center + centered * zoom + pan_offset
+            }
         };
 
         // Use cached semantic filter visible set (computed once per frame in update())
