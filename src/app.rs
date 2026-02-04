@@ -3106,10 +3106,10 @@ impl DashboardApp {
             .unwrap_or(1);
 
         let bar_width = 40.0;
-        let bar_spacing = 8.0;
         let available_height = ui.available_height() - 40.0; // Leave room for labels
 
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0; // Remove gaps between bars
             for (i, bin) in bins.iter().enumerate() {
                 ui.vertical(|ui| {
                     // Calculate total height for this bar
@@ -3200,10 +3200,6 @@ impl DashboardApp {
                             .color(theme::text::SECONDARY)
                     );
                 });
-
-                if i < bins.len() - 1 {
-                    ui.add_space(bar_spacing);
-                }
             }
         });
     }
