@@ -2408,6 +2408,14 @@ impl DashboardApp {
         // Use cached semantic filter visible set (computed once per frame in update())
         let semantic_visible = self.semantic_filter_cache.clone();
 
+        // Draw y=0 axis line (user message spine) - subtle horizontal line
+        let y_zero_screen = transform(Pos2::new(0.0, 0.0)).y;
+        let axis_color = Color32::from_rgba_unmultiplied(120, 125, 135, 80); // Subtle grey with transparency
+        painter.line_segment(
+            [Pos2::new(rect.left(), y_zero_screen), Pos2::new(rect.right(), y_zero_screen)],
+            Stroke::new(1.0, axis_color)
+        );
+
         // Draw edges first (behind nodes)
         for edge in &self.graph.data.edges {
             // Check if edge is dimmed (timeline-hidden) vs fully hidden (other filters)

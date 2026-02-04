@@ -40,13 +40,13 @@ pub struct ForceLayout {
 impl Default for ForceLayout {
     fn default() -> Self {
         Self {
-            repulsion: 10000.0,
-            attraction: 0.1,
-            centering: 0.0001,
-            damping: 0.85,
+            repulsion: 12000.0,      // Increased for better spread
+            attraction: 0.08,         // Slightly reduced for looser clustering
+            centering: 0.0002,        // Doubled to keep nodes more centered
+            damping: 0.88,            // Slightly increased for faster settling
             min_distance: 30.0,
             max_velocity: 50.0,
-            ideal_length: 100.0,
+            ideal_length: 120.0,      // Increased for more spacing
             temporal_strength: 0.5,
             size_physics_weight: 0.0,
         }
