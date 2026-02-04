@@ -96,6 +96,17 @@ pub struct ImportanceStats {
     pub scored_messages: i64,
 }
 
+/// Token usage bin for histogram
+#[derive(Debug, Clone)]
+struct TokenBin {
+    timestamp_start: String,
+    timestamp_end: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+}
+
 /// Main dashboard application
 pub struct DashboardApp {
     // Database client
@@ -227,6 +238,12 @@ pub struct DashboardApp {
 
     // Beads loader with caching (lazy loading, virtual scrolling)
     bead_loader: BeadLoader,
+
+    // Token histogram panel
+    histogram_panel_enabled: bool,
+    histogram_split_ratio: f32,
+    histogram_dragging_divider: bool,
+    histogram_hovered_bin: Option<usize>,
 }
 
 impl DashboardApp {
@@ -327,6 +344,10 @@ impl DashboardApp {
             beads_panel_open: settings.beads_panel_open,
             mail_panel_open: settings.mail_panel_open,
 
+            // Token histogram panel (read before settings move)
+            histogram_panel_enabled: settings.histogram_panel_enabled,
+            histogram_split_ratio: settings.histogram_split_ratio,
+
             // Settings persistence
             settings,
             settings_dirty: false,
@@ -361,6 +382,10 @@ impl DashboardApp {
 
             // Beads loader with caching
             bead_loader: BeadLoader::new(),
+
+            // Histogram state (not in settings)
+            histogram_dragging_divider: false,
+            histogram_hovered_bin: None,
         };
 
         // Load initial data if connected
@@ -418,6 +443,8 @@ impl DashboardApp {
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
+        self.settings.histogram_panel_enabled = self.histogram_panel_enabled;
+        self.settings.histogram_split_ratio = self.histogram_split_ratio;
 
         // Also save to the active view's per-view settings
         // This ensures changes persist even without switching view modes
@@ -1720,6 +1747,25 @@ impl DashboardApp {
                         self.mark_settings_dirty();
                     }
                 });
+
+                ui.add_space(5.0);
+                ui.separator();
+                ui.add_space(5.0);
+
+                // Token histogram panel toggle
+                if ui.checkbox(&mut self.histogram_panel_enabled, "📊 Token Histogram Panel")
+                    .on_hover_text("Show token usage histogram in a split pane")
+                    .changed()
+                {
+                    self.mark_settings_dirty();
+                }
+
+                if self.histogram_panel_enabled {
+                    ui.label(format!("Split ratio: {:.0}% / {:.0}%",
+                        self.histogram_split_ratio * 100.0,
+                        (1.0 - self.histogram_split_ratio) * 100.0
+                    ));
+                }
             });
 
         // Node Sizing section
@@ -2942,6 +2988,300 @@ impl DashboardApp {
         }
     }
 
+    /// Render split view with graph on left and histogram on right
+    fn render_split_view(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_rect_before_wrap();
+
+        // Calculate split dimensions
+        let divider_width = 4.0;
+        let graph_width = available.width() * self.histogram_split_ratio - divider_width / 2.0;
+        let histogram_width = available.width() * (1.0 - self.histogram_split_ratio) - divider_width / 2.0;
+
+        // Graph panel (left)
+        let graph_rect = egui::Rect::from_min_size(
+            available.min,
+            egui::vec2(graph_width, available.height()),
+        );
+
+        // Divider (center)
+        let divider_rect = egui::Rect::from_min_size(
+            egui::pos2(available.min.x + graph_width, available.min.y),
+            egui::vec2(divider_width, available.height()),
+        );
+
+        // Histogram panel (right)
+        let histogram_rect = egui::Rect::from_min_size(
+            egui::pos2(available.min.x + graph_width + divider_width, available.min.y),
+            egui::vec2(histogram_width, available.height()),
+        );
+
+        // Render graph in left pane
+        let mut graph_ui = ui.new_child(egui::UiBuilder::new().max_rect(graph_rect));
+        self.render_graph(&mut graph_ui);
+
+        // Render draggable divider
+        self.render_divider(ui, divider_rect);
+
+        // Render histogram in right pane
+        let mut histogram_ui = ui.new_child(egui::UiBuilder::new().max_rect(histogram_rect));
+        self.render_token_histogram(&mut histogram_ui);
+    }
+
+    /// Render the draggable divider between graph and histogram
+    fn render_divider(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        // Handle dragging
+        if response.dragged() {
+            let drag_delta_x = response.drag_delta().x;
+            let available_width = ui.available_width();
+            let ratio_delta = drag_delta_x / available_width;
+            self.histogram_split_ratio = (self.histogram_split_ratio + ratio_delta).clamp(0.2, 0.8);
+            self.histogram_dragging_divider = true;
+            self.mark_settings_dirty();
+        } else if self.histogram_dragging_divider && !response.is_pointer_button_down_on() {
+            self.histogram_dragging_divider = false;
+        }
+
+        // Visual feedback
+        let color = if response.hovered() || self.histogram_dragging_divider {
+            theme::border::FOCUS
+        } else {
+            theme::border::SUBTLE
+        };
+
+        ui.painter().rect_filled(rect, 0.0, color);
+
+        // Change cursor on hover
+        if response.hovered() || self.histogram_dragging_divider {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+
+    /// Render the token usage histogram
+    fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            // Header
+            ui.horizontal(|ui| {
+                ui.heading("Token Usage");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Legend
+                    ui.label("Legend:");
+                    ui.colored_label(theme::token::CACHE_CREATE, "█ Cache Create");
+                    ui.colored_label(theme::token::CACHE_READ, "█ Cache Read");
+                    ui.colored_label(theme::token::OUTPUT, "█ Output");
+                    ui.colored_label(theme::token::INPUT, "█ Input");
+                });
+            });
+
+            ui.separator();
+
+            // Aggregate token bins
+            let bins = self.aggregate_token_bins();
+
+            if bins.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No token data available");
+                });
+                return;
+            }
+
+            // Scrollable histogram
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.render_histogram_bars(ui, &bins);
+            });
+        });
+    }
+
+    /// Render the histogram bars
+    fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
+        if bins.is_empty() {
+            return;
+        }
+
+        // Find max total for normalization
+        let max_total = bins.iter()
+            .map(|b| b.input_tokens + b.output_tokens + b.cache_read_tokens + b.cache_creation_tokens)
+            .max()
+            .unwrap_or(1);
+
+        let bar_width = 60.0;
+        let bar_max_height = 100.0;
+        let bar_spacing = 10.0;
+
+        for (i, bin) in bins.iter().enumerate() {
+            ui.horizontal(|ui| {
+                // Time label
+                ui.label(format_timestamp(&bin.timestamp_start));
+
+                ui.add_space(10.0);
+
+                // Bar area
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(bar_width, bar_max_height),
+                    egui::Sense::hover(),
+                );
+
+                // Track hovered bin
+                if response.hovered() {
+                    self.histogram_hovered_bin = Some(i);
+                } else if self.histogram_hovered_bin == Some(i) && !response.hovered() {
+                    self.histogram_hovered_bin = None;
+                }
+
+                // Calculate heights
+                let total = bin.input_tokens + bin.output_tokens + bin.cache_read_tokens + bin.cache_creation_tokens;
+                if total == 0 {
+                    return;
+                }
+
+                let scale = bar_max_height / max_total as f32;
+
+                // Draw stacked segments (bottom to top: input, output, cache read, cache create)
+                let mut y_offset = 0.0;
+
+                // Input (bottom)
+                if bin.input_tokens > 0 {
+                    let height = bin.input_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::INPUT);
+                    y_offset += height;
+                }
+
+                // Output
+                if bin.output_tokens > 0 {
+                    let height = bin.output_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::OUTPUT);
+                    y_offset += height;
+                }
+
+                // Cache read
+                if bin.cache_read_tokens > 0 {
+                    let height = bin.cache_read_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::CACHE_READ);
+                    y_offset += height;
+                }
+
+                // Cache creation
+                if bin.cache_creation_tokens > 0 {
+                    let height = bin.cache_creation_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    ui.painter().rect_filled(seg_rect, 0.0, theme::token::CACHE_CREATE);
+                }
+
+                // Hover tooltip
+                response.on_hover_ui(|ui| {
+                    ui.label(format!("{} - {}",
+                        format_timestamp(&bin.timestamp_start),
+                        format_timestamp(&bin.timestamp_end)
+                    ));
+                    ui.separator();
+                    ui.label(format!("Input: {} tokens", bin.input_tokens));
+                    ui.label(format!("Output: {} tokens", bin.output_tokens));
+                    ui.label(format!("Cache Read: {} tokens", bin.cache_read_tokens));
+                    ui.label(format!("Cache Create: {} tokens", bin.cache_creation_tokens));
+                    ui.label(format!("Total: {} tokens", total));
+                });
+            });
+
+            ui.add_space(bar_spacing);
+        }
+    }
+
+    /// Aggregate token usage into time bins
+    fn aggregate_token_bins(&self) -> Vec<TokenBin> {
+        use chrono::{DateTime, Utc};
+
+        // Collect all nodes with token data and valid timestamps
+        let mut timestamped_nodes: Vec<_> = self.graph.data.nodes.iter()
+            .filter_map(|node| {
+                let ts = node.timestamp.as_ref()?;
+                let input = node.input_tokens.unwrap_or(0);
+                let output = node.output_tokens.unwrap_or(0);
+                let cache_read = node.cache_read_tokens.unwrap_or(0);
+                let cache_create = node.cache_creation_tokens.unwrap_or(0);
+
+                // Only include if there's some token data
+                if input == 0 && output == 0 && cache_read == 0 && cache_create == 0 {
+                    return None;
+                }
+
+                Some((ts.clone(), input, output, cache_read, cache_create))
+            })
+            .collect();
+
+        if timestamped_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort by timestamp
+        timestamped_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Parse timestamps
+        let mut parsed_nodes: Vec<_> = timestamped_nodes.iter()
+            .filter_map(|(ts, input, output, cache_read, cache_create)| {
+                let parsed = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+                Some((parsed, *input, *output, *cache_read, *cache_create))
+            })
+            .collect();
+
+        if parsed_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // Calculate bin duration using timeline's bin logic
+        let bin_duration_secs = self.time_range.bin_duration_secs() as i64;
+
+        // Determine bin count and range
+        let start_time = parsed_nodes.first().unwrap().0;
+        let end_time = parsed_nodes.last().unwrap().0;
+        let range_secs = (end_time - start_time).num_seconds();
+        let bin_count = ((range_secs as f64 / bin_duration_secs as f64).ceil() as usize).max(1);
+
+        // Initialize bins
+        let mut bins = Vec::new();
+        for i in 0..bin_count {
+            let bin_start = start_time + chrono::Duration::seconds(i as i64 * bin_duration_secs);
+            let bin_end = start_time + chrono::Duration::seconds((i as i64 + 1) * bin_duration_secs);
+
+            bins.push(TokenBin {
+                timestamp_start: bin_start.to_rfc3339(),
+                timestamp_end: bin_end.to_rfc3339(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            });
+        }
+
+        // Aggregate nodes into bins
+        for (timestamp, input, output, cache_read, cache_create) in parsed_nodes {
+            let bin_index = ((timestamp - start_time).num_seconds() / bin_duration_secs) as usize;
+            if bin_index < bins.len() {
+                bins[bin_index].input_tokens += input as i64;
+                bins[bin_index].output_tokens += output as i64;
+                bins[bin_index].cache_read_tokens += cache_read as i64;
+                bins[bin_index].cache_creation_tokens += cache_create as i64;
+            }
+        }
+
+        bins
+    }
+
     fn render_timeline(&mut self, ui: &mut egui::Ui) {
         if self.graph.timeline.timestamps.is_empty() {
             ui.label("No timestamped nodes");
@@ -3435,11 +3775,15 @@ impl eframe::App for DashboardApp {
                 });
         }
 
-        // Main graph area
+        // Main graph area - with optional histogram split
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::bg::GRAPH))
             .show(ctx, |ui| {
-                self.render_graph(ui);
+                if self.histogram_panel_enabled {
+                    self.render_split_view(ui);
+                } else {
+                    self.render_graph(ui);
+                }
             });
     }
 
@@ -3482,5 +3826,16 @@ fn truncate_lines(s: &str, max_lines: usize, max_chars_per_line: usize) -> Strin
         format!("{}...", result)
     } else {
         result
+    }
+}
+
+/// Format an RFC3339 timestamp to a human-readable format
+fn format_timestamp(ts: &str) -> String {
+    use chrono::DateTime;
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
+        parsed.format("%b %d %H:%M").to_string()
+    } else {
+        ts.to_string()
     }
 }

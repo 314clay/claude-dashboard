@@ -344,6 +344,12 @@ pub struct Settings {
     pub beads_panel_open: bool,
     #[serde(default = "default_mail_panel_open")]
     pub mail_panel_open: bool,
+
+    // Token histogram panel
+    #[serde(default = "default_histogram_panel_enabled")]
+    pub histogram_panel_enabled: bool,
+    #[serde(default = "default_histogram_split_ratio")]
+    pub histogram_split_ratio: f32,
 }
 
 impl Settings {
@@ -457,6 +463,14 @@ fn default_mail_panel_open() -> bool {
     false
 }
 
+fn default_histogram_panel_enabled() -> bool {
+    true
+}
+
+fn default_histogram_split_ratio() -> f32 {
+    0.65
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let force_directed = ViewSettings::force_directed_defaults();
@@ -511,6 +525,10 @@ impl Default for Settings {
             // Panel visibility
             beads_panel_open: false,
             mail_panel_open: false,
+
+            // Token histogram panel
+            histogram_panel_enabled: true,
+            histogram_split_ratio: 0.65,
         }
     }
 }
