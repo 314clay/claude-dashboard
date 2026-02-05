@@ -1210,6 +1210,220 @@ pub fn desaturate(color: egui::Color32, amount: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(r, g, b, color.a())
 }
 
+// ============================================================================
+// Histogram Data Structures
+// ============================================================================
+
+/// How to display token counts in the histogram
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenDisplayMode {
+    /// Show raw token counts
+    #[default]
+    Absolute,
+    /// Show as percentage of total tokens in the time window
+    Percentage,
+    /// Show as rate (tokens per minute)
+    Rate,
+}
+
+impl TokenDisplayMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            TokenDisplayMode::Absolute => "Absolute",
+            TokenDisplayMode::Percentage => "Percentage",
+            TokenDisplayMode::Rate => "Rate",
+        }
+    }
+}
+
+/// How to order/stack bars in the histogram
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StackOrder {
+    /// Stack by token type: input, output, cache_read, cache_creation
+    #[default]
+    ByTokenType,
+    /// Stack by role: user, assistant
+    ByRole,
+    /// Stack by project
+    ByProject,
+    /// Stack by session
+    BySession,
+}
+
+impl StackOrder {
+    pub fn label(&self) -> &'static str {
+        match self {
+            StackOrder::ByTokenType => "Token Type",
+            StackOrder::ByRole => "Role",
+            StackOrder::ByProject => "Project",
+            StackOrder::BySession => "Session",
+        }
+    }
+}
+
+/// Filter criteria for histogram data
+#[derive(Debug, Clone, Default)]
+pub struct HistogramFilter {
+    /// Only include specific projects (empty = all)
+    pub projects: Vec<String>,
+    /// Only include specific sessions (empty = all)
+    pub sessions: Vec<String>,
+    /// Only include specific roles (empty = all)
+    pub roles: Vec<Role>,
+    /// Include input tokens
+    pub include_input: bool,
+    /// Include output tokens
+    pub include_output: bool,
+    /// Include cache read tokens
+    pub include_cache_read: bool,
+    /// Include cache creation tokens
+    pub include_cache_creation: bool,
+}
+
+impl HistogramFilter {
+    /// Create a filter that includes all token types
+    pub fn all() -> Self {
+        Self {
+            projects: Vec::new(),
+            sessions: Vec::new(),
+            roles: Vec::new(),
+            include_input: true,
+            include_output: true,
+            include_cache_read: true,
+            include_cache_creation: true,
+        }
+    }
+}
+
+/// A segment within a histogram bin (for stacked bars)
+#[derive(Debug, Clone)]
+pub struct TokenSegment {
+    /// Label for this segment (e.g., "input", "output", project name, etc.)
+    pub label: String,
+    /// Token count for this segment
+    pub count: i64,
+    /// Color for this segment
+    pub color: egui::Color32,
+}
+
+/// A single bin in the histogram
+#[derive(Debug, Clone)]
+pub struct TokenBin {
+    /// Start time of this bin (epoch seconds)
+    pub start_time: f64,
+    /// End time of this bin (epoch seconds)
+    pub end_time: f64,
+    /// Segments within this bin (for stacked bars)
+    pub segments: Vec<TokenSegment>,
+    /// Total token count across all segments
+    pub total: i64,
+}
+
+impl TokenBin {
+    /// Create a new empty bin
+    pub fn new(start_time: f64, end_time: f64) -> Self {
+        Self {
+            start_time,
+            end_time,
+            segments: Vec::new(),
+            total: 0,
+        }
+    }
+
+    /// Add a segment to this bin
+    pub fn add_segment(&mut self, label: String, count: i64, color: egui::Color32) {
+        self.segments.push(TokenSegment { label, count, color });
+        self.total += count;
+    }
+
+    /// Get the midpoint time of this bin
+    pub fn midpoint(&self) -> f64 {
+        (self.start_time + self.end_time) / 2.0
+    }
+
+    /// Get the duration of this bin in seconds
+    pub fn duration(&self) -> f64 {
+        self.end_time - self.start_time
+    }
+}
+
+/// State for the token usage histogram
+#[derive(Debug, Clone)]
+pub struct HistogramState {
+    /// Computed histogram bins
+    pub bins: Vec<TokenBin>,
+    /// Number of bins to divide the time range into
+    pub bin_count: usize,
+    /// How to display values
+    pub display_mode: TokenDisplayMode,
+    /// How to stack/order bars
+    pub stack_order: StackOrder,
+    /// Filter criteria
+    pub filter: HistogramFilter,
+    /// Maximum value across all bins (for normalization)
+    pub max_value: i64,
+    /// Total tokens in the current view
+    pub total_tokens: i64,
+    /// Whether the histogram needs rebuilding
+    pub dirty: bool,
+}
+
+impl Default for HistogramState {
+    fn default() -> Self {
+        Self {
+            bins: Vec::new(),
+            bin_count: 20,
+            display_mode: TokenDisplayMode::default(),
+            stack_order: StackOrder::default(),
+            filter: HistogramFilter::all(),
+            max_value: 0,
+            total_tokens: 0,
+            dirty: true,
+        }
+    }
+}
+
+impl HistogramState {
+    /// Mark the histogram as needing a rebuild
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Check if rebuild is needed
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Clear the dirty flag after rebuilding
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Set the number of bins and mark dirty
+    pub fn set_bin_count(&mut self, count: usize) {
+        if self.bin_count != count {
+            self.bin_count = count.max(1);
+            self.dirty = true;
+        }
+    }
+
+    /// Set display mode and mark dirty
+    pub fn set_display_mode(&mut self, mode: TokenDisplayMode) {
+        if self.display_mode != mode {
+            self.display_mode = mode;
+            self.dirty = true;
+        }
+    }
+
+    /// Set stack order and mark dirty
+    pub fn set_stack_order(&mut self, order: StackOrder) {
+        if self.stack_order != order {
+            self.stack_order = order;
+            self.dirty = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
