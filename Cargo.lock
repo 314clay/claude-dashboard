@@ -870,6 +870,7 @@ dependencies = [
  "egui 0.29.1",
  "egui_extras",
  "egui_graphs",
+ "egui_plot",
  "petgraph",
  "rand",
  "reqwest",
@@ -1153,6 +1154,17 @@ dependencies = [
  "egui 0.28.1",
  "petgraph",
  "rand",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8dca4871c15d51aadb79534dcf51a8189e5de3426ee7b465eb7db9a0a81ea67"
+dependencies = [
+ "ahash",
+ "egui 0.29.1",
+ "emath 0.29.1",
 ]
 
 [[package]]
