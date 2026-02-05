@@ -10,6 +10,7 @@ authors = ["Clay Arnold"]
 eframe = { version = "0.29", features = ["persistence"] }
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["image"] }
+egui_plot = "0.29"
 
 # Graph visualization
 egui_graphs = "0.21"
