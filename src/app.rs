@@ -248,7 +248,6 @@ pub struct DashboardApp {
     histogram_split_ratio: f32,
     histogram_dragging_divider: bool,
     histogram_hovered_bin: Option<usize>,
-    histogram_selected_bin: Option<usize>,
     histogram_bar_width: f32,
     histogram_scroll_offset: f32,
 }
@@ -393,7 +392,6 @@ impl DashboardApp {
             // Histogram state (not in settings)
             histogram_dragging_divider: false,
             histogram_hovered_bin: None,
-            histogram_selected_bin: None,
             histogram_bar_width: 40.0,
             histogram_scroll_offset: 0.0,
         };
@@ -3098,28 +3096,13 @@ impl DashboardApp {
 
     /// Render the token usage histogram
     fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
-        let mut clear_filter = false;
         ui.vertical(|ui| {
-            // Header
             ui.horizontal(|ui| {
                 ui.heading("Token Usage");
-
-                // Show filter indicator and clear button when a bin is selected
-                if self.histogram_selected_bin.is_some() {
-                    ui.label(
-                        egui::RichText::new("(filtered)")
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(100, 180, 255))
-                    );
-                    if ui.small_button("Clear filter").clicked() {
-                        clear_filter = true;
-                    }
-                }
             });
 
             ui.separator();
 
-            // Aggregate token bins
             let bins = self.aggregate_token_bins();
 
             if bins.is_empty() {
@@ -3131,14 +3114,6 @@ impl DashboardApp {
 
             self.render_histogram_bars(ui, &bins);
         });
-
-        // Handle clear filter button (outside closure to avoid borrow issues)
-        if clear_filter {
-            self.histogram_selected_bin = None;
-            self.graph.timeline.start_position = 0.0;
-            self.graph.timeline.position = 1.0;
-            self.graph.update_visible_nodes();
-        }
     }
 
     /// Render the histogram bars using direct painter calls (no per-bar layout = no gaps).
@@ -3157,7 +3132,6 @@ impl DashboardApp {
         let label_height = 20.0;
         let available_height = (ui.available_height() - label_height).max(40.0);
         let total_width = bins.len() as f32 * bar_width;
-        let is_selected = self.histogram_selected_bin;
 
         // Allocate one big rect for the entire histogram
         let (rect, response) = ui.allocate_exact_size(
@@ -3168,18 +3142,23 @@ impl DashboardApp {
         let bar_area = egui::Rect::from_min_size(rect.min, egui::vec2(total_width, available_height));
         let painter = ui.painter_at(rect);
 
-        // Handle trackpad zoom (ctrl+scroll or pinch) and pan (scroll or drag)
-        let scroll = ui.input(|i| i.smooth_scroll_delta);
-        let modifiers = ui.input(|i| i.modifiers);
+        // Handle trackpad zoom and pan
+        // Two-finger swipe (both axes) pans, pinch/cmd+scroll zooms
+        let pointer_over = ui.rect_contains_pointer(rect);
+        if pointer_over {
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            let modifiers = ui.input(|i| i.modifiers);
 
-        if response.hovered() {
             if modifiers.command {
-                // Zoom: ctrl/cmd + scroll Y
+                // Zoom: cmd + scroll Y (pinch gesture)
                 let zoom_delta = scroll.y * 0.01;
                 self.histogram_bar_width = (self.histogram_bar_width * (1.0 + zoom_delta)).clamp(8.0, 120.0);
             } else {
-                // Pan: horizontal scroll
-                self.histogram_scroll_offset -= scroll.x;
+                // Pan: two-finger swipe (use both x and y for natural trackpad feel)
+                // On macOS, horizontal swipe = scroll.x, vertical swipe = scroll.y
+                // Map vertical scroll to horizontal panning too (most natural gesture)
+                let pan = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
+                self.histogram_scroll_offset -= pan;
             }
         }
 
@@ -3192,8 +3171,7 @@ impl DashboardApp {
         let max_scroll = (total_width - rect.width()).max(0.0);
         self.histogram_scroll_offset = self.histogram_scroll_offset.clamp(0.0, max_scroll);
 
-        // Determine which bin is hovered/clicked
-        let mut clicked_bin: Option<(usize, String, String)> = None;
+        // Determine which bin is hovered
         let mut hovered_bin_idx: Option<usize> = None;
 
         if let Some(pointer) = response.hover_pos() {
@@ -3201,24 +3179,9 @@ impl DashboardApp {
             let bin_idx = (rel_x / bar_width) as usize;
             if bin_idx < bins.len() && pointer.y >= rect.min.y && pointer.y <= rect.min.y + available_height {
                 hovered_bin_idx = Some(bin_idx);
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
         self.histogram_hovered_bin = hovered_bin_idx;
-
-        if response.clicked() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                let rel_x = pointer.x - rect.min.x + self.histogram_scroll_offset;
-                let bin_idx = (rel_x / bar_width) as usize;
-                if bin_idx < bins.len() {
-                    clicked_bin = Some((
-                        bin_idx,
-                        bins[bin_idx].timestamp_start.clone(),
-                        bins[bin_idx].timestamp_end.clone(),
-                    ));
-                }
-            }
-        }
 
         // Paint bars directly
         for (i, bin) in bins.iter().enumerate() {
@@ -3228,18 +3191,6 @@ impl DashboardApp {
             if bar_x + bar_width < rect.min.x || bar_x > rect.max.x {
                 continue;
             }
-
-            let selected = is_selected == Some(i);
-            let dimmed = is_selected.is_some() && !selected;
-            let alpha_mult: f32 = if dimmed { 0.3 } else { 1.0 };
-
-            let apply_alpha = |color: egui::Color32, mult: f32| -> egui::Color32 {
-                if mult >= 1.0 { return color; }
-                egui::Color32::from_rgba_unmultiplied(
-                    color.r(), color.g(), color.b(),
-                    (color.a() as f32 * mult) as u8,
-                )
-            };
 
             if bin.total_tokens > 0 {
                 let scale = available_height / max_total as f32;
@@ -3253,18 +3204,9 @@ impl DashboardApp {
                         egui::vec2(bar_width, height),
                     );
                     let color = self.histogram_session_color(&session.session_id, &session.project);
-                    painter.rect_filled(seg_rect, 0.0, apply_alpha(color, alpha_mult));
+                    painter.rect_filled(seg_rect, 0.0, color);
                     y_offset += height;
                 }
-            }
-
-            // Selection highlight
-            if selected {
-                let bar_rect = egui::Rect::from_min_size(
-                    egui::pos2(bar_x, rect.min.y),
-                    egui::vec2(bar_width, available_height),
-                );
-                painter.rect_stroke(bar_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
             }
         }
 
@@ -3281,8 +3223,7 @@ impl DashboardApp {
 
             let tick_top = rect.min.y + available_height;
             let tick_bottom = tick_top + 4.0;
-            let dimmed = is_selected.is_some() && is_selected != Some(i);
-            let label_color = if dimmed { theme::text::DISABLED } else { theme::text::SECONDARY };
+            let label_color = theme::text::SECONDARY;
 
             // Tick mark
             painter.line_segment(
@@ -3316,7 +3257,6 @@ impl DashboardApp {
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
             );
 
-            let selected = is_selected == Some(idx);
             egui::show_tooltip_at_pointer(ui.ctx(), egui::LayerId::new(egui::Order::Tooltip, ui.id().with("hist_layer")), ui.id().with("hist_tooltip"), |ui| {
                 ui.label(format!("{} - {}",
                     format_timestamp(&bin.timestamp_start),
@@ -3334,59 +3274,8 @@ impl DashboardApp {
                 }
                 ui.separator();
                 ui.label(format!("Total: {} tokens", bin.total_tokens));
-                ui.separator();
-                if selected {
-                    ui.label("Click to clear filter");
-                } else {
-                    ui.label("Click to filter to this time range");
-                }
             });
         }
-
-        // Apply click action after rendering
-        if let Some((bin_idx, ts_start, ts_end)) = clicked_bin {
-            self.apply_histogram_drill_down(bin_idx, &ts_start, &ts_end);
-        }
-    }
-
-    /// Apply or clear histogram drill-down filter.
-    /// Sets the timeline window to the clicked bin's time range.
-    fn apply_histogram_drill_down(&mut self, bin_idx: usize, ts_start: &str, ts_end: &str) {
-        use chrono::{DateTime, Utc};
-
-        if self.histogram_selected_bin == Some(bin_idx) {
-            // Clicking same bin again - clear filter, restore full timeline range
-            self.histogram_selected_bin = None;
-            self.graph.timeline.start_position = 0.0;
-            self.graph.timeline.position = 1.0;
-            self.timeline_enabled = true;
-            self.graph.update_visible_nodes();
-            return;
-        }
-
-        // Parse bin timestamps to epoch seconds
-        let start_dt = match DateTime::parse_from_rfc3339(ts_start) {
-            Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => return,
-        };
-        let end_dt = match DateTime::parse_from_rfc3339(ts_end) {
-            Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => return,
-        };
-
-        let start_secs = start_dt.timestamp() as f64;
-        let end_secs = end_dt.timestamp() as f64;
-
-        // Convert to timeline positions
-        let start_pos = self.graph.timeline.position_at_time(start_secs);
-        let end_pos = self.graph.timeline.position_at_time(end_secs);
-
-        // Set the timeline window and enable it
-        self.histogram_selected_bin = Some(bin_idx);
-        self.timeline_enabled = true;
-        self.graph.timeline.start_position = start_pos;
-        self.graph.timeline.position = end_pos.max(start_pos + 0.001); // Ensure end > start
-        self.graph.update_visible_nodes();
     }
 
     /// Aggregate token usage into time bins by session (respects timeline visibility)
