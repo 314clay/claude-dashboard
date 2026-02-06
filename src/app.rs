@@ -244,6 +244,7 @@ pub struct DashboardApp {
     histogram_split_ratio: f32,
     histogram_dragging_divider: bool,
     histogram_hovered_bin: Option<usize>,
+    histogram_selected_bin: Option<usize>,
 }
 
 impl DashboardApp {
@@ -386,6 +387,7 @@ impl DashboardApp {
             // Histogram state (not in settings)
             histogram_dragging_divider: false,
             histogram_hovered_bin: None,
+            histogram_selected_bin: None,
         };
 
         // Load initial data if connected
@@ -3066,10 +3068,24 @@ impl DashboardApp {
 
     /// Render the token usage histogram
     fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
+        let mut clear_filter = false;
         ui.vertical(|ui| {
             // Header
             ui.horizontal(|ui| {
                 ui.heading("Token Usage");
+
+                // Show filter indicator and clear button when a bin is selected
+                if self.histogram_selected_bin.is_some() {
+                    ui.label(
+                        egui::RichText::new("(filtered)")
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(100, 180, 255))
+                    );
+                    if ui.small_button("Clear filter").clicked() {
+                        clear_filter = true;
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Legend
                     ui.label("Legend:");
@@ -3097,9 +3113,18 @@ impl DashboardApp {
                 self.render_histogram_bars(ui, &bins);
             });
         });
+
+        // Handle clear filter button (outside closure to avoid borrow issues)
+        if clear_filter {
+            self.histogram_selected_bin = None;
+            self.graph.timeline.start_position = 0.0;
+            self.graph.timeline.position = 1.0;
+            self.graph.update_visible_nodes();
+        }
     }
 
     /// Render the histogram bars (time on X axis, vertical bars)
+    /// Clicking a bar drills down by setting the timeline window to that bin's range.
     fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
         if bins.is_empty() {
             return;
@@ -3113,6 +3138,10 @@ impl DashboardApp {
 
         let bar_width = 40.0;
         let available_height = ui.available_height() - 40.0; // Leave room for labels
+        let is_selected = self.histogram_selected_bin;
+
+        // Collect click actions to apply after the loop (avoids borrow issues)
+        let mut clicked_bin: Option<(usize, String, String)> = None;
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0; // Remove gaps between bars
@@ -3120,11 +3149,13 @@ impl DashboardApp {
                 ui.vertical(|ui| {
                     // Calculate total height for this bar
                     let total = bin.input_tokens + bin.output_tokens + bin.cache_read_tokens + bin.cache_creation_tokens;
+                    let selected = is_selected == Some(i);
+                    let dimmed = is_selected.is_some() && !selected;
 
-                    // Bar area
+                    // Bar area - clickable
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(bar_width, available_height),
-                        egui::Sense::hover(),
+                        egui::Sense::click(),
                     );
 
                     // Track hovered bin
@@ -3134,11 +3165,27 @@ impl DashboardApp {
                         self.histogram_hovered_bin = None;
                     }
 
+                    // Handle click - toggle drill-down filter
+                    if response.clicked() {
+                        clicked_bin = Some((i, bin.timestamp_start.clone(), bin.timestamp_end.clone()));
+                    }
+
+                    // Dim factor for non-selected bars
+                    let alpha_mult = if dimmed { 0.3 } else { 1.0 };
+
                     if total > 0 {
                         let scale = available_height / max_total as f32;
 
                         // Draw stacked segments (bottom to top: input, output, cache read, cache create)
                         let mut y_offset = 0.0;
+
+                        let apply_alpha = |color: egui::Color32, mult: f32| -> egui::Color32 {
+                            if mult >= 1.0 { return color; }
+                            egui::Color32::from_rgba_unmultiplied(
+                                color.r(), color.g(), color.b(),
+                                (color.a() as f32 * mult) as u8,
+                            )
+                        };
 
                         // Input (bottom)
                         if bin.input_tokens > 0 {
@@ -3147,7 +3194,7 @@ impl DashboardApp {
                                 egui::pos2(rect.min.x, rect.max.y - y_offset - height),
                                 egui::vec2(bar_width, height),
                             );
-                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::INPUT);
+                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::INPUT, alpha_mult));
                             y_offset += height;
                         }
 
@@ -3158,7 +3205,7 @@ impl DashboardApp {
                                 egui::pos2(rect.min.x, rect.max.y - y_offset - height),
                                 egui::vec2(bar_width, height),
                             );
-                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::OUTPUT);
+                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::OUTPUT, alpha_mult));
                             y_offset += height;
                         }
 
@@ -3169,7 +3216,7 @@ impl DashboardApp {
                                 egui::pos2(rect.min.x, rect.max.y - y_offset - height),
                                 egui::vec2(bar_width, height),
                             );
-                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::CACHE_READ);
+                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::CACHE_READ, alpha_mult));
                             y_offset += height;
                         }
 
@@ -3180,8 +3227,22 @@ impl DashboardApp {
                                 egui::pos2(rect.min.x, rect.max.y - y_offset - height),
                                 egui::vec2(bar_width, height),
                             );
-                            ui.painter().rect_filled(seg_rect, 2.0, theme::token::CACHE_CREATE);
+                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::CACHE_CREATE, alpha_mult));
                         }
+                    }
+
+                    // Selection highlight outline
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            egui::Stroke::new(2.0, egui::Color32::WHITE),
+                        );
+                    }
+
+                    // Hover cursor hint
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
 
                     // Hover tooltip
@@ -3196,18 +3257,70 @@ impl DashboardApp {
                         ui.label(format!("Cache Read: {} tokens", bin.cache_read_tokens));
                         ui.label(format!("Cache Create: {} tokens", bin.cache_creation_tokens));
                         ui.label(format!("Total: {} tokens", total));
+                        ui.separator();
+                        if selected {
+                            ui.label("Click to clear filter");
+                        } else {
+                            ui.label("Click to filter to this time range");
+                        }
                     });
 
                     // Time label below bar
                     ui.add_space(2.0);
+                    let label_color = if dimmed { theme::text::DISABLED } else { theme::text::SECONDARY };
                     ui.label(
                         egui::RichText::new(format_timestamp(&bin.timestamp_start))
                             .size(9.0)
-                            .color(theme::text::SECONDARY)
+                            .color(label_color)
                     );
                 });
             }
         });
+
+        // Apply click action after rendering
+        if let Some((bin_idx, ts_start, ts_end)) = clicked_bin {
+            self.apply_histogram_drill_down(bin_idx, &ts_start, &ts_end);
+        }
+    }
+
+    /// Apply or clear histogram drill-down filter.
+    /// Sets the timeline window to the clicked bin's time range.
+    fn apply_histogram_drill_down(&mut self, bin_idx: usize, ts_start: &str, ts_end: &str) {
+        use chrono::{DateTime, Utc};
+
+        if self.histogram_selected_bin == Some(bin_idx) {
+            // Clicking same bin again - clear filter, restore full timeline range
+            self.histogram_selected_bin = None;
+            self.graph.timeline.start_position = 0.0;
+            self.graph.timeline.position = 1.0;
+            self.timeline_enabled = true;
+            self.graph.update_visible_nodes();
+            return;
+        }
+
+        // Parse bin timestamps to epoch seconds
+        let start_dt = match DateTime::parse_from_rfc3339(ts_start) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return,
+        };
+        let end_dt = match DateTime::parse_from_rfc3339(ts_end) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return,
+        };
+
+        let start_secs = start_dt.timestamp() as f64;
+        let end_secs = end_dt.timestamp() as f64;
+
+        // Convert to timeline positions
+        let start_pos = self.graph.timeline.position_at_time(start_secs);
+        let end_pos = self.graph.timeline.position_at_time(end_secs);
+
+        // Set the timeline window and enable it
+        self.histogram_selected_bin = Some(bin_idx);
+        self.timeline_enabled = true;
+        self.graph.timeline.start_position = start_pos;
+        self.graph.timeline.position = end_pos.max(start_pos + 0.001); // Ensure end > start
+        self.graph.update_visible_nodes();
     }
 
     /// Aggregate token usage into time bins (respects timeline visibility)
