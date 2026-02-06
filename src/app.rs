@@ -98,13 +98,17 @@ pub struct ImportanceStats {
 
 /// Token usage bin for histogram
 #[derive(Debug, Clone)]
+struct SessionTokens {
+    session_id: String,
+    project: String,
+    total_tokens: i64,
+}
+
 struct TokenBin {
     timestamp_start: String,
     timestamp_end: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    cache_creation_tokens: i64,
+    sessions: Vec<SessionTokens>,
+    total_tokens: i64,
 }
 
 /// Main dashboard application
@@ -245,6 +249,8 @@ pub struct DashboardApp {
     histogram_dragging_divider: bool,
     histogram_hovered_bin: Option<usize>,
     histogram_selected_bin: Option<usize>,
+    histogram_bar_width: f32,
+    histogram_scroll_offset: f32,
 }
 
 impl DashboardApp {
@@ -388,6 +394,8 @@ impl DashboardApp {
             histogram_dragging_divider: false,
             histogram_hovered_bin: None,
             histogram_selected_bin: None,
+            histogram_bar_width: 40.0,
+            histogram_scroll_offset: 0.0,
         };
 
         // Load initial data if connected
@@ -3066,6 +3074,28 @@ impl DashboardApp {
         }
     }
 
+    /// Get the color for a session in the histogram, matching graph node colors
+    fn histogram_session_color(&self, session_id: &str, project: &str) -> egui::Color32 {
+        use crate::graph::types::{ColorMode, hsl_to_rgb};
+        match self.graph.color_mode {
+            ColorMode::Project if !project.is_empty() => {
+                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.55)
+            }
+            ColorMode::Hybrid if !project.is_empty() => {
+                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
+                let t = self.graph.session_position_in_project(session_id, project);
+                let sat = 0.5 + t * 0.4;
+                let light = 0.65 - t * 0.2;
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), sat, light)
+            }
+            _ => {
+                let hue = self.graph.session_colors.get(session_id).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.5)
+            }
+        }
+    }
+
     /// Render the token usage histogram
     fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
         let mut clear_filter = false;
@@ -3085,15 +3115,6 @@ impl DashboardApp {
                         clear_filter = true;
                     }
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Legend
-                    ui.label("Legend:");
-                    ui.colored_label(theme::token::CACHE_CREATE, "█ Cache Create");
-                    ui.colored_label(theme::token::CACHE_READ, "█ Cache Read");
-                    ui.colored_label(theme::token::OUTPUT, "█ Output");
-                    ui.colored_label(theme::token::INPUT, "█ Input");
-                });
             });
 
             ui.separator();
@@ -3108,10 +3129,7 @@ impl DashboardApp {
                 return;
             }
 
-            // Scrollable histogram (horizontal scroll, time on X axis)
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                self.render_histogram_bars(ui, &bins);
-            });
+            self.render_histogram_bars(ui, &bins);
         });
 
         // Handle clear filter button (outside closure to avoid borrow issues)
@@ -3123,159 +3141,207 @@ impl DashboardApp {
         }
     }
 
-    /// Render the histogram bars (time on X axis, vertical bars)
-    /// Clicking a bar drills down by setting the timeline window to that bin's range.
+    /// Render the histogram bars using direct painter calls (no per-bar layout = no gaps).
+    /// Session-colored stacking, trackpad zoom/pan, tick-mark date labels.
     fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
         if bins.is_empty() {
             return;
         }
 
-        // Find max total for normalization
         let max_total = bins.iter()
-            .map(|b| b.input_tokens + b.output_tokens + b.cache_read_tokens + b.cache_creation_tokens)
+            .map(|b| b.total_tokens)
             .max()
             .unwrap_or(1);
 
-        let bar_width = 40.0;
-        let available_height = ui.available_height() - 40.0; // Leave room for labels
+        let bar_width = self.histogram_bar_width;
+        let label_height = 20.0;
+        let available_height = (ui.available_height() - label_height).max(40.0);
+        let total_width = bins.len() as f32 * bar_width;
         let is_selected = self.histogram_selected_bin;
 
-        // Collect click actions to apply after the loop (avoids borrow issues)
-        let mut clicked_bin: Option<(usize, String, String)> = None;
+        // Allocate one big rect for the entire histogram
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(total_width.max(ui.available_width()), available_height + label_height),
+            egui::Sense::click_and_drag(),
+        );
 
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0; // Remove gaps between bars
-            for (i, bin) in bins.iter().enumerate() {
-                ui.vertical(|ui| {
-                    // Calculate total height for this bar
-                    let total = bin.input_tokens + bin.output_tokens + bin.cache_read_tokens + bin.cache_creation_tokens;
-                    let selected = is_selected == Some(i);
-                    let dimmed = is_selected.is_some() && !selected;
+        let bar_area = egui::Rect::from_min_size(rect.min, egui::vec2(total_width, available_height));
+        let painter = ui.painter_at(rect);
 
-                    // Bar area - clickable
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(bar_width, available_height),
-                        egui::Sense::click(),
-                    );
+        // Handle trackpad zoom (ctrl+scroll or pinch) and pan (scroll or drag)
+        let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let modifiers = ui.input(|i| i.modifiers);
 
-                    // Track hovered bin
-                    if response.hovered() {
-                        self.histogram_hovered_bin = Some(i);
-                    } else if self.histogram_hovered_bin == Some(i) && !response.hovered() {
-                        self.histogram_hovered_bin = None;
-                    }
-
-                    // Handle click - toggle drill-down filter
-                    if response.clicked() {
-                        clicked_bin = Some((i, bin.timestamp_start.clone(), bin.timestamp_end.clone()));
-                    }
-
-                    // Dim factor for non-selected bars
-                    let alpha_mult = if dimmed { 0.3 } else { 1.0 };
-
-                    if total > 0 {
-                        let scale = available_height / max_total as f32;
-
-                        // Draw stacked segments (bottom to top: input, output, cache read, cache create)
-                        let mut y_offset = 0.0;
-
-                        let apply_alpha = |color: egui::Color32, mult: f32| -> egui::Color32 {
-                            if mult >= 1.0 { return color; }
-                            egui::Color32::from_rgba_unmultiplied(
-                                color.r(), color.g(), color.b(),
-                                (color.a() as f32 * mult) as u8,
-                            )
-                        };
-
-                        // Input (bottom)
-                        if bin.input_tokens > 0 {
-                            let height = bin.input_tokens as f32 * scale;
-                            let seg_rect = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                                egui::vec2(bar_width, height),
-                            );
-                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::INPUT, alpha_mult));
-                            y_offset += height;
-                        }
-
-                        // Output
-                        if bin.output_tokens > 0 {
-                            let height = bin.output_tokens as f32 * scale;
-                            let seg_rect = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                                egui::vec2(bar_width, height),
-                            );
-                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::OUTPUT, alpha_mult));
-                            y_offset += height;
-                        }
-
-                        // Cache read
-                        if bin.cache_read_tokens > 0 {
-                            let height = bin.cache_read_tokens as f32 * scale;
-                            let seg_rect = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                                egui::vec2(bar_width, height),
-                            );
-                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::CACHE_READ, alpha_mult));
-                            y_offset += height;
-                        }
-
-                        // Cache creation (top)
-                        if bin.cache_creation_tokens > 0 {
-                            let height = bin.cache_creation_tokens as f32 * scale;
-                            let seg_rect = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x, rect.max.y - y_offset - height),
-                                egui::vec2(bar_width, height),
-                            );
-                            ui.painter().rect_filled(seg_rect, 2.0, apply_alpha(theme::token::CACHE_CREATE, alpha_mult));
-                        }
-                    }
-
-                    // Selection highlight outline
-                    if selected {
-                        ui.painter().rect_stroke(
-                            rect,
-                            2.0,
-                            egui::Stroke::new(2.0, egui::Color32::WHITE),
-                        );
-                    }
-
-                    // Hover cursor hint
-                    if response.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-
-                    // Hover tooltip
-                    response.on_hover_ui(|ui| {
-                        ui.label(format!("{} - {}",
-                            format_timestamp(&bin.timestamp_start),
-                            format_timestamp(&bin.timestamp_end)
-                        ));
-                        ui.separator();
-                        ui.label(format!("Input: {} tokens", bin.input_tokens));
-                        ui.label(format!("Output: {} tokens", bin.output_tokens));
-                        ui.label(format!("Cache Read: {} tokens", bin.cache_read_tokens));
-                        ui.label(format!("Cache Create: {} tokens", bin.cache_creation_tokens));
-                        ui.label(format!("Total: {} tokens", total));
-                        ui.separator();
-                        if selected {
-                            ui.label("Click to clear filter");
-                        } else {
-                            ui.label("Click to filter to this time range");
-                        }
-                    });
-
-                    // Time label below bar
-                    ui.add_space(2.0);
-                    let label_color = if dimmed { theme::text::DISABLED } else { theme::text::SECONDARY };
-                    ui.label(
-                        egui::RichText::new(format_timestamp(&bin.timestamp_start))
-                            .size(9.0)
-                            .color(label_color)
-                    );
-                });
+        if response.hovered() {
+            if modifiers.command {
+                // Zoom: ctrl/cmd + scroll Y
+                let zoom_delta = scroll.y * 0.01;
+                self.histogram_bar_width = (self.histogram_bar_width * (1.0 + zoom_delta)).clamp(8.0, 120.0);
+            } else {
+                // Pan: horizontal scroll
+                self.histogram_scroll_offset -= scroll.x;
             }
-        });
+        }
+
+        // Pan via drag
+        if response.dragged() {
+            self.histogram_scroll_offset -= response.drag_delta().x;
+        }
+
+        // Clamp scroll offset
+        let max_scroll = (total_width - rect.width()).max(0.0);
+        self.histogram_scroll_offset = self.histogram_scroll_offset.clamp(0.0, max_scroll);
+
+        // Determine which bin is hovered/clicked
+        let mut clicked_bin: Option<(usize, String, String)> = None;
+        let mut hovered_bin_idx: Option<usize> = None;
+
+        if let Some(pointer) = response.hover_pos() {
+            let rel_x = pointer.x - rect.min.x + self.histogram_scroll_offset;
+            let bin_idx = (rel_x / bar_width) as usize;
+            if bin_idx < bins.len() && pointer.y >= rect.min.y && pointer.y <= rect.min.y + available_height {
+                hovered_bin_idx = Some(bin_idx);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        self.histogram_hovered_bin = hovered_bin_idx;
+
+        if response.clicked() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let rel_x = pointer.x - rect.min.x + self.histogram_scroll_offset;
+                let bin_idx = (rel_x / bar_width) as usize;
+                if bin_idx < bins.len() {
+                    clicked_bin = Some((
+                        bin_idx,
+                        bins[bin_idx].timestamp_start.clone(),
+                        bins[bin_idx].timestamp_end.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Paint bars directly
+        for (i, bin) in bins.iter().enumerate() {
+            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
+
+            // Skip bars outside visible area
+            if bar_x + bar_width < rect.min.x || bar_x > rect.max.x {
+                continue;
+            }
+
+            let selected = is_selected == Some(i);
+            let dimmed = is_selected.is_some() && !selected;
+            let alpha_mult: f32 = if dimmed { 0.3 } else { 1.0 };
+
+            let apply_alpha = |color: egui::Color32, mult: f32| -> egui::Color32 {
+                if mult >= 1.0 { return color; }
+                egui::Color32::from_rgba_unmultiplied(
+                    color.r(), color.g(), color.b(),
+                    (color.a() as f32 * mult) as u8,
+                )
+            };
+
+            if bin.total_tokens > 0 {
+                let scale = available_height / max_total as f32;
+                let mut y_offset = 0.0;
+
+                // Draw session segments bottom to top (sorted largest first = bottom)
+                for session in &bin.sessions {
+                    let height = session.total_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_x, bar_area.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    let color = self.histogram_session_color(&session.session_id, &session.project);
+                    painter.rect_filled(seg_rect, 0.0, apply_alpha(color, alpha_mult));
+                    y_offset += height;
+                }
+            }
+
+            // Selection highlight
+            if selected {
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(bar_x, rect.min.y),
+                    egui::vec2(bar_width, available_height),
+                );
+                painter.rect_stroke(bar_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+            }
+        }
+
+        // Date labels: tick marks at regular intervals
+        let label_interval = ((60.0 / bar_width).ceil() as usize).max(1); // ~60px between labels
+        for (i, bin) in bins.iter().enumerate() {
+            if i % label_interval != 0 {
+                continue;
+            }
+            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
+            if bar_x < rect.min.x - bar_width || bar_x > rect.max.x + bar_width {
+                continue;
+            }
+
+            let tick_top = rect.min.y + available_height;
+            let tick_bottom = tick_top + 4.0;
+            let dimmed = is_selected.is_some() && is_selected != Some(i);
+            let label_color = if dimmed { theme::text::DISABLED } else { theme::text::SECONDARY };
+
+            // Tick mark
+            painter.line_segment(
+                [egui::pos2(bar_x, tick_top), egui::pos2(bar_x, tick_bottom)],
+                egui::Stroke::new(1.0, label_color),
+            );
+
+            // Label
+            let label = format_timestamp(&bin.timestamp_start);
+            painter.text(
+                egui::pos2(bar_x + 2.0, tick_bottom + 1.0),
+                egui::Align2::LEFT_TOP,
+                &label,
+                egui::FontId::proportional(10.0),
+                label_color,
+            );
+        }
+
+        // Hover tooltip
+        if let Some(idx) = hovered_bin_idx {
+            let bin = &bins[idx];
+            let bar_x = rect.min.x + idx as f32 * bar_width - self.histogram_scroll_offset;
+            let tooltip_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_x, rect.min.y),
+                egui::vec2(bar_width, available_height),
+            );
+            // Show hover highlight
+            painter.rect_filled(
+                tooltip_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+            );
+
+            let selected = is_selected == Some(idx);
+            egui::show_tooltip_at_pointer(ui.ctx(), egui::LayerId::new(egui::Order::Tooltip, ui.id().with("hist_layer")), ui.id().with("hist_tooltip"), |ui| {
+                ui.label(format!("{} - {}",
+                    format_timestamp(&bin.timestamp_start),
+                    format_timestamp(&bin.timestamp_end)
+                ));
+                ui.separator();
+                for session in &bin.sessions {
+                    let color = self.histogram_session_color(&session.session_id, &session.project);
+                    let label = if session.project.is_empty() {
+                        format!("{}: {} tokens", &session.session_id[..8.min(session.session_id.len())], session.total_tokens)
+                    } else {
+                        format!("{}: {} tokens", session.project, session.total_tokens)
+                    };
+                    ui.colored_label(color, label);
+                }
+                ui.separator();
+                ui.label(format!("Total: {} tokens", bin.total_tokens));
+                ui.separator();
+                if selected {
+                    ui.label("Click to clear filter");
+                } else {
+                    ui.label("Click to filter to this time range");
+                }
+            });
+        }
 
         // Apply click action after rendering
         if let Some((bin_idx, ts_start, ts_end)) = clicked_bin {
@@ -3323,12 +3389,13 @@ impl DashboardApp {
         self.graph.update_visible_nodes();
     }
 
-    /// Aggregate token usage into time bins (respects timeline visibility)
+    /// Aggregate token usage into time bins by session (respects timeline visibility)
     fn aggregate_token_bins(&self) -> Vec<TokenBin> {
         use chrono::{DateTime, Utc};
+        use std::collections::HashMap;
 
         // Collect all nodes with token data and valid timestamps
-        // Filter by timeline visibility if enabled
+        // Now we track session_id and project per node
         let mut timestamped_nodes: Vec<_> = self.graph.data.nodes.iter()
             .filter_map(|node| {
                 // Skip nodes hidden by timeline
@@ -3337,17 +3404,16 @@ impl DashboardApp {
                 }
 
                 let ts = node.timestamp.as_ref()?;
-                let input = node.input_tokens.unwrap_or(0);
-                let output = node.output_tokens.unwrap_or(0);
-                let cache_read = node.cache_read_tokens.unwrap_or(0);
-                let cache_create = node.cache_creation_tokens.unwrap_or(0);
+                let total = node.input_tokens.unwrap_or(0)
+                    + node.output_tokens.unwrap_or(0)
+                    + node.cache_read_tokens.unwrap_or(0)
+                    + node.cache_creation_tokens.unwrap_or(0);
 
-                // Only include if there's some token data
-                if input == 0 && output == 0 && cache_read == 0 && cache_create == 0 {
+                if total == 0 {
                     return None;
                 }
 
-                Some((ts.clone(), input, output, cache_read, cache_create))
+                Some((ts.clone(), node.session_id.clone(), node.project.clone(), total as i64))
             })
             .collect();
 
@@ -3359,10 +3425,10 @@ impl DashboardApp {
         timestamped_nodes.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Parse timestamps
-        let mut parsed_nodes: Vec<_> = timestamped_nodes.iter()
-            .filter_map(|(ts, input, output, cache_read, cache_create)| {
+        let parsed_nodes: Vec<_> = timestamped_nodes.iter()
+            .filter_map(|(ts, session_id, project, total)| {
                 let parsed = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
-                Some((parsed, *input, *output, *cache_read, *cache_create))
+                Some((parsed, session_id.clone(), project.clone(), *total))
             })
             .collect();
 
@@ -3372,32 +3438,28 @@ impl DashboardApp {
 
         // When timeline scrubber is active, synchronize histogram to the visible window
         let (start_time, bin_duration_secs, bin_count) = if self.timeline_enabled {
-            // Use scrubber window as the histogram range
             let scrubber_start_epoch = self.graph.timeline.time_at_position(self.graph.timeline.start_position);
             let scrubber_end_epoch = self.graph.timeline.time_at_position(self.graph.timeline.position);
             let visible_range_secs = (scrubber_end_epoch - scrubber_start_epoch).max(1.0);
 
-            // Convert epoch seconds to chrono DateTime
             let start_dt = DateTime::<Utc>::from_timestamp(scrubber_start_epoch as i64, 0)
                 .unwrap_or_else(|| parsed_nodes.first().unwrap().0);
 
-            // Target ~20 bins, snap to nice durations
             let raw_bin = visible_range_secs / 20.0;
-            let bin_dur = if raw_bin <= 60.0 { 60 }                         // 1 min
-                else if raw_bin <= 5.0 * 60.0 { 5 * 60 }                   // 5 min
-                else if raw_bin <= 15.0 * 60.0 { 15 * 60 }                 // 15 min
-                else if raw_bin <= 30.0 * 60.0 { 30 * 60 }                 // 30 min
-                else if raw_bin <= 3600.0 { 3600 }                          // 1 hr
-                else if raw_bin <= 3.0 * 3600.0 { 3 * 3600 }               // 3 hr
-                else if raw_bin <= 6.0 * 3600.0 { 6 * 3600 }               // 6 hr
-                else if raw_bin <= 12.0 * 3600.0 { 12 * 3600 }             // 12 hr
-                else if raw_bin <= 86400.0 { 86400 }                        // 1 day
-                else { (7 * 86400_i64).max(raw_bin as i64) };               // 1 week+
+            let bin_dur = if raw_bin <= 60.0 { 60 }
+                else if raw_bin <= 5.0 * 60.0 { 5 * 60 }
+                else if raw_bin <= 15.0 * 60.0 { 15 * 60 }
+                else if raw_bin <= 30.0 * 60.0 { 30 * 60 }
+                else if raw_bin <= 3600.0 { 3600 }
+                else if raw_bin <= 3.0 * 3600.0 { 3 * 3600 }
+                else if raw_bin <= 6.0 * 3600.0 { 6 * 3600 }
+                else if raw_bin <= 12.0 * 3600.0 { 12 * 3600 }
+                else if raw_bin <= 86400.0 { 86400 }
+                else { (7 * 86400_i64).max(raw_bin as i64) };
 
             let count = ((visible_range_secs / bin_dur as f64).ceil() as usize).max(1);
             (start_dt, bin_dur, count)
         } else {
-            // Default: derive range from data, bin duration from global time_range
             let bin_dur = self.time_range.bin_duration_secs() as i64;
             let data_start = parsed_nodes.first().unwrap().0;
             let data_end = parsed_nodes.last().unwrap().0;
@@ -3406,7 +3468,9 @@ impl DashboardApp {
             (data_start, bin_dur, count)
         };
 
-        // Initialize bins
+        // Initialize bins with session-level tracking
+        // Use a HashMap per bin to accumulate session tokens, then convert to Vec
+        let mut bin_session_maps: Vec<HashMap<String, (String, i64)>> = Vec::new();
         let mut bins = Vec::new();
         for i in 0..bin_count {
             let bin_start = start_time + chrono::Duration::seconds(i as i64 * bin_duration_secs);
@@ -3415,24 +3479,39 @@ impl DashboardApp {
             bins.push(TokenBin {
                 timestamp_start: bin_start.to_rfc3339(),
                 timestamp_end: bin_end.to_rfc3339(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
+                sessions: Vec::new(),
+                total_tokens: 0,
             });
+            bin_session_maps.push(HashMap::new());
         }
 
-        // Aggregate nodes into bins
-        for (timestamp, input, output, cache_read, cache_create) in parsed_nodes {
+        // Aggregate nodes into bins by session
+        for (timestamp, session_id, project, total) in parsed_nodes {
             let offset = (timestamp - start_time).num_seconds();
             if offset < 0 { continue; }
             let bin_index = (offset / bin_duration_secs) as usize;
             if bin_index < bins.len() {
-                bins[bin_index].input_tokens += input as i64;
-                bins[bin_index].output_tokens += output as i64;
-                bins[bin_index].cache_read_tokens += cache_read as i64;
-                bins[bin_index].cache_creation_tokens += cache_create as i64;
+                let entry = bin_session_maps[bin_index]
+                    .entry(session_id.clone())
+                    .or_insert_with(|| (project.clone(), 0));
+                entry.1 += total;
             }
+        }
+
+        // Convert session maps into sorted SessionTokens vecs
+        for (i, session_map) in bin_session_maps.into_iter().enumerate() {
+            let mut sessions: Vec<SessionTokens> = session_map
+                .into_iter()
+                .map(|(session_id, (project, total))| SessionTokens {
+                    session_id,
+                    project,
+                    total_tokens: total,
+                })
+                .collect();
+            // Sort by total descending for stable stacking (largest at bottom)
+            sessions.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+            bins[i].total_tokens = sessions.iter().map(|s| s.total_tokens).sum();
+            bins[i].sessions = sessions;
         }
 
         bins

@@ -1137,7 +1137,7 @@ impl GraphState {
     }
 
     /// Apply global hue offset, wrapping around 360°
-    fn apply_hue_offset(&self, hue: f32) -> f32 {
+    pub fn apply_hue_offset(&self, hue: f32) -> f32 {
         (hue + self.hue_offset) % 360.0
     }
 
@@ -1149,7 +1149,7 @@ impl GraphState {
 
     /// Get the position (0.0-1.0) of a session within its project's timeline.
     /// Used for hybrid coloring: earlier sessions = 0.0, later sessions = 1.0.
-    fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
+    pub fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
         if let Some(sessions) = self.project_sessions.get(project) {
             if sessions.len() <= 1 {
                 return 0.5; // Single session, use middle
