@@ -3370,14 +3370,41 @@ impl DashboardApp {
             return Vec::new();
         }
 
-        // Calculate bin duration using timeline's bin logic
-        let bin_duration_secs = self.time_range.bin_duration_secs() as i64;
+        // When timeline scrubber is active, synchronize histogram to the visible window
+        let (start_time, bin_duration_secs, bin_count) = if self.timeline_enabled {
+            // Use scrubber window as the histogram range
+            let scrubber_start_epoch = self.graph.timeline.time_at_position(self.graph.timeline.start_position);
+            let scrubber_end_epoch = self.graph.timeline.time_at_position(self.graph.timeline.position);
+            let visible_range_secs = (scrubber_end_epoch - scrubber_start_epoch).max(1.0);
 
-        // Determine bin count and range
-        let start_time = parsed_nodes.first().unwrap().0;
-        let end_time = parsed_nodes.last().unwrap().0;
-        let range_secs = (end_time - start_time).num_seconds();
-        let bin_count = ((range_secs as f64 / bin_duration_secs as f64).ceil() as usize).max(1);
+            // Convert epoch seconds to chrono DateTime
+            let start_dt = DateTime::<Utc>::from_timestamp(scrubber_start_epoch as i64, 0)
+                .unwrap_or_else(|| parsed_nodes.first().unwrap().0);
+
+            // Target ~20 bins, snap to nice durations
+            let raw_bin = visible_range_secs / 20.0;
+            let bin_dur = if raw_bin <= 60.0 { 60 }                         // 1 min
+                else if raw_bin <= 5.0 * 60.0 { 5 * 60 }                   // 5 min
+                else if raw_bin <= 15.0 * 60.0 { 15 * 60 }                 // 15 min
+                else if raw_bin <= 30.0 * 60.0 { 30 * 60 }                 // 30 min
+                else if raw_bin <= 3600.0 { 3600 }                          // 1 hr
+                else if raw_bin <= 3.0 * 3600.0 { 3 * 3600 }               // 3 hr
+                else if raw_bin <= 6.0 * 3600.0 { 6 * 3600 }               // 6 hr
+                else if raw_bin <= 12.0 * 3600.0 { 12 * 3600 }             // 12 hr
+                else if raw_bin <= 86400.0 { 86400 }                        // 1 day
+                else { (7 * 86400_i64).max(raw_bin as i64) };               // 1 week+
+
+            let count = ((visible_range_secs / bin_dur as f64).ceil() as usize).max(1);
+            (start_dt, bin_dur, count)
+        } else {
+            // Default: derive range from data, bin duration from global time_range
+            let bin_dur = self.time_range.bin_duration_secs() as i64;
+            let data_start = parsed_nodes.first().unwrap().0;
+            let data_end = parsed_nodes.last().unwrap().0;
+            let range_secs = (data_end - data_start).num_seconds();
+            let count = ((range_secs as f64 / bin_dur as f64).ceil() as usize).max(1);
+            (data_start, bin_dur, count)
+        };
 
         // Initialize bins
         let mut bins = Vec::new();
@@ -3397,7 +3424,9 @@ impl DashboardApp {
 
         // Aggregate nodes into bins
         for (timestamp, input, output, cache_read, cache_create) in parsed_nodes {
-            let bin_index = ((timestamp - start_time).num_seconds() / bin_duration_secs) as usize;
+            let offset = (timestamp - start_time).num_seconds();
+            if offset < 0 { continue; }
+            let bin_index = (offset / bin_duration_secs) as usize;
             if bin_index < bins.len() {
                 bins[bin_index].input_tokens += input as i64;
                 bins[bin_index].output_tokens += output as i64;
