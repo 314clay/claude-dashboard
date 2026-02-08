@@ -13,11 +13,11 @@ use crate::graph::types::{GraphData, GraphEdge, GraphNode, Role, SessionSummaryD
 const SCHEMA_SQL: &str = include_str!("../schema.sqlite.sql");
 
 /// Resolve the database file path (env override or default config dir).
+/// Uses ~/.config/dashboard-native/ to match the Python ingest script.
 fn db_path() -> String {
     std::env::var("DB_PATH").unwrap_or_else(|_| {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("dashboard-native");
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config_dir = home.join(".config").join("dashboard-native");
         std::fs::create_dir_all(&config_dir).ok();
         config_dir.join("dashboard.db").to_string_lossy().to_string()
     })
