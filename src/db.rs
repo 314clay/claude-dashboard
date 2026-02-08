@@ -1,20 +1,27 @@
-//! Direct PostgreSQL database access using sqlx.
+//! SQLite database access using sqlx.
 //!
-//! Replaces the Python API for core queries.
+//! Self-contained local database. Creates the DB file and schema on first run.
 
-use chrono::{DateTime, Utc};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{FromRow, PgPool};
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{FromRow, SqlitePool};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::graph::types::{GraphData, GraphEdge, GraphNode, Role, SessionSummaryData};
 
-/// Database connection configuration
-const DB_HOST: &str = "localhost";
-const DB_PORT: u16 = 5433;
-const DB_USER: &str = "clayarnold";
-const DB_NAME: &str = "connectingservices";
+/// Embedded schema — run on every connect (all statements are IF NOT EXISTS).
+const SCHEMA_SQL: &str = include_str!("../schema.sqlite.sql");
+
+/// Resolve the database file path (env override or default config dir).
+fn db_path() -> String {
+    std::env::var("DB_PATH").unwrap_or_else(|_| {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("dashboard-native");
+        std::fs::create_dir_all(&config_dir).ok();
+        config_dir.join("dashboard.db").to_string_lossy().to_string()
+    })
+}
 
 /// Row returned from the graph query
 #[derive(Debug, FromRow)]
@@ -23,7 +30,7 @@ struct MessageRow {
     session_id: String,
     role: String,
     content: Option<String>,
-    timestamp: Option<DateTime<Utc>>,
+    timestamp: Option<String>,
     sequence_num: i32,
     importance_score: Option<f64>,
     importance_reason: Option<String>,
@@ -49,15 +56,15 @@ struct SummaryRow {
     summary: Option<String>,
     user_requests: Option<String>,
     completed_work: Option<String>,
-    topics: Option<serde_json::Value>,
+    topics: Option<String>,
     detected_project: Option<String>,
-    generated_at: Option<DateTime<Utc>>,
+    generated_at: Option<String>,
 }
 
 /// Row returned from semantic filter matches query
 #[derive(Debug, FromRow)]
 struct FilterMatchRow {
-    message_id: i64,  // bigint in DB
+    message_id: i64,
     filter_id: i32,
 }
 
@@ -72,7 +79,7 @@ pub struct ImportanceStats {
 
 /// Database client with connection pool
 pub struct DbClient {
-    pool: PgPool,
+    pool: SqlitePool,
     runtime: Arc<Runtime>,
 }
 
@@ -81,18 +88,44 @@ impl DbClient {
     pub fn new() -> Result<Self, String> {
         let runtime = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
+        let path = db_path();
+        let url = format!("sqlite://{}?mode=rwc", path);
+
         let pool = runtime.block_on(async {
-            let url = format!(
-                "postgres://{}@{}:{}/{}",
-                DB_USER, DB_HOST, DB_PORT, DB_NAME
-            );
-            PgPoolOptions::new()
+            let pool = SqlitePoolOptions::new()
                 .max_connections(5)
                 .connect(&url)
                 .await
-        }).map_err(|e| format!("Failed to connect to database: {}", e))?;
+                .map_err(|e| format!("Failed to connect to database: {}", e))?;
 
-        tracing::info!("Connected to PostgreSQL at {}:{}", DB_HOST, DB_PORT);
+            // Enable foreign keys and WAL mode
+            sqlx::query("PRAGMA journal_mode = WAL")
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&pool)
+                .await
+                .ok();
+
+            // Run schema (all CREATE IF NOT EXISTS — safe to repeat)
+            // Split on semicolons and execute each statement individually
+            // because sqlx doesn't support multiple statements in one query for SQLite.
+            for statement in SCHEMA_SQL.split(';') {
+                let trimmed = statement.trim();
+                if trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with("PRAGMA") {
+                    continue;
+                }
+                sqlx::query(trimmed)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| format!("Schema init failed on: {}... — {}", &trimmed[..trimmed.len().min(60)], e))?;
+            }
+
+            Ok::<SqlitePool, String>(pool)
+        })?;
+
+        tracing::info!("Connected to SQLite at {}", path);
 
         Ok(Self {
             pool,
@@ -131,9 +164,9 @@ impl DbClient {
                         m.cache_read_tokens,
                         m.cache_creation_tokens,
                         s.cwd
-                    FROM claude_sessions.messages m
-                    JOIN claude_sessions.sessions s ON m.session_id = s.session_id
-                    WHERE m.session_id = $1
+                    FROM messages m
+                    JOIN sessions s ON m.session_id = s.session_id
+                    WHERE m.session_id = ?1
                     ORDER BY m.session_id, m.sequence_num
                     "#,
                 )
@@ -158,9 +191,9 @@ impl DbClient {
                         m.cache_read_tokens,
                         m.cache_creation_tokens,
                         s.cwd
-                    FROM claude_sessions.messages m
-                    JOIN claude_sessions.sessions s ON m.session_id = s.session_id
-                    WHERE m.timestamp >= NOW() - INTERVAL '1 hour' * $1
+                    FROM messages m
+                    JOIN sessions s ON m.session_id = s.session_id
+                    WHERE m.timestamp >= datetime('now', '-' || CAST(?1 AS INTEGER) || ' hours')
                     ORDER BY m.session_id, m.sequence_num
                     "#,
                 )
@@ -193,7 +226,14 @@ impl DbClient {
                 };
 
                 let cwd = row.cwd.unwrap_or_default();
-                let project = cwd.replace("/Users/clayarnold/", "~/");
+                let project = if let Some(home) = dirs::home_dir() {
+                    let home_str = format!("{}/", home.display());
+                    cwd.replace(&home_str, "~/")
+                } else {
+                    cwd.clone()
+                };
+
+                let ts = row.timestamp;
 
                 nodes.push(GraphNode {
                     id: msg_id.clone(),
@@ -203,7 +243,7 @@ impl DbClient {
                     session_id: session_id.clone(),
                     session_short: session_id[..8.min(session_id.len())].to_string(),
                     project,
-                    timestamp: row.timestamp.map(|t| t.to_rfc3339()),
+                    timestamp: ts.clone(),
                     importance_score: row.importance_score.map(|v| v as f32),
                     importance_reason: row.importance_reason,
                     output_tokens: row.token_count,
@@ -219,7 +259,7 @@ impl DbClient {
                         source: prev_id.clone(),
                         target: msg_id.clone(),
                         session_id: session_id.clone(),
-                        timestamp: row.timestamp.map(|t| t.to_rfc3339()),
+                        timestamp: ts.clone(),
                         is_obsidian: false,
                         is_topic: false,
                         is_similarity: false,
@@ -238,27 +278,39 @@ impl DbClient {
                     .collect();
 
                 if !message_ids.is_empty() {
-                    let filter_matches: Vec<FilterMatchRow> = sqlx::query_as(
+                    // SQLite doesn't support ANY($1) with arrays.
+                    // Build a dynamic IN clause with positional params.
+                    let placeholders: Vec<String> = (1..=message_ids.len())
+                        .map(|i| format!("?{}", i))
+                        .collect();
+                    let in_clause = placeholders.join(", ");
+                    let sql = format!(
                         r#"
                         SELECT
                             r.message_id,
                             r.filter_id
-                        FROM claude_sessions.semantic_filter_results r
-                        JOIN claude_sessions.semantic_filters f ON r.filter_id = f.id
-                        WHERE r.message_id = ANY($1)
-                          AND r.matches = true
-                          AND f.is_active = true
+                        FROM semantic_filter_results r
+                        JOIN semantic_filters f ON r.filter_id = f.id
+                        WHERE r.message_id IN ({})
+                          AND r.matches = 1
+                          AND f.is_active = 1
                         "#,
-                    )
-                    .bind(&message_ids)
-                    .fetch_all(&self.pool)
-                    .await
-                    .unwrap_or_default();
+                        in_clause
+                    );
+
+                    let mut query = sqlx::query_as::<_, FilterMatchRow>(&sql);
+                    for id in &message_ids {
+                        query = query.bind(id);
+                    }
+
+                    let filter_matches: Vec<FilterMatchRow> = query
+                        .fetch_all(&self.pool)
+                        .await
+                        .unwrap_or_default();
 
                     // Build message_id -> filter_ids mapping
                     let mut matches_map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
                     for row in filter_matches {
-                        // message_id is i64 in DB but i32 in nodes, convert safely
                         if let Ok(msg_id) = i32::try_from(row.message_id) {
                             matches_map.entry(msg_id).or_default().push(row.filter_id);
                         }
@@ -291,8 +343,8 @@ impl DbClient {
                     topics,
                     detected_project,
                     generated_at
-                FROM claude_sessions.session_summaries
-                WHERE session_id = $1
+                FROM session_summaries
+                WHERE session_id = ?1
                 "#,
             )
             .bind(session_id)
@@ -303,7 +355,7 @@ impl DbClient {
             match row {
                 Some(r) => {
                     let topics: Vec<String> = r.topics
-                        .and_then(|v| serde_json::from_value(v).ok())
+                        .and_then(|v| serde_json::from_str(&v).ok())
                         .unwrap_or_default();
 
                     Ok(SessionSummaryData {
@@ -314,7 +366,7 @@ impl DbClient {
                         completed_work: r.completed_work,
                         topics: Some(topics),
                         detected_project: r.detected_project,
-                        generated_at: r.generated_at.map(|t| t.to_rfc3339()),
+                        generated_at: r.generated_at,
                         error: None,
                     })
                 }
@@ -340,10 +392,10 @@ impl DbClient {
                 r#"
                 SELECT
                     COUNT(*) as total_messages,
-                    COUNT(*) FILTER (WHERE importance_score IS NOT NULL) as scored_messages,
-                    COUNT(*) FILTER (WHERE importance_score IS NULL) as unscored_messages,
-                    COUNT(DISTINCT session_id) FILTER (WHERE importance_score IS NULL) as sessions_with_unscored
-                FROM claude_sessions.messages
+                    SUM(CASE WHEN importance_score IS NOT NULL THEN 1 ELSE 0 END) as scored_messages,
+                    SUM(CASE WHEN importance_score IS NULL THEN 1 ELSE 0 END) as unscored_messages,
+                    COUNT(DISTINCT CASE WHEN importance_score IS NULL THEN session_id END) as sessions_with_unscored
+                FROM messages
                 "#,
             )
             .fetch_one(&self.pool)

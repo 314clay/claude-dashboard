@@ -24,103 +24,6 @@ pub enum ColorMode {
     Hybrid,   // Project hue + session S/L variation (temporally similar = similar shade)
 }
 
-/// View mode for graph visualization
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum ViewMode {
-    #[default]
-    ForceDirected,  // Traditional physics-based layout
-    Timeline,       // X = time, Y = attention distance from user messages
-}
-
-impl ViewMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ViewMode::ForceDirected => "Force",
-            ViewMode::Timeline => "Timeline",
-        }
-    }
-
-    pub fn icon(&self) -> &'static str {
-        match self {
-            ViewMode::ForceDirected => "🔮",
-            ViewMode::Timeline => "📊",
-        }
-    }
-
-    pub fn tooltip(&self) -> &'static str {
-        match self {
-            ViewMode::ForceDirected => "Force-directed graph layout",
-            ViewMode::Timeline => "Timeline view: X = time, Y = attention distance",
-        }
-    }
-
-    pub fn toggle(&self) -> Self {
-        match self {
-            ViewMode::ForceDirected => ViewMode::Timeline,
-            ViewMode::Timeline => ViewMode::ForceDirected,
-        }
-    }
-}
-
-/// Per-view settings that differ between view modes
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ViewSettings {
-    // Physics parameters
-    pub repulsion: f32,
-    pub attraction: f32,
-    pub centering: f32,
-    pub temporal_strength: f32,
-
-    // Node sizing weights
-    pub w_importance: f32,
-    pub w_tokens: f32,
-    pub w_time: f32,
-    pub max_node_multiplier: f32,
-
-    // Temporal edges
-    pub temporal_edges_enabled: bool,
-    pub temporal_window_mins: f32,
-}
-
-impl ViewSettings {
-    /// Default settings for force-directed view
-    pub fn force_directed_defaults() -> Self {
-        Self {
-            repulsion: 500.0,
-            attraction: 0.01,
-            centering: 0.001,
-            temporal_strength: 0.05,
-            w_importance: 2.0,
-            w_tokens: 1.5,
-            w_time: 1.0,
-            max_node_multiplier: 5.0,
-            temporal_edges_enabled: true,
-            temporal_window_mins: 5.0,
-        }
-    }
-
-    /// Default settings for timeline view
-    pub fn timeline_defaults() -> Self {
-        Self {
-            // Stronger vertical repulsion to spread nodes apart
-            repulsion: 800.0,
-            attraction: 0.02,  // Stronger attraction to keep threads together
-            centering: 0.0,     // No centering (X is fixed by time)
-            temporal_strength: 0.0, // Disable temporal attraction
-
-            // De-emphasize time weight since X already encodes time
-            w_importance: 3.0,
-            w_tokens: 2.0,
-            w_time: 0.0,  // Disable time-based sizing
-            max_node_multiplier: 4.0,
-
-            // Temporal edges off by default (would cramp toward y=0)
-            temporal_edges_enabled: false,
-            temporal_window_mins: 5.0,
-        }
-    }
-}
-
 /// Role of a message in the conversation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1137,7 +1040,7 @@ impl GraphState {
     }
 
     /// Apply global hue offset, wrapping around 360°
-    pub fn apply_hue_offset(&self, hue: f32) -> f32 {
+    fn apply_hue_offset(&self, hue: f32) -> f32 {
         (hue + self.hue_offset) % 360.0
     }
 
@@ -1149,7 +1052,7 @@ impl GraphState {
 
     /// Get the position (0.0-1.0) of a session within its project's timeline.
     /// Used for hybrid coloring: earlier sessions = 0.0, later sessions = 1.0.
-    pub fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
+    fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
         if let Some(sessions) = self.project_sessions.get(project) {
             if sessions.len() <= 1 {
                 return 0.5; // Single session, use middle

@@ -2,13 +2,11 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 
-# Database
-psycopg2-binary>=2.9.9
-pandas>=2.0.0
-
 # LLM Integration (for summaries and importance scoring)
-# Uses OpenAI client to talk to LiteLLM proxy or direct API
+# At least one provider is needed for AI features; all are optional.
+# OpenAI client is also used as the transport for Google and LiteLLM.
 openai>=1.0.0
 
-# Optional: for direct Gemini API access (if not using LiteLLM proxy)
-# google-generativeai>=0.8.0
+# Optional providers (install the one you plan to use)
+anthropic>=0.39.0          # pip install anthropic
+# google-generativeai is NOT needed; we use OpenAI-compat endpoint for Gemini

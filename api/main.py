@@ -106,18 +106,8 @@ def sessions(
     limit: int = Query(default=50, description="Max sessions to return"),
 ):
     """Get list of sessions with metadata."""
-    df = get_sessions(hours, limit)
-    if df.empty:
-        return {"sessions": []}
-
-    # Convert to list of dicts, handling datetime serialization
-    records = df.to_dict(orient="records")
-    for r in records:
-        for k, v in r.items():
-            if hasattr(v, 'isoformat'):
-                r[k] = v.isoformat()
-
-    return {"sessions": records}
+    rows = get_sessions(hours, limit)
+    return {"sessions": rows}
 
 
 @app.get("/metrics")
@@ -131,17 +121,8 @@ def metrics(
 @app.get("/session/{session_id}/messages")
 def session_messages(session_id: str):
     """Get all messages for a specific session."""
-    df = get_session_messages(session_id)
-    if df.empty:
-        return {"messages": []}
-
-    records = df.to_dict(orient="records")
-    for r in records:
-        for k, v in r.items():
-            if hasattr(v, 'isoformat'):
-                r[k] = v.isoformat()
-
-    return {"messages": records}
+    rows = get_session_messages(session_id)
+    return {"messages": rows}
 
 
 @app.get("/session/{session_id}/summary/partial")
@@ -196,11 +177,8 @@ def tools(
     hours: float = Query(default=24, description="Hours to look back"),
 ):
     """Get tool usage statistics."""
-    df = get_tool_usage(hours)
-    if df.empty:
-        return {"tools": []}
-
-    return {"tools": df.to_dict(orient="records")}
+    rows = get_tool_usage(hours)
+    return {"tools": rows}
 
 
 @app.get("/projects")

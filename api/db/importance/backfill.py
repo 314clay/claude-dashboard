@@ -21,8 +21,8 @@ def get_importance_stats() -> dict:
             COUNT(importance_score) as scored_messages,
             COUNT(*) - COUNT(importance_score) as unscored_messages,
             AVG(importance_score) as avg_score,
-            COUNT(DISTINCT session_id) FILTER (WHERE importance_score IS NULL) as sessions_with_unscored
-        FROM claude_sessions.messages
+            (SELECT COUNT(DISTINCT session_id) FROM messages WHERE importance_score IS NULL) as sessions_with_unscored
+        FROM messages
     """)
 
     row = cur.fetchone()
@@ -56,7 +56,6 @@ def _process_single_session(
             return {"session_id": session_id, "error": "failed to create context"}
 
         scores = scorer.score_session(session_id, context, batch_size=batch_size)
-        # score_session already saves scores internally, so use len(scores)
 
         return {
             "session_id": session_id,
@@ -145,7 +144,6 @@ def backfill_importance_scores(
                     results["contexts_reused"] += 1
 
                 scores = scorer.score_session(session_id, context, batch_size=batch_size)
-                # score_session already saves scores internally
 
                 results["sessions_processed"] += 1
                 results["messages_scored"] += len(scores)

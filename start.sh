@@ -16,9 +16,9 @@ echo -e "${GREEN}Starting Claude Activity Dashboard (Native)${NC}"
 
 # Find Python - check multiple options
 find_python() {
-    # 1. Check for project-wide venv (preferred for ConnectingServices)
-    if [ -f "/Users/clayarnold/w/connect/venv/bin/python" ]; then
-        echo "/Users/clayarnold/w/connect/venv/bin/python"
+    # 1. Check CONNECT_VENV env var (preferred for ConnectingServices)
+    if [ -n "$CONNECT_VENV" ] && [ -f "$CONNECT_VENV/bin/python" ]; then
+        echo "$CONNECT_VENV/bin/python"
         return
     fi
 

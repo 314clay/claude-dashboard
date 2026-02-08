@@ -143,23 +143,6 @@ pub mod timeline {
     pub const PLAYHEAD: Color32 = super::accent::CYAN;
 }
 
-/// Token usage histogram colors
-pub mod token {
-    use super::*;
-
-    /// Input tokens (blue)
-    pub const INPUT: Color32 = Color32::from_rgb(100, 150, 255);
-
-    /// Output tokens (green)
-    pub const OUTPUT: Color32 = Color32::from_rgb(100, 255, 150);
-
-    /// Cache read tokens (purple)
-    pub const CACHE_READ: Color32 = Color32::from_rgb(200, 100, 255);
-
-    /// Cache creation tokens (orange)
-    pub const CACHE_CREATE: Color32 = Color32::from_rgb(255, 150, 50);
-}
-
 /// Skeleton loading placeholder colors
 pub mod skeleton {
     use super::*;

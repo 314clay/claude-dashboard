@@ -2,9 +2,11 @@
 
 Extracts project names from file paths touched during Claude Code sessions.
 """
+import json as json_module
 import os
 import re
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +26,6 @@ def _build_project_roots():
 
     patterns = []
     for dir_name in project_dirs:
-        # Pattern to extract project name (first path component after the project dir)
         pattern = rf'{re.escape(home)}/{re.escape(dir_name.strip())}/([^/]+)/'
         patterns.append(pattern)
 
@@ -54,7 +55,6 @@ def extract_project_from_path(path: str) -> Optional[str]:
     if not path:
         return None
 
-    # Skip temp files
     if path.startswith('/var/folders/') or path.startswith('/tmp/'):
         return None
 
@@ -78,12 +78,12 @@ def detect_project_for_session(session_id: str) -> Optional[str]:
 
     try:
         cur.execute("""
-            SELECT tu.tool_input->>'file_path' as path
-            FROM claude_sessions.messages m
-            JOIN claude_sessions.tool_usages tu ON m.id = tu.message_id
-            WHERE m.session_id = %s
+            SELECT json_extract(tu.tool_input, '$.file_path') as path
+            FROM messages m
+            JOIN tool_usages tu ON m.id = tu.message_id
+            WHERE m.session_id = ?
               AND tu.tool_name IN ('Read', 'Edit', 'Write', 'Glob', 'Grep')
-              AND tu.tool_input->>'file_path' IS NOT NULL
+              AND json_extract(tu.tool_input, '$.file_path') IS NOT NULL
         """, (session_id,))
 
         rows = cur.fetchall()
@@ -91,7 +91,6 @@ def detect_project_for_session(session_id: str) -> Optional[str]:
         if not rows:
             return None
 
-        # Count projects
         project_counts = Counter()
         for row in rows:
             project = extract_project_from_path(row['path'])
@@ -101,7 +100,6 @@ def detect_project_for_session(session_id: str) -> Optional[str]:
         if not project_counts:
             return None
 
-        # Return most common project
         return project_counts.most_common(1)[0][0]
 
     finally:
@@ -109,20 +107,29 @@ def detect_project_for_session(session_id: str) -> Optional[str]:
         conn.close()
 
 
-def _build_sql_case_expression():
-    """Build a SQL CASE expression for project detection based on PROJECT_ROOTS."""
+def _build_sqlite_case_expression():
+    """Build a SQL CASE expression for project detection using SQLite functions.
+
+    SQLite doesn't have split_part, so we use substr + instr to extract
+    the first path component after the project directory.
+    """
     home = HOME_DIR.rstrip('/')
     project_dirs = os.environ.get("PROJECT_DIRS", "w,Documents/GitHub,Documents/github,Projects,code").split(",")
 
     cases = []
     for dir_name in project_dirs:
         dir_path = f"{home}/{dir_name.strip()}"
-        # SQL LIKE pattern needs %% for literal %
         like_pattern = f"{dir_path}/%"
-        # Use split_part to extract the project name
+        # Extract the part after dir_path/, up to the next /
+        # substr(replace(file_path, 'dir_path/', ''), 1, instr(replace(file_path, 'dir_path/', ''), '/') - 1)
+        replace_expr = f"replace(file_path, '{dir_path}/', '')"
+        extract_expr = f"substr({replace_expr}, 1, instr({replace_expr}, '/') - 1)"
         cases.append(f"""
             WHEN file_path LIKE '{like_pattern}' THEN
-                split_part(replace(file_path, '{dir_path}/', ''), '/', 1)""")
+                CASE WHEN instr({replace_expr}, '/') > 0
+                     THEN {extract_expr}
+                     ELSE {replace_expr}
+                END""")
 
     return "CASE" + "".join(cases) + "\n                        ELSE NULL\n                    END"
 
@@ -136,22 +143,21 @@ def detect_all_projects() -> dict[str, str]:
     conn = get_connection()
     cur = conn.cursor()
 
-    case_expr = _build_sql_case_expression()
+    case_expr = _build_sqlite_case_expression()
     excluded_list = ", ".join(f"'{name}'" for name in EXCLUDED_NAMES)
 
     try:
-        # Get all file paths grouped by session
         query = f"""
             WITH file_paths AS (
                 SELECT
                     m.session_id,
-                    tu.tool_input->>'file_path' as file_path
-                FROM claude_sessions.messages m
-                JOIN claude_sessions.tool_usages tu ON m.id = tu.message_id
+                    json_extract(tu.tool_input, '$.file_path') as file_path
+                FROM messages m
+                JOIN tool_usages tu ON m.id = tu.message_id
                 WHERE tu.tool_name IN ('Read', 'Edit', 'Write', 'Glob', 'Grep')
-                  AND tu.tool_input->>'file_path' IS NOT NULL
-                  AND tu.tool_input->>'file_path' NOT LIKE '/var/folders/%'
-                  AND tu.tool_input->>'file_path' NOT LIKE '/tmp/%'
+                  AND json_extract(tu.tool_input, '$.file_path') IS NOT NULL
+                  AND json_extract(tu.tool_input, '$.file_path') NOT LIKE '/var/folders/%'
+                  AND json_extract(tu.tool_input, '$.file_path') NOT LIKE '/tmp/%'
             ),
             extracted AS (
                 SELECT
@@ -208,23 +214,18 @@ def backfill_detected_projects(dry_run: bool = False) -> dict:
     cur = conn.cursor()
 
     try:
-        # Get existing detected_projects
         cur.execute("""
             SELECT session_id, detected_project
-            FROM claude_sessions.session_summaries
+            FROM session_summaries
         """)
         existing = {row['session_id']: row['detected_project'] for row in cur.fetchall()}
 
-        # Find sessions needing update
         to_update = {}
         for session_id, project in detected.items():
             if session_id not in existing:
-                # No summary exists - need to create one
                 to_update[session_id] = {'project': project, 'action': 'insert'}
             elif existing.get(session_id) is None:
-                # Summary exists but no project detected yet
                 to_update[session_id] = {'project': project, 'action': 'update'}
-            # Skip if already has a detected_project (don't overwrite manual assignments)
 
         if dry_run:
             return {
@@ -235,27 +236,25 @@ def backfill_detected_projects(dry_run: bool = False) -> dict:
                 "projects": dict(Counter(detected.values())),
             }
 
-        # Perform updates
         updated = 0
         inserted = 0
 
         for session_id, info in to_update.items():
             if info['action'] == 'update':
                 cur.execute("""
-                    UPDATE claude_sessions.session_summaries
-                    SET detected_project = %s
-                    WHERE session_id = %s
+                    UPDATE session_summaries
+                    SET detected_project = ?
+                    WHERE session_id = ?
                 """, (info['project'], session_id))
                 updated += 1
             else:
-                # Insert minimal summary with just the detected project
                 cur.execute("""
-                    INSERT INTO claude_sessions.session_summaries
+                    INSERT INTO session_summaries
                         (session_id, detected_project, generated_at)
-                    VALUES (%s, %s, NOW())
+                    VALUES (?, ?, ?)
                     ON CONFLICT (session_id) DO UPDATE
-                    SET detected_project = EXCLUDED.detected_project
-                """, (session_id, info['project']))
+                    SET detected_project = excluded.detected_project
+                """, (session_id, info['project'], datetime.now(timezone.utc).isoformat()))
                 inserted += 1
 
         conn.commit()
@@ -294,7 +293,6 @@ if __name__ == "__main__":
     print(f"Home directory: {HOME_DIR}")
     print(f"Project roots: {PROJECT_ROOTS}\n")
 
-    # Dry run first
     result = backfill_detected_projects(dry_run=True)
     print("Dry run results:")
     print(json.dumps(result, indent=2))

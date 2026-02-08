@@ -1,4 +1,4 @@
-"""Database query functions for semantic filters."""
+"""Database query functions for semantic filters (SQLite backend)."""
 from datetime import datetime, timezone
 from .queries import get_connection
 
@@ -20,9 +20,9 @@ def get_all_filters() -> list[dict]:
             f.created_at,
             f.is_active,
             COUNT(r.id) as total_scored,
-            COUNT(r.id) FILTER (WHERE r.matches = true) as matches
-        FROM claude_sessions.semantic_filters f
-        LEFT JOIN claude_sessions.semantic_filter_results r ON f.id = r.filter_id
+            SUM(CASE WHEN r.matches = 1 THEN 1 ELSE 0 END) as matches
+        FROM semantic_filters f
+        LEFT JOIN semantic_filter_results r ON f.id = r.filter_id
         GROUP BY f.id, f.name, f.query_text, f.created_at, f.is_active
         ORDER BY f.created_at DESC
     """)
@@ -31,15 +31,7 @@ def get_all_filters() -> list[dict]:
     cur.close()
     conn.close()
 
-    results = []
-    for row in rows:
-        result = dict(row)
-        # Convert datetime to ISO string for JSON serialization
-        if result.get('created_at') and hasattr(result['created_at'], 'isoformat'):
-            result['created_at'] = result['created_at'].isoformat()
-        results.append(result)
-
-    return results
+    return [dict(row) for row in rows]
 
 
 def create_filter(name: str, query_text: str) -> dict:
@@ -58,22 +50,26 @@ def create_filter(name: str, query_text: str) -> dict:
     conn = get_connection()
     cur = conn.cursor()
 
+    now = datetime.now(timezone.utc).isoformat()
     cur.execute("""
-        INSERT INTO claude_sessions.semantic_filters (name, query_text, created_at, is_active)
-        VALUES (%s, %s, %s, true)
-        RETURNING id, name, query_text, created_at, is_active
-    """, (name, query_text, datetime.now(timezone.utc)))
+        INSERT INTO semantic_filters (name, query_text, created_at, is_active)
+        VALUES (?, ?, ?, 1)
+    """, (name, query_text, now))
+
+    filter_id = cur.lastrowid
+    conn.commit()
+
+    # Fetch the created row
+    cur.execute("""
+        SELECT id, name, query_text, created_at, is_active
+        FROM semantic_filters WHERE id = ?
+    """, (filter_id,))
 
     row = cur.fetchone()
-    conn.commit()
     cur.close()
     conn.close()
 
-    result = dict(row)
-    if result.get('created_at') and hasattr(result['created_at'], 'isoformat'):
-        result['created_at'] = result['created_at'].isoformat()
-
-    return result
+    return dict(row)
 
 
 def delete_filter(filter_id: int) -> bool:
@@ -90,18 +86,17 @@ def delete_filter(filter_id: int) -> bool:
 
     # Delete results first (foreign key constraint)
     cur.execute("""
-        DELETE FROM claude_sessions.semantic_filter_results
-        WHERE filter_id = %s
+        DELETE FROM semantic_filter_results
+        WHERE filter_id = ?
     """, (filter_id,))
 
     # Delete the filter
     cur.execute("""
-        DELETE FROM claude_sessions.semantic_filters
-        WHERE id = %s
-        RETURNING id
+        DELETE FROM semantic_filters
+        WHERE id = ?
     """, (filter_id,))
 
-    deleted = cur.fetchone() is not None
+    deleted = cur.rowcount > 0
     conn.commit()
     cur.close()
     conn.close()
@@ -125,8 +120,8 @@ def get_filter_status(filter_id: int) -> dict | None:
     # Get filter info
     cur.execute("""
         SELECT id, name, query_text, is_active
-        FROM claude_sessions.semantic_filters
-        WHERE id = %s
+        FROM semantic_filters
+        WHERE id = ?
     """, (filter_id,))
 
     filter_row = cur.fetchone()
@@ -138,7 +133,7 @@ def get_filter_status(filter_id: int) -> dict | None:
     # Get total message count
     cur.execute("""
         SELECT COUNT(*) as total
-        FROM claude_sessions.messages
+        FROM messages
     """)
     total = cur.fetchone()['total']
 
@@ -146,14 +141,14 @@ def get_filter_status(filter_id: int) -> dict | None:
     cur.execute("""
         SELECT
             COUNT(*) as scored,
-            COUNT(*) FILTER (WHERE matches = true) as matches
-        FROM claude_sessions.semantic_filter_results
-        WHERE filter_id = %s
+            SUM(CASE WHEN matches = 1 THEN 1 ELSE 0 END) as matches
+        FROM semantic_filter_results
+        WHERE filter_id = ?
     """, (filter_id,))
 
     result_row = cur.fetchone()
     scored = result_row['scored']
-    matches = result_row['matches']
+    matches = result_row['matches'] or 0
 
     cur.close()
     conn.close()
@@ -185,18 +180,24 @@ def get_message_filter_matches(message_ids: list[int]) -> dict[int, list[int]]:
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT
-            r.message_id,
-            r.filter_id
-        FROM claude_sessions.semantic_filter_results r
-        JOIN claude_sessions.semantic_filters f ON r.filter_id = f.id
-        WHERE r.message_id = ANY(%s)
-          AND r.matches = true
-          AND f.is_active = true
-    """, (message_ids,))
+    # SQLite has a variable limit (~999), batch large queries
+    rows = []
+    batch_size = 900
+    for i in range(0, len(message_ids), batch_size):
+        batch = message_ids[i:i + batch_size]
+        placeholders = ','.join('?' * len(batch))
+        cur.execute(f"""
+            SELECT
+                r.message_id,
+                r.filter_id
+            FROM semantic_filter_results r
+            JOIN semantic_filters f ON r.filter_id = f.id
+            WHERE r.message_id IN ({placeholders})
+              AND r.matches = 1
+              AND f.is_active = 1
+        """, batch)
+        rows.extend(cur.fetchall())
 
-    rows = cur.fetchall()
     cur.close()
     conn.close()
 

@@ -9,12 +9,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..queries import get_connection
+from .. import llm
 from .context import SessionContext
-
-# LiteLLM proxy configuration
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
-MODEL_NAME = os.environ.get("SUMMARY_MODEL", "gemini-2.5-flash")
 
 
 class ImportanceScorer:
@@ -47,23 +43,15 @@ MESSAGES TO SCORE:
 Respond with JSON only, no markdown code blocks:
 {{"scores": [{{"id": <message_id>, "score": <0.0-1.0>, "reason": "<brief reason, max 50 chars>"}}]}}"""
 
-    def _generate_via_litellm(self, prompt: str) -> Optional[str]:
-        """Generate text via LiteLLM proxy."""
-        try:
-            from openai import OpenAI
-            client = OpenAI(
-                base_url=f"{LITELLM_BASE_URL}/v1",
-                api_key=LITELLM_API_KEY
-            )
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=8192,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"LiteLLM error: {e}")
+    def _generate(self, prompt: str) -> Optional[str]:
+        """Generate text via the configured LLM provider."""
+        if not llm.is_available():
+            print("LLM not configured - importance scoring disabled")
             return None
+        return llm.complete(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8192,
+        )
 
     def get_unscored_messages(self, session_id: str, limit: int = 30, force: bool = False) -> list[dict]:
         """Get messages for a session that need scoring.
@@ -77,21 +65,20 @@ Respond with JSON only, no markdown code blocks:
         cur = conn.cursor()
 
         if force:
-            # Get all messages regardless of current score
             cur.execute("""
                 SELECT id, role, content, sequence_num
-                FROM claude_sessions.messages
-                WHERE session_id = %s
+                FROM messages
+                WHERE session_id = ?
                 ORDER BY sequence_num
-                LIMIT %s
+                LIMIT ?
             """, (session_id, limit))
         else:
             cur.execute("""
                 SELECT id, role, content, sequence_num
-                FROM claude_sessions.messages
-                WHERE session_id = %s AND importance_score IS NULL
+                FROM messages
+                WHERE session_id = ? AND importance_score IS NULL
                 ORDER BY sequence_num
-                LIMIT %s
+                LIMIT ?
             """, (session_id, limit))
 
         messages = [dict(row) for row in cur.fetchall()]
@@ -136,7 +123,7 @@ Respond with JSON only, no markdown code blocks:
             messages=messages_text,
         )
 
-        response = self._generate_via_litellm(prompt)
+        response = self._generate(prompt)
         if not response:
             return {}
 
@@ -228,26 +215,25 @@ Respond with JSON only, no markdown code blocks:
         conn = get_connection()
         cur = conn.cursor()
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).isoformat()
         updated = 0
 
         for msg_id, (score, reason) in scores.items():
             if force:
-                # Overwrite regardless of current value (atomic update)
                 cur.execute("""
-                    UPDATE claude_sessions.messages
-                    SET importance_score = %s,
-                        importance_reason = %s,
-                        importance_scored_at = %s
-                    WHERE id = %s
+                    UPDATE messages
+                    SET importance_score = ?,
+                        importance_reason = ?,
+                        importance_scored_at = ?
+                    WHERE id = ?
                 """, (score, reason if reason else None, now, msg_id))
             else:
                 cur.execute("""
-                    UPDATE claude_sessions.messages
-                    SET importance_score = %s,
-                        importance_reason = %s,
-                        importance_scored_at = %s
-                    WHERE id = %s AND importance_score IS NULL
+                    UPDATE messages
+                    SET importance_score = ?,
+                        importance_reason = ?,
+                        importance_scored_at = ?
+                    WHERE id = ? AND importance_score IS NULL
                 """, (score, reason if reason else None, now, msg_id))
             updated += cur.rowcount
 

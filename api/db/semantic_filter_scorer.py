@@ -10,11 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .queries import get_connection
-
-# LiteLLM proxy configuration
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
-MODEL_NAME = os.environ.get("SUMMARY_MODEL", "gemini-2.5-flash")
+from . import llm
 
 
 class SemanticFilterScorer:
@@ -42,23 +38,15 @@ IMPORTANT:
     def __init__(self):
         pass
 
-    def _generate_via_litellm(self, prompt: str) -> Optional[str]:
-        """Generate text via LiteLLM proxy."""
-        try:
-            from openai import OpenAI
-            client = OpenAI(
-                base_url=f"{LITELLM_BASE_URL}/v1",
-                api_key=LITELLM_API_KEY
-            )
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=8192,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"LiteLLM error: {e}")
+    def _generate(self, prompt: str) -> Optional[str]:
+        """Generate text via the configured LLM provider."""
+        if not llm.is_available():
+            print("LLM not configured - semantic filter scoring disabled")
             return None
+        return llm.complete(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8192,
+        )
 
     def get_active_filters(self) -> list[dict]:
         """Get all active semantic filters from database.
@@ -71,8 +59,8 @@ IMPORTANT:
 
         cur.execute("""
             SELECT id, name, query_text
-            FROM claude_sessions.semantic_filters
-            WHERE is_active = true
+            FROM semantic_filters
+            WHERE is_active = 1
             ORDER BY id
         """)
 
@@ -100,13 +88,13 @@ IMPORTANT:
 
         cur.execute("""
             SELECT m.id, m.role, m.content
-            FROM claude_sessions.messages m
+            FROM messages m
             WHERE NOT EXISTS (
-                SELECT 1 FROM claude_sessions.semantic_filter_results sfr
-                WHERE sfr.message_id = m.id AND sfr.filter_id = %s
+                SELECT 1 FROM semantic_filter_results sfr
+                WHERE sfr.message_id = m.id AND sfr.filter_id = ?
             )
             ORDER BY m.timestamp DESC
-            LIMIT %s
+            LIMIT ?
         """, (filter_id, limit))
 
         messages = [dict(row) for row in cur.fetchall()]
@@ -155,14 +143,13 @@ IMPORTANT:
             messages=messages_text,
         )
 
-        response = self._generate_via_litellm(prompt)
+        response = self._generate(prompt)
         if not response:
             return {}
 
         # Parse response
         try:
             text = response.strip()
-            # Strip markdown code blocks if present
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
@@ -178,13 +165,11 @@ IMPORTANT:
                 msg_id = r.get('id')
                 matching_filters = r.get('matches', [])
                 if msg_id is not None:
-                    # Parse filter IDs, handling "Filter X" format
                     parsed_filters = []
                     for f in matching_filters:
                         if isinstance(f, int):
                             parsed_filters.append(f)
                         elif isinstance(f, str):
-                            # Handle "Filter X" format
                             match = re.match(r'Filter\s*(\d+)', f, re.IGNORECASE)
                             if match:
                                 parsed_filters.append(int(match.group(1)))
@@ -219,26 +204,24 @@ IMPORTANT:
         conn = get_connection()
         cur = conn.cursor()
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).isoformat()
         inserted = 0
 
         for msg_id, matching_filters in results.items():
             matching_set = set(matching_filters)
 
             for filter_id in all_filter_ids:
-                matches = filter_id in matching_set
-                # Confidence: 1.0 for matches, 0.0 for non-matches
-                # (Could be enhanced with LLM returning confidence)
+                matches = 1 if filter_id in matching_set else 0
                 confidence = 1.0 if matches else 0.0
 
                 cur.execute("""
-                    INSERT INTO claude_sessions.semantic_filter_results
+                    INSERT INTO semantic_filter_results
                     (filter_id, message_id, matches, confidence, scored_at)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT (filter_id, message_id)
-                    DO UPDATE SET matches = EXCLUDED.matches,
-                                  confidence = EXCLUDED.confidence,
-                                  scored_at = EXCLUDED.scored_at
+                    DO UPDATE SET matches = excluded.matches,
+                                  confidence = excluded.confidence,
+                                  scored_at = excluded.scored_at
                 """, (filter_id, msg_id, matches, confidence, now))
                 inserted += cur.rowcount
 
@@ -276,13 +259,11 @@ def categorize_messages(
         "errors": []
     }
 
-    # Get all active filters (we score against all in each batch)
     filters = scorer.get_active_filters()
     if not filters:
         results["errors"].append("No active filters found")
         return results
 
-    # Verify the requested filter exists and is active
     filter_ids = [f['id'] for f in filters]
     if filter_id not in filter_ids:
         results["errors"].append(f"Filter {filter_id} not found or inactive")
@@ -292,7 +273,6 @@ def categorize_messages(
     messages_processed = 0
 
     while messages_processed < max_messages:
-        # Get unscored messages for the target filter
         messages = scorer.get_unscored_messages_for_filter(
             filter_id,
             limit=batch_size
@@ -301,17 +281,14 @@ def categorize_messages(
         if not messages:
             break
 
-        # Score batch against all filters
         batch_results = scorer.score_batch(messages, filters)
 
         if not batch_results:
             results["errors"].append(f"Batch {results['batches_processed']} failed to score")
             break
 
-        # Save results
         saved = scorer.save_results(batch_results, all_filter_ids)
 
-        # Count matches for the target filter
         for msg_id, matching_filters in batch_results.items():
             if filter_id in matching_filters:
                 results["matches"] += 1
@@ -320,7 +297,6 @@ def categorize_messages(
         results["batches_processed"] += 1
         messages_processed += len(messages)
 
-        # If we got fewer than batch_size, we're done
         if len(messages) < batch_size:
             break
 
@@ -343,17 +319,16 @@ def get_filter_stats() -> dict:
             sf.query_text,
             sf.is_active,
             COUNT(sfr.message_id) as scored_count,
-            COUNT(sfr.message_id) FILTER (WHERE sfr.matches = true) as match_count
-        FROM claude_sessions.semantic_filters sf
-        LEFT JOIN claude_sessions.semantic_filter_results sfr ON sf.id = sfr.filter_id
+            SUM(CASE WHEN sfr.matches = 1 THEN 1 ELSE 0 END) as match_count
+        FROM semantic_filters sf
+        LEFT JOIN semantic_filter_results sfr ON sf.id = sfr.filter_id
         GROUP BY sf.id, sf.name, sf.query_text, sf.is_active
         ORDER BY sf.id
     """)
 
     filters = [dict(row) for row in cur.fetchall()]
 
-    # Get total message count
-    cur.execute("SELECT COUNT(*) as total FROM claude_sessions.messages")
+    cur.execute("SELECT COUNT(*) as total FROM messages")
     total_messages = cur.fetchone()['total']
 
     cur.close()

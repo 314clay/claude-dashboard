@@ -10,11 +10,7 @@ import json
 import os
 
 from ..queries import get_connection
-
-# LiteLLM proxy configuration (same as summarizer.py)
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
-MODEL_NAME = os.environ.get("SUMMARY_MODEL", "gemini-2.5-flash")
+from .. import llm
 
 
 @dataclass
@@ -60,23 +56,15 @@ Be concise. Focus on the key points."""
         """
         self.staleness_days = staleness_days
 
-    def _generate_via_litellm(self, prompt: str) -> Optional[str]:
-        """Generate text via LiteLLM proxy."""
-        try:
-            from openai import OpenAI
-            client = OpenAI(
-                base_url=f"{LITELLM_BASE_URL}/v1",
-                api_key=LITELLM_API_KEY
-            )
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2048,
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"LiteLLM error: {e}")
+    def _generate(self, prompt: str) -> Optional[str]:
+        """Generate text via the configured LLM provider."""
+        if not llm.is_available():
+            print("LLM not configured - context creation disabled")
             return None
+        return llm.complete(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+        )
 
     def get_sessions_needing_context(self, limit: int = 50, since_days: float = None) -> list[str]:
         """Find sessions that need contexts (old enough, have unscored messages).
@@ -89,40 +77,39 @@ Be concise. Focus on the key points."""
         conn = get_connection()
         cur = conn.cursor()
 
-        staleness_threshold = datetime.now(timezone.utc) - timedelta(days=self.staleness_days)
+        staleness_threshold = (datetime.now(timezone.utc) - timedelta(days=self.staleness_days)).isoformat()
 
         if since_days is not None:
-            # Filter to sessions with messages in the past since_days
-            since_threshold = datetime.now(timezone.utc) - timedelta(days=since_days)
+            since_threshold = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
             cur.execute("""
                 SELECT m.session_id, MAX(m.timestamp) as last_msg
-                FROM claude_sessions.messages m
+                FROM messages m
                 WHERE m.importance_score IS NULL
-                  AND m.timestamp >= %s
+                  AND m.timestamp >= ?
                   AND m.session_id IN (
                       SELECT session_id
-                      FROM claude_sessions.messages
+                      FROM messages
                       GROUP BY session_id
-                      HAVING MAX(timestamp) < %s
+                      HAVING MAX(timestamp) < ?
                   )
                 GROUP BY m.session_id
                 ORDER BY last_msg DESC
-                LIMIT %s
+                LIMIT ?
             """, (since_threshold, staleness_threshold, limit))
         else:
             cur.execute("""
                 SELECT m.session_id, MAX(m.timestamp) as last_msg
-                FROM claude_sessions.messages m
+                FROM messages m
                 WHERE m.importance_score IS NULL
                   AND m.session_id IN (
                       SELECT session_id
-                      FROM claude_sessions.messages
+                      FROM messages
                       GROUP BY session_id
-                      HAVING MAX(timestamp) < %s
+                      HAVING MAX(timestamp) < ?
                   )
                 GROUP BY m.session_id
                 ORDER BY last_msg DESC
-                LIMIT %s
+                LIMIT ?
             """, (staleness_threshold, limit))
 
         session_ids = [row['session_id'] for row in cur.fetchall()]
@@ -143,11 +130,11 @@ Be concise. Focus on the key points."""
                 ss.session_id,
                 ss.message_count_at_gen,
                 COUNT(m.id) as current_count
-            FROM claude_sessions.session_summaries ss
-            JOIN claude_sessions.messages m ON m.session_id = ss.session_id
+            FROM session_summaries ss
+            JOIN messages m ON m.session_id = ss.session_id
             WHERE ss.message_count_at_gen IS NOT NULL
             GROUP BY ss.session_id, ss.message_count_at_gen
-            HAVING COUNT(m.id) - ss.message_count_at_gen > %s
+            HAVING COUNT(m.id) - ss.message_count_at_gen > ?
         """, (threshold,))
 
         rows = [dict(row) for row in cur.fetchall()]
@@ -162,8 +149,8 @@ Be concise. Focus on the key points."""
 
         cur.execute("""
             SELECT summary, completed_work, topics, message_count_at_gen, generated_at
-            FROM claude_sessions.session_summaries
-            WHERE session_id = %s
+            FROM session_summaries
+            WHERE session_id = ?
         """, (session_id,))
 
         row = cur.fetchone()
@@ -173,7 +160,17 @@ Be concise. Focus on the key points."""
         if not row:
             return None
 
-        topics = row['topics'] if isinstance(row['topics'], list) else []
+        raw_topics = row['topics']
+        if isinstance(raw_topics, str):
+            try:
+                topics = json.loads(raw_topics)
+            except (json.JSONDecodeError, TypeError):
+                topics = []
+        elif isinstance(raw_topics, list):
+            topics = raw_topics
+        else:
+            topics = []
+
         return SessionContext(
             session_id=session_id,
             summary=row['summary'] or "",
@@ -188,7 +185,7 @@ Be concise. Focus on the key points."""
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT COUNT(*) as count FROM claude_sessions.messages WHERE session_id = %s
+            SELECT COUNT(*) as count FROM messages WHERE session_id = ?
         """, (session_id,))
         row = cur.fetchone()
         cur.close()
@@ -204,8 +201,8 @@ Be concise. Focus on the key points."""
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT role, content FROM claude_sessions.messages
-            WHERE session_id = %s ORDER BY sequence_num
+            SELECT role, content FROM messages
+            WHERE session_id = ? ORDER BY sequence_num
         """, (session_id,))
         messages = [dict(row) for row in cur.fetchall()]
         cur.close()
@@ -232,7 +229,7 @@ Be concise. Focus on the key points."""
         prompt = self.SUMMARY_PROMPT.format(conversation=conversation_text)
 
         # Generate summary via LLM
-        text = self._generate_via_litellm(prompt)
+        text = self._generate(prompt)
         if not text:
             return None
 
@@ -254,20 +251,20 @@ Be concise. Focus on the key points."""
             return None
 
         # Save to database
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).isoformat()
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO claude_sessions.session_summaries
+            INSERT INTO session_summaries
                 (session_id, summary, completed_work, topics, message_count_at_gen, generated_at, model)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (session_id) DO UPDATE SET
-                summary = EXCLUDED.summary,
-                completed_work = EXCLUDED.completed_work,
-                topics = EXCLUDED.topics,
-                message_count_at_gen = EXCLUDED.message_count_at_gen,
-                generated_at = EXCLUDED.generated_at,
-                model = EXCLUDED.model
+                summary = excluded.summary,
+                completed_work = excluded.completed_work,
+                topics = excluded.topics,
+                message_count_at_gen = excluded.message_count_at_gen,
+                generated_at = excluded.generated_at,
+                model = excluded.model
         """, (
             session_id,
             summary,
@@ -275,7 +272,7 @@ Be concise. Focus on the key points."""
             json.dumps(topics),
             message_count,
             now,
-            MODEL_NAME
+            llm.get_provider() or "unknown"
         ))
         conn.commit()
         cur.close()

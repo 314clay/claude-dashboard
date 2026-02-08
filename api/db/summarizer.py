@@ -1,18 +1,15 @@
-"""Session summarization using LiteLLM proxy.
+"""Session summarization using LLM.
 
-Routes through LiteLLM proxy at port 4001 for unified API access.
+Routes through the shared LLM module for provider-agnostic API access.
 """
+import json
 import os
 from functools import lru_cache
 from .queries import get_connection, get_session_messages, get_session_messages_before, _normalize_path
+from . import llm
 
 # In-memory cache for partial summaries (session_id, timestamp) -> result
 _partial_summary_cache: dict[tuple[str, str], dict] = {}
-
-# LiteLLM proxy configuration
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4001")
-LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
-MODEL_NAME = os.environ.get("SUMMARY_MODEL", "fast")
 
 SUMMARY_PROMPT = """Analyze this Claude Code conversation and provide a structured summary.
 
@@ -39,35 +36,25 @@ TOPIC GUIDELINES:
 Be concise. Focus on the key points. If the conversation is about coding, mention the specific files or features involved."""
 
 
-def _generate_via_litellm(prompt: str) -> str | None:
-    """Generate text via LiteLLM proxy."""
-    try:
-        from openai import OpenAI
-        client = OpenAI(
-            base_url=f"{LITELLM_BASE_URL}/v1",
-            api_key=LITELLM_API_KEY
-        )
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"LiteLLM error: {e}")
+def _generate(prompt: str) -> str | None:
+    """Generate text via the configured LLM provider."""
+    if not llm.is_available():
+        print("LLM not configured - AI summaries disabled")
         return None
+    return llm.complete(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+    )
 
 
 def _extract_json(text: str) -> dict | None:
     """Extract JSON object from LLM response, handling markdown and extra text."""
-    import json
     import re
 
     text = text.strip()
 
     # Try to extract from markdown code block first
     if "```" in text:
-        # Find content between ``` markers
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if match:
             try:
@@ -76,7 +63,6 @@ def _extract_json(text: str) -> dict | None:
                 pass
 
     # Try to find JSON object directly
-    # Look for { ... } pattern
     match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
     if match:
         try:
@@ -94,8 +80,7 @@ def _extract_json(text: str) -> dict | None:
 
 
 def generate_session_summary(session_id: str) -> dict | None:
-    """Generate a summary for a session using LiteLLM proxy."""
-    # Get messages
+    """Generate a summary for a session using the configured LLM."""
     messages_df = get_session_messages(session_id)
     if messages_df.empty:
         return None
@@ -105,26 +90,22 @@ def generate_session_summary(session_id: str) -> dict | None:
     for _, msg in messages_df.iterrows():
         role = "USER" if msg['role'] == 'user' else "CLAUDE"
         content = msg['content'] or ""
-        # Truncate very long messages
         if len(content) > 2000:
             content = content[:2000] + "..."
         conversation_parts.append(f"{role}: {content}")
 
     conversation_text = "\n\n".join(conversation_parts)
 
-    # Limit total size to avoid token limits
     if len(conversation_text) > 50000:
         conversation_text = conversation_text[:50000] + "\n\n[CONVERSATION TRUNCATED]"
 
     prompt = SUMMARY_PROMPT.format(conversation=conversation_text)
 
-    # Generate via LiteLLM
-    text = _generate_via_litellm(prompt)
+    text = _generate(prompt)
     if text is None:
         return None
 
     try:
-        import json
         result = _extract_json(text)
         if result is None:
             print(f"Could not extract JSON from response: {text[:200]}...")
@@ -174,7 +155,6 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
         dict with summary, completed_work, unsuccessful_attempts, current_focus,
         user_count, and assistant_count
     """
-    # Check cache first
     cache_key = (session_id, before_timestamp)
     if cache_key in _partial_summary_cache:
         print(f"Cache hit for partial summary: {session_id[:8]}...@{before_timestamp}")
@@ -182,16 +162,13 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
 
     print(f"Cache miss - generating partial summary for {session_id[:8]}...@{before_timestamp}")
 
-    # Get messages up to timestamp
     messages_df = get_session_messages_before(session_id, before_timestamp)
     if messages_df.empty:
         return None
 
-    # Count messages by role
     user_count = len(messages_df[messages_df['role'] == 'user'])
     assistant_count = len(messages_df[messages_df['role'] == 'assistant'])
 
-    # Build conversation text
     conversation_parts = []
     for _, msg in messages_df.iterrows():
         role = "USER" if msg['role'] == 'user' else "CLAUDE"
@@ -202,14 +179,12 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
 
     conversation_text = "\n\n".join(conversation_parts)
 
-    # Limit total size
     if len(conversation_text) > 50000:
         conversation_text = conversation_text[:50000] + "\n\n[CONVERSATION TRUNCATED]"
 
     prompt = PARTIAL_SUMMARY_PROMPT.format(conversation=conversation_text)
 
-    # Generate via LiteLLM
-    text = _generate_via_litellm(prompt)
+    text = _generate(prompt)
     if text is None:
         return {
             "summary": "Failed to generate summary",
@@ -233,7 +208,6 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
                 "assistant_count": assistant_count,
             }
 
-        # Ensure string fields are always strings (LLMs sometimes return arrays)
         def ensure_string(val):
             if isinstance(val, list):
                 return "\n".join(str(v) for v in val) if val else ""
@@ -247,12 +221,10 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
             "user_count": user_count,
             "assistant_count": assistant_count,
         }
-        # Cache the successful result
         _partial_summary_cache[cache_key] = summary_result
         return summary_result
     except Exception as e:
         print(f"Error parsing partial summary: {e}")
-        # Don't cache errors - let user retry
         return {
             "summary": f"Error parsing response: {e}",
             "completed_work": "",
@@ -272,14 +244,21 @@ def get_or_create_summary(session_id: str, force_refresh: bool = False) -> dict 
     if not force_refresh:
         cur.execute("""
             SELECT summary, user_requests, completed_work, topics, generated_at, model
-            FROM claude_sessions.session_summaries
-            WHERE session_id = %s
+            FROM session_summaries
+            WHERE session_id = ?
         """, (session_id,))
         row = cur.fetchone()
         if row:
             cur.close()
             conn.close()
-            return dict(row)
+            result = dict(row)
+            # Parse JSON topics
+            if isinstance(result.get('topics'), str):
+                try:
+                    result['topics'] = json.loads(result['topics'])
+                except (json.JSONDecodeError, TypeError):
+                    result['topics'] = []
+            return result
 
     # Generate new summary
     summary_data = generate_session_summary(session_id)
@@ -289,34 +268,54 @@ def get_or_create_summary(session_id: str, force_refresh: bool = False) -> dict 
         return None
 
     # Save to database
-    import json as json_module
+    now = json.dumps(None)  # placeholder
+    model_name = llm.get_provider() or "unknown"
+    now_iso = datetime.now(timezone.utc).isoformat() if True else None
+    from datetime import datetime, timezone
+
     cur.execute("""
-        INSERT INTO claude_sessions.session_summaries
-            (session_id, summary, user_requests, completed_work, topics, model)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO session_summaries
+            (session_id, summary, user_requests, completed_work, topics, model, generated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (session_id) DO UPDATE SET
-            summary = EXCLUDED.summary,
-            user_requests = EXCLUDED.user_requests,
-            completed_work = EXCLUDED.completed_work,
-            topics = EXCLUDED.topics,
-            generated_at = NOW(),
-            model = EXCLUDED.model
-        RETURNING summary, user_requests, completed_work, topics, generated_at, model
+            summary = excluded.summary,
+            user_requests = excluded.user_requests,
+            completed_work = excluded.completed_work,
+            topics = excluded.topics,
+            generated_at = excluded.generated_at,
+            model = excluded.model
     """, (
         session_id,
         summary_data["summary"],
         summary_data["user_requests"],
         summary_data["completed_work"],
-        json_module.dumps(summary_data.get("topics", [])),
-        MODEL_NAME
+        json.dumps(summary_data.get("topics", [])),
+        model_name,
+        datetime.now(timezone.utc).isoformat(),
     ))
 
-    result = cur.fetchone()
     conn.commit()
+
+    # Fetch back the inserted row
+    cur.execute("""
+        SELECT summary, user_requests, completed_work, topics, generated_at, model
+        FROM session_summaries
+        WHERE session_id = ?
+    """, (session_id,))
+
+    result_row = cur.fetchone()
     cur.close()
     conn.close()
 
-    return dict(result) if result else summary_data
+    if result_row:
+        result = dict(result_row)
+        if isinstance(result.get('topics'), str):
+            try:
+                result['topics'] = json.loads(result['topics'])
+            except (json.JSONDecodeError, TypeError):
+                result['topics'] = []
+        return result
+    return summary_data
 
 
 def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict]:
@@ -325,7 +324,7 @@ def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict
     cur = conn.cursor()
 
     from datetime import datetime, timedelta, timezone
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
     cur.execute("""
         SELECT
@@ -334,21 +333,21 @@ def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict
             s.start_time,
             s.end_time,
             COUNT(m.id) as total_messages,
-            COUNT(*) FILTER (WHERE m.role = 'user') as user_messages,
-            COUNT(*) FILTER (WHERE m.role = 'assistant') as assistant_messages,
-            EXTRACT(EPOCH FROM (COALESCE(s.end_time, NOW()) - s.start_time))/60 as duration_mins,
+            SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+            SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
+            (strftime('%s', COALESCE(s.end_time, datetime('now'))) - strftime('%s', s.start_time)) / 60.0 as duration_mins,
             ss.summary,
             ss.user_requests,
             ss.completed_work,
             ss.topics
-        FROM claude_sessions.sessions s
-        LEFT JOIN claude_sessions.messages m ON s.session_id = m.session_id
-        LEFT JOIN claude_sessions.session_summaries ss ON s.session_id = ss.session_id
-        WHERE s.start_time >= %s
+        FROM sessions s
+        LEFT JOIN messages m ON s.session_id = m.session_id
+        LEFT JOIN session_summaries ss ON s.session_id = ss.session_id
+        WHERE s.start_time >= ?
         GROUP BY s.session_id, s.cwd, s.start_time, s.end_time,
                  ss.summary, ss.user_requests, ss.completed_work, ss.topics
         ORDER BY s.start_time DESC
-        LIMIT %s
+        LIMIT ?
     """, (since, limit))
 
     rows = cur.fetchall()
@@ -358,12 +357,14 @@ def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict
     sessions = []
     for row in rows:
         session = dict(row)
-        # Clean up paths
         session['project'] = _normalize_path(session['cwd']) if session['cwd'] else ''
         session['is_active'] = session['end_time'] is None
-        # Convert Decimal to float
-        if session.get('duration_mins'):
-            session['duration_mins'] = float(session['duration_mins'])
+        # Parse JSON topics
+        if isinstance(session.get('topics'), str):
+            try:
+                session['topics'] = json.loads(session['topics'])
+            except (json.JSONDecodeError, TypeError):
+                session['topics'] = []
         sessions.append(session)
 
     return sessions

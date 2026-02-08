@@ -1,9 +1,8 @@
 //! Main application state and UI.
 
 use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
-use crate::beads::BeadLoader;
 use crate::db::DbClient;
-use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData, ViewMode, ViewSettings};
+use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
 use crate::settings::{Preset, Settings, SizingPreset};
@@ -96,21 +95,6 @@ pub struct ImportanceStats {
     pub scored_messages: i64,
 }
 
-/// Token usage bin for histogram
-#[derive(Debug, Clone)]
-struct SessionTokens {
-    session_id: String,
-    project: String,
-    total_tokens: i64,
-}
-
-struct TokenBin {
-    timestamp_start: String,
-    timestamp_end: String,
-    sessions: Vec<SessionTokens>,
-    total_tokens: i64,
-}
-
 /// Main dashboard application
 pub struct DashboardApp {
     // Database client
@@ -130,16 +114,6 @@ pub struct DashboardApp {
     timeline_enabled: bool,
     timeline_histogram_mode: bool,
     hover_scrubs_timeline: bool,
-
-    // View mode (force-directed vs timeline)
-    view_mode: ViewMode,
-    force_directed_settings: ViewSettings,
-    timeline_settings: ViewSettings,
-
-    // Timeline view navigation (separate from graph pan/zoom)
-    time_zoom: f32,        // X-axis zoom (time scale)
-    attention_zoom: f32,   // Y-axis zoom (attention spread)
-    time_pan: f32,         // Horizontal pan offset (time position)
 
     // Node sizing (unified formula)
     sizing_preset: SizingPreset,
@@ -239,17 +213,6 @@ pub struct DashboardApp {
     // Collapsible side panels
     beads_panel_open: bool,
     mail_panel_open: bool,
-
-    // Beads loader with caching (lazy loading, virtual scrolling)
-    bead_loader: BeadLoader,
-
-    // Token histogram panel
-    histogram_panel_enabled: bool,
-    histogram_split_ratio: f32,
-    histogram_dragging_divider: bool,
-    histogram_hovered_bin: Option<usize>,
-    histogram_bar_width: f32,
-    histogram_scroll_offset: f32,
 }
 
 impl DashboardApp {
@@ -292,12 +255,6 @@ impl DashboardApp {
             timeline_enabled: settings.timeline_enabled,
             timeline_histogram_mode: false, // Default to notch view
             hover_scrubs_timeline: settings.hover_scrubs_timeline,
-            view_mode: ViewMode::ForceDirected,
-            force_directed_settings: ViewSettings::force_directed_defaults(),
-            timeline_settings: ViewSettings::timeline_defaults(),
-            time_zoom: 1.0,
-            attention_zoom: 1.0,
-            time_pan: 0.0,
             sizing_preset: settings.sizing_preset,
             w_importance: settings.w_importance,
             w_tokens: settings.w_tokens,
@@ -350,10 +307,6 @@ impl DashboardApp {
             beads_panel_open: settings.beads_panel_open,
             mail_panel_open: settings.mail_panel_open,
 
-            // Token histogram panel (read before settings move)
-            histogram_panel_enabled: settings.histogram_panel_enabled,
-            histogram_split_ratio: settings.histogram_split_ratio,
-
             // Settings persistence
             settings,
             settings_dirty: false,
@@ -385,15 +338,6 @@ impl DashboardApp {
             mail_network_state: None,
             mail_network_loading: false,
             mail_network_error: None,
-
-            // Beads loader with caching
-            bead_loader: BeadLoader::new(),
-
-            // Histogram state (not in settings)
-            histogram_dragging_divider: false,
-            histogram_hovered_bin: None,
-            histogram_bar_width: 40.0,
-            histogram_scroll_offset: 0.0,
         };
 
         // Load initial data if connected
@@ -451,12 +395,6 @@ impl DashboardApp {
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
-        self.settings.histogram_panel_enabled = self.histogram_panel_enabled;
-        self.settings.histogram_split_ratio = self.histogram_split_ratio;
-
-        // Also save to the active view's per-view settings
-        // This ensures changes persist even without switching view modes
-        self.settings.save_to_active_view_settings();
     }
 
     /// Copy settings values to UI fields (used when loading a preset)
@@ -495,32 +433,6 @@ impl DashboardApp {
             self.settings_dirty = false;
             self.last_settings_save = Instant::now();
         }
-    }
-
-    /// Switch view mode, saving current settings and applying new view's settings
-    fn switch_view_mode(&mut self, new_mode: ViewMode) {
-        // First sync current UI to settings (to capture any pending changes)
-        self.sync_settings_from_ui();
-        // Save current settings to the current view's per-view settings
-        self.settings.save_to_active_view_settings();
-
-        // Switch view mode
-        self.view_mode = new_mode;
-        self.settings.view_mode = new_mode;
-
-        // Apply new view's settings to main settings
-        self.settings.apply_active_view_settings();
-
-        // Sync settings to UI fields
-        self.sync_ui_from_settings();
-
-        // Handle temporal edges - toggle them based on new view mode
-        let temporal_enabled = self.settings.temporal_attraction_enabled;
-        if self.graph.temporal_attraction_enabled != temporal_enabled {
-            self.graph.set_temporal_attraction_enabled(temporal_enabled);
-        }
-
-        self.mark_settings_dirty();
     }
 
     fn load_graph(&mut self) {
@@ -1401,9 +1313,57 @@ impl DashboardApp {
         }
     }
 
-    /// Render the beads panel (issues/tasks) with lazy loading and virtual scrolling
+    /// Render the beads panel (issues/tasks)
     fn render_beads_panel(&mut self, ui: &mut egui::Ui) {
-        crate::beads::render_beads_panel(ui, &mut self.bead_loader, self.beads_panel_open);
+        ui.horizontal(|ui| {
+            ui.heading("Beads");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("B to toggle")
+                        .small()
+                        .color(theme::text::MUTED)
+                );
+            });
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // Placeholder content - beads data integration would go here
+            ui.label(
+                egui::RichText::new("Issue tracking panel")
+                    .color(theme::text::SECONDARY)
+            );
+            ui.add_space(16.0);
+
+            // Sample structure showing what the panel would contain
+            ui.label(egui::RichText::new("Ready").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No ready issues")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("In Progress").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No issues in progress")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("Blocked").strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("No blocked issues")
+                    .color(theme::text::MUTED)
+                    .italics()
+            );
+        });
     }
 
     /// Render the mail panel (inbox/outbox)
@@ -1520,9 +1480,6 @@ impl DashboardApp {
                         self.layout.size_physics_weight = 0.0;
                         self.pan_offset = Vec2::ZERO;
                         self.zoom = 1.0;
-                        self.time_zoom = 1.0;
-                        self.attention_zoom = 1.0;
-                        self.time_pan = 0.0;
                         self.load_graph();
                     }
                 });
@@ -1664,27 +1621,6 @@ impl DashboardApp {
                 }
             });
 
-        // View Mode section
-        egui::CollapsingHeader::new("View Mode")
-            .default_open(true)
-            .show(ui, |ui| {
-                let current_mode = self.settings.view_mode;
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(current_mode == ViewMode::ForceDirected, ViewMode::ForceDirected.label())
-                        .on_hover_text("Standard force-directed layout with full physics simulation")
-                        .clicked() && current_mode != ViewMode::ForceDirected
-                    {
-                        self.switch_view_mode(ViewMode::ForceDirected);
-                    }
-                    if ui.selectable_label(current_mode == ViewMode::Timeline, ViewMode::Timeline.label())
-                        .on_hover_text("Timeline layout: X = time, Y = physics. Temporal edges disabled.")
-                        .clicked() && current_mode != ViewMode::Timeline
-                    {
-                        self.switch_view_mode(ViewMode::Timeline);
-                    }
-                });
-            });
-
         // Display section
         egui::CollapsingHeader::new("Display")
             .default_open(true)
@@ -1736,44 +1672,6 @@ impl DashboardApp {
                         self.graph.randomize_hue_offset();
                     }
                 });
-
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.label("View:");
-                    if ui.selectable_label(self.view_mode == ViewMode::ForceDirected, "🔮 Force")
-                        .on_hover_text("Force-directed physics layout")
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::ForceDirected;
-                        self.mark_settings_dirty();
-                    }
-                    if ui.selectable_label(self.view_mode == ViewMode::Timeline, "📊 Timeline")
-                        .on_hover_text("Timeline view: X = time, Y = attention distance from user")
-                        .clicked()
-                    {
-                        self.view_mode = ViewMode::Timeline;
-                        self.mark_settings_dirty();
-                    }
-                });
-
-                ui.add_space(5.0);
-                ui.separator();
-                ui.add_space(5.0);
-
-                // Token histogram panel toggle
-                if ui.checkbox(&mut self.histogram_panel_enabled, "📊 Token Histogram Panel")
-                    .on_hover_text("Show token usage histogram in a split pane")
-                    .changed()
-                {
-                    self.mark_settings_dirty();
-                }
-
-                if self.histogram_panel_enabled {
-                    ui.label(format!("Split ratio: {:.0}% / {:.0}%",
-                        self.histogram_split_ratio * 100.0,
-                        (1.0 - self.histogram_split_ratio) * 100.0
-                    ));
-                }
             });
 
         // Node Sizing section
@@ -2243,17 +2141,8 @@ impl DashboardApp {
             if ui.button("Reset View").clicked() {
                 self.pan_offset = Vec2::ZERO;
                 self.zoom = 1.0;
-                self.time_zoom = 1.0;
-                self.attention_zoom = 1.0;
-                self.time_pan = 0.0;
             }
-            // Show appropriate zoom based on view mode
-            if self.view_mode == ViewMode::Timeline {
-                ui.label(format!("Time: {:.0}% | Attn: {:.0}%",
-                    self.time_zoom * 100.0, self.attention_zoom * 100.0));
-            } else {
-                ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
-            }
+            ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
         });
 
         ui.add_space(10.0);
@@ -2348,6 +2237,112 @@ impl DashboardApp {
         }
     }
 
+    /// Render the first-run / empty-database welcome screen.
+    fn render_empty_state(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size();
+        ui.allocate_new_ui(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(
+                ui.max_rect().center(),
+                egui::vec2(available.x.min(520.0), available.y),
+            )),
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(available.y * 0.25);
+
+                    ui.label(
+                        egui::RichText::new("Welcome to Claude Activity Dashboard")
+                            .size(22.0)
+                            .color(theme::text::PRIMARY)
+                            .strong(),
+                    );
+                    ui.add_space(12.0);
+
+                    // Show DB error if present, otherwise show empty-data guidance
+                    if let Some(ref err) = self.db_error {
+                        ui.label(
+                            egui::RichText::new(format!("Database error: {}", err))
+                                .size(14.0)
+                                .color(theme::accent::RED),
+                        );
+                        ui.add_space(8.0);
+                        if ui.button("Retry connection").clicked() {
+                            self.reconnect_db();
+                            if self.db_connected {
+                                self.load_graph();
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "No conversation data found.\nImport your Claude Code history to get started.",
+                            )
+                            .size(14.0)
+                            .color(theme::text::SECONDARY),
+                        );
+                    }
+
+                    ui.add_space(20.0);
+
+                    // Instructions
+                    egui::Frame::none()
+                        .fill(theme::bg::SURFACE)
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::same(16.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Getting started")
+                                    .size(14.0)
+                                    .color(theme::text::PRIMARY)
+                                    .strong(),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Run the ingestion tool to import sessions:\n\n\
+                                     dashboard-native ingest\n\n\
+                                     Or import only recent history:\n\n\
+                                     dashboard-native ingest --since 7d",
+                                )
+                                .size(13.0)
+                                .color(theme::text::SECONDARY)
+                                .family(egui::FontFamily::Monospace),
+                            );
+                        });
+
+                    ui.add_space(16.0);
+
+                    // Database path info
+                    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| {
+                        dirs::config_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("dashboard-native")
+                            .join("dashboard.db")
+                            .to_string_lossy()
+                            .to_string()
+                    });
+                    ui.label(
+                        egui::RichText::new(format!("Database: {}", db_path))
+                            .size(11.0)
+                            .color(theme::text::MUTED),
+                    );
+
+                    ui.add_space(16.0);
+
+                    if ui.button("Refresh").clicked() {
+                        if self.db_connected {
+                            self.load_graph();
+                        } else {
+                            self.reconnect_db();
+                            if self.db_connected {
+                                self.load_graph();
+                            }
+                        }
+                    }
+                });
+            },
+        );
+    }
+
     fn render_graph(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = response.rect;
@@ -2358,65 +2353,28 @@ impl DashboardApp {
         let zoom_delta = ui.input(|i| i.zoom_delta());
         let hover_pos = response.hover_pos();
 
-        // Get modifier keys for alt navigation modes
-        let shift_held = ui.input(|i| i.modifiers.shift);
+        // Handle click-drag pan (for mouse users)
+        if response.dragged_by(egui::PointerButton::Primary) {
+            self.pan_offset += response.drag_delta();
+        }
 
-        // Handle input differently based on view mode
-        if self.view_mode == ViewMode::Timeline {
-            // Timeline mode: separate X (time) and Y (attention) navigation
+        // Handle two-finger scroll pan (for trackpad users)
+        // Apply before zoom so cursor-anchored zoom works correctly
+        if scroll_delta != egui::Vec2::ZERO && response.hovered() {
+            self.pan_offset += scroll_delta;
+        }
 
-            // Click-drag: horizontal = time pan, vertical = attention pan (for now, both adjust position)
-            if response.dragged_by(egui::PointerButton::Primary) {
-                let drag = response.drag_delta();
-                // Convert screen drag to normalized time pan
-                // Negative because dragging right should show earlier time (move left in time)
-                self.time_pan += drag.x / (rect.width() * self.time_zoom);
-            }
+        // Handle pinch-to-zoom and Ctrl+scroll (cursor-anchored)
+        if let Some(cursor_pos) = hover_pos {
+            if zoom_delta != 1.0 {
+                let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
 
-            // Two-finger scroll: horizontal = time pan, vertical = unused (or could pan Y)
-            if scroll_delta != egui::Vec2::ZERO && response.hovered() {
-                // Horizontal scroll pans through time
-                self.time_pan += scroll_delta.x / (rect.width() * self.time_zoom);
-            }
+                // Zoom toward cursor: adjust pan so point under cursor stays fixed
+                let cursor_offset = cursor_pos - center - self.pan_offset;
+                let zoom_factor = 1.0 - new_zoom / self.zoom;
+                self.pan_offset += cursor_offset * zoom_factor;
 
-            // Pinch-to-zoom: default = time zoom, Shift = attention zoom
-            if let Some(_cursor_pos) = hover_pos {
-                if zoom_delta != 1.0 {
-                    if shift_held {
-                        // Shift+pinch: zoom attention axis (Y)
-                        self.attention_zoom = (self.attention_zoom * zoom_delta).clamp(0.1, 10.0);
-                    } else {
-                        // Normal pinch: zoom time axis (X)
-                        self.time_zoom = (self.time_zoom * zoom_delta).clamp(0.1, 10.0);
-                    }
-                }
-            }
-        } else {
-            // Force-directed mode: traditional pan/zoom behavior
-
-            // Handle click-drag pan (for mouse users)
-            if response.dragged_by(egui::PointerButton::Primary) {
-                self.pan_offset += response.drag_delta();
-            }
-
-            // Handle two-finger scroll pan (for trackpad users)
-            // Apply before zoom so cursor-anchored zoom works correctly
-            if scroll_delta != egui::Vec2::ZERO && response.hovered() {
-                self.pan_offset += scroll_delta;
-            }
-
-            // Handle pinch-to-zoom and Ctrl+scroll (cursor-anchored)
-            if let Some(cursor_pos) = hover_pos {
-                if zoom_delta != 1.0 {
-                    let new_zoom = (self.zoom * zoom_delta).clamp(0.005, 5.0);
-
-                    // Zoom toward cursor: adjust pan so point under cursor stays fixed
-                    let cursor_offset = cursor_pos - center - self.pan_offset;
-                    let zoom_factor = 1.0 - new_zoom / self.zoom;
-                    self.pan_offset += cursor_offset * zoom_factor;
-
-                    self.zoom = new_zoom;
-                }
+                self.zoom = new_zoom;
             }
         }
 
@@ -2424,58 +2382,21 @@ impl DashboardApp {
         // Only simulate visible nodes (respects timeline + importance filters)
         let physics_visible = self.compute_physics_visible_nodes();
         let node_sizes = self.compute_node_sizes();
-
-        // Choose physics algorithm based on view mode
-        match self.view_mode {
-            ViewMode::ForceDirected => {
-                self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
-            }
-            ViewMode::Timeline => {
-                self.layout.step_timeline(
-                    &mut self.graph,
-                    rect,
-                    physics_visible.as_ref(),
-                    node_sizes.as_ref(),
-                    self.settings.timeline_spacing_even
-                );
-            }
-        }
+        self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
 
         // Cache values for transform closure to avoid borrowing self
         let pan_offset = self.pan_offset;
         let zoom = self.zoom;
-        let view_mode = self.view_mode;
-        let time_zoom = self.time_zoom;
-        let attention_zoom = self.attention_zoom;
-        let time_pan = self.time_pan;
 
         // Transform helper: graph space -> screen space
-        // Behavior differs by view mode
+        // Pan is in screen space (applied after zoom) for 1:1 movement at any zoom level
         let transform = |pos: Pos2| -> Pos2 {
-            if view_mode == ViewMode::Timeline {
-                // Timeline mode: independent X (time) and Y (attention) transforms
-                let centered = pos.to_vec2() - center.to_vec2();
-                // Apply separate zoom factors and time pan (normalized, scaled by width)
-                let x = center.x + centered.x * time_zoom + time_pan * rect.width() * time_zoom;
-                let y = center.y + centered.y * attention_zoom;
-                Pos2::new(x, y)
-            } else {
-                // Force-directed mode: uniform zoom with pan
-                let centered = pos.to_vec2() - center.to_vec2();
-                center + centered * zoom + pan_offset
-            }
+            let centered = pos.to_vec2() - center.to_vec2();
+            center + centered * zoom + pan_offset
         };
 
         // Use cached semantic filter visible set (computed once per frame in update())
         let semantic_visible = self.semantic_filter_cache.clone();
-
-        // Draw y=0 axis line (user message spine) - subtle horizontal line
-        let y_zero_screen = transform(Pos2::new(0.0, 0.0)).y;
-        let axis_color = Color32::from_rgba_unmultiplied(120, 125, 135, 80); // Subtle grey with transparency
-        painter.line_segment(
-            [Pos2::new(rect.left(), y_zero_screen), Pos2::new(rect.right(), y_zero_screen)],
-            Stroke::new(1.0, axis_color)
-        );
 
         // Draw edges first (behind nodes)
         for edge in &self.graph.data.edges {
@@ -3002,410 +2923,6 @@ impl DashboardApp {
         }
     }
 
-    /// Render split view with graph on left and histogram on right
-    fn render_split_view(&mut self, ui: &mut egui::Ui) {
-        let available = ui.available_rect_before_wrap();
-
-        // Calculate split dimensions
-        let divider_width = 4.0;
-        let graph_width = available.width() * self.histogram_split_ratio - divider_width / 2.0;
-        let histogram_width = available.width() * (1.0 - self.histogram_split_ratio) - divider_width / 2.0;
-
-        // Graph panel (left)
-        let graph_rect = egui::Rect::from_min_size(
-            available.min,
-            egui::vec2(graph_width, available.height()),
-        );
-
-        // Divider (center)
-        let divider_rect = egui::Rect::from_min_size(
-            egui::pos2(available.min.x + graph_width, available.min.y),
-            egui::vec2(divider_width, available.height()),
-        );
-
-        // Histogram panel (right)
-        let histogram_rect = egui::Rect::from_min_size(
-            egui::pos2(available.min.x + graph_width + divider_width, available.min.y),
-            egui::vec2(histogram_width, available.height()),
-        );
-
-        // Render graph in left pane
-        let mut graph_ui = ui.new_child(egui::UiBuilder::new().max_rect(graph_rect));
-        self.render_graph(&mut graph_ui);
-
-        // Render draggable divider
-        self.render_divider(ui, divider_rect);
-
-        // Render histogram in right pane
-        let mut histogram_ui = ui.new_child(egui::UiBuilder::new().max_rect(histogram_rect));
-        self.render_token_histogram(&mut histogram_ui);
-    }
-
-    /// Render the draggable divider between graph and histogram
-    fn render_divider(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-
-        // Handle dragging
-        if response.dragged() {
-            let drag_delta_x = response.drag_delta().x;
-            let available_width = ui.available_width();
-            let ratio_delta = drag_delta_x / available_width;
-            self.histogram_split_ratio = (self.histogram_split_ratio + ratio_delta).clamp(0.2, 0.8);
-            self.histogram_dragging_divider = true;
-            self.mark_settings_dirty();
-        } else if self.histogram_dragging_divider && !response.is_pointer_button_down_on() {
-            self.histogram_dragging_divider = false;
-        }
-
-        // Visual feedback
-        let color = if response.hovered() || self.histogram_dragging_divider {
-            theme::border::FOCUS
-        } else {
-            theme::border::SUBTLE
-        };
-
-        ui.painter().rect_filled(rect, 0.0, color);
-
-        // Change cursor on hover
-        if response.hovered() || self.histogram_dragging_divider {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
-    }
-
-    /// Get the color for a session in the histogram, matching graph node colors
-    fn histogram_session_color(&self, session_id: &str, project: &str) -> egui::Color32 {
-        use crate::graph::types::{ColorMode, hsl_to_rgb};
-        match self.graph.color_mode {
-            ColorMode::Project if !project.is_empty() => {
-                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
-                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.55)
-            }
-            ColorMode::Hybrid if !project.is_empty() => {
-                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
-                let t = self.graph.session_position_in_project(session_id, project);
-                let sat = 0.5 + t * 0.4;
-                let light = 0.65 - t * 0.2;
-                hsl_to_rgb(self.graph.apply_hue_offset(hue), sat, light)
-            }
-            _ => {
-                let hue = self.graph.session_colors.get(session_id).copied().unwrap_or(0.0);
-                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.5)
-            }
-        }
-    }
-
-    /// Render the token usage histogram
-    fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Token Usage");
-            });
-
-            ui.separator();
-
-            let bins = self.aggregate_token_bins();
-
-            if bins.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No token data available");
-                });
-                return;
-            }
-
-            self.render_histogram_bars(ui, &bins);
-        });
-    }
-
-    /// Render the histogram bars using direct painter calls (no per-bar layout = no gaps).
-    /// Session-colored stacking, trackpad zoom/pan, tick-mark date labels.
-    fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
-        if bins.is_empty() {
-            return;
-        }
-
-        let max_total = bins.iter()
-            .map(|b| b.total_tokens)
-            .max()
-            .unwrap_or(1);
-
-        let bar_width = self.histogram_bar_width;
-        let label_height = 20.0;
-        let available_height = (ui.available_height() - label_height).max(40.0);
-        let total_width = bins.len() as f32 * bar_width;
-
-        // Allocate one big rect for the entire histogram
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(total_width.max(ui.available_width()), available_height + label_height),
-            egui::Sense::click_and_drag(),
-        );
-
-        let bar_area = egui::Rect::from_min_size(rect.min, egui::vec2(total_width, available_height));
-        let painter = ui.painter_at(rect);
-
-        // Handle trackpad zoom and pan
-        // Two-finger swipe (both axes) pans, pinch/cmd+scroll zooms
-        let pointer_over = ui.rect_contains_pointer(rect);
-        if pointer_over {
-            let scroll = ui.input(|i| i.smooth_scroll_delta);
-            let modifiers = ui.input(|i| i.modifiers);
-
-            if modifiers.command {
-                // Zoom: cmd + scroll Y (pinch gesture)
-                let zoom_delta = scroll.y * 0.01;
-                self.histogram_bar_width = (self.histogram_bar_width * (1.0 + zoom_delta)).clamp(8.0, 120.0);
-            } else {
-                // Pan: two-finger swipe (use both x and y for natural trackpad feel)
-                // On macOS, horizontal swipe = scroll.x, vertical swipe = scroll.y
-                // Map vertical scroll to horizontal panning too (most natural gesture)
-                let pan = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
-                self.histogram_scroll_offset -= pan;
-            }
-        }
-
-        // Pan via drag
-        if response.dragged() {
-            self.histogram_scroll_offset -= response.drag_delta().x;
-        }
-
-        // Clamp scroll offset
-        let max_scroll = (total_width - rect.width()).max(0.0);
-        self.histogram_scroll_offset = self.histogram_scroll_offset.clamp(0.0, max_scroll);
-
-        // Determine which bin is hovered
-        let mut hovered_bin_idx: Option<usize> = None;
-
-        if let Some(pointer) = response.hover_pos() {
-            let rel_x = pointer.x - rect.min.x + self.histogram_scroll_offset;
-            let bin_idx = (rel_x / bar_width) as usize;
-            if bin_idx < bins.len() && pointer.y >= rect.min.y && pointer.y <= rect.min.y + available_height {
-                hovered_bin_idx = Some(bin_idx);
-            }
-        }
-        self.histogram_hovered_bin = hovered_bin_idx;
-
-        // Paint bars directly
-        for (i, bin) in bins.iter().enumerate() {
-            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
-
-            // Skip bars outside visible area
-            if bar_x + bar_width < rect.min.x || bar_x > rect.max.x {
-                continue;
-            }
-
-            if bin.total_tokens > 0 {
-                let scale = available_height / max_total as f32;
-                let mut y_offset = 0.0;
-
-                // Draw session segments bottom to top (sorted largest first = bottom)
-                for session in &bin.sessions {
-                    let height = session.total_tokens as f32 * scale;
-                    let seg_rect = egui::Rect::from_min_size(
-                        egui::pos2(bar_x, bar_area.max.y - y_offset - height),
-                        egui::vec2(bar_width, height),
-                    );
-                    let color = self.histogram_session_color(&session.session_id, &session.project);
-                    painter.rect_filled(seg_rect, 0.0, color);
-                    y_offset += height;
-                }
-            }
-        }
-
-        // Date labels: tick marks at regular intervals
-        let label_interval = ((60.0 / bar_width).ceil() as usize).max(1); // ~60px between labels
-        for (i, bin) in bins.iter().enumerate() {
-            if i % label_interval != 0 {
-                continue;
-            }
-            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
-            if bar_x < rect.min.x - bar_width || bar_x > rect.max.x + bar_width {
-                continue;
-            }
-
-            let tick_top = rect.min.y + available_height;
-            let tick_bottom = tick_top + 4.0;
-            let label_color = theme::text::SECONDARY;
-
-            // Tick mark
-            painter.line_segment(
-                [egui::pos2(bar_x, tick_top), egui::pos2(bar_x, tick_bottom)],
-                egui::Stroke::new(1.0, label_color),
-            );
-
-            // Label
-            let label = format_timestamp(&bin.timestamp_start);
-            painter.text(
-                egui::pos2(bar_x + 2.0, tick_bottom + 1.0),
-                egui::Align2::LEFT_TOP,
-                &label,
-                egui::FontId::proportional(10.0),
-                label_color,
-            );
-        }
-
-        // Hover tooltip
-        if let Some(idx) = hovered_bin_idx {
-            let bin = &bins[idx];
-            let bar_x = rect.min.x + idx as f32 * bar_width - self.histogram_scroll_offset;
-            let tooltip_rect = egui::Rect::from_min_size(
-                egui::pos2(bar_x, rect.min.y),
-                egui::vec2(bar_width, available_height),
-            );
-            // Show hover highlight
-            painter.rect_filled(
-                tooltip_rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-            );
-
-            egui::show_tooltip_at_pointer(ui.ctx(), egui::LayerId::new(egui::Order::Tooltip, ui.id().with("hist_layer")), ui.id().with("hist_tooltip"), |ui| {
-                ui.label(format!("{} - {}",
-                    format_timestamp(&bin.timestamp_start),
-                    format_timestamp(&bin.timestamp_end)
-                ));
-                ui.separator();
-                for session in &bin.sessions {
-                    let color = self.histogram_session_color(&session.session_id, &session.project);
-                    let label = if session.project.is_empty() {
-                        format!("{}: {} tokens", &session.session_id[..8.min(session.session_id.len())], session.total_tokens)
-                    } else {
-                        format!("{}: {} tokens", session.project, session.total_tokens)
-                    };
-                    ui.colored_label(color, label);
-                }
-                ui.separator();
-                ui.label(format!("Total: {} tokens", bin.total_tokens));
-            });
-        }
-    }
-
-    /// Aggregate token usage into time bins by session (respects timeline visibility)
-    fn aggregate_token_bins(&self) -> Vec<TokenBin> {
-        use chrono::{DateTime, Utc};
-        use std::collections::HashMap;
-
-        // Collect all nodes with token data and valid timestamps
-        // Now we track session_id and project per node
-        let mut timestamped_nodes: Vec<_> = self.graph.data.nodes.iter()
-            .filter_map(|node| {
-                // Skip nodes hidden by timeline
-                if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
-                    return None;
-                }
-
-                let ts = node.timestamp.as_ref()?;
-                let total = node.input_tokens.unwrap_or(0)
-                    + node.output_tokens.unwrap_or(0)
-                    + node.cache_read_tokens.unwrap_or(0)
-                    + node.cache_creation_tokens.unwrap_or(0);
-
-                if total == 0 {
-                    return None;
-                }
-
-                Some((ts.clone(), node.session_id.clone(), node.project.clone(), total as i64))
-            })
-            .collect();
-
-        if timestamped_nodes.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by timestamp
-        timestamped_nodes.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Parse timestamps
-        let parsed_nodes: Vec<_> = timestamped_nodes.iter()
-            .filter_map(|(ts, session_id, project, total)| {
-                let parsed = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
-                Some((parsed, session_id.clone(), project.clone(), *total))
-            })
-            .collect();
-
-        if parsed_nodes.is_empty() {
-            return Vec::new();
-        }
-
-        // When timeline scrubber is active, synchronize histogram to the visible window
-        let (start_time, bin_duration_secs, bin_count) = if self.timeline_enabled {
-            let scrubber_start_epoch = self.graph.timeline.time_at_position(self.graph.timeline.start_position);
-            let scrubber_end_epoch = self.graph.timeline.time_at_position(self.graph.timeline.position);
-            let visible_range_secs = (scrubber_end_epoch - scrubber_start_epoch).max(1.0);
-
-            let start_dt = DateTime::<Utc>::from_timestamp(scrubber_start_epoch as i64, 0)
-                .unwrap_or_else(|| parsed_nodes.first().unwrap().0);
-
-            let raw_bin = visible_range_secs / 20.0;
-            let bin_dur = if raw_bin <= 60.0 { 60 }
-                else if raw_bin <= 5.0 * 60.0 { 5 * 60 }
-                else if raw_bin <= 15.0 * 60.0 { 15 * 60 }
-                else if raw_bin <= 30.0 * 60.0 { 30 * 60 }
-                else if raw_bin <= 3600.0 { 3600 }
-                else if raw_bin <= 3.0 * 3600.0 { 3 * 3600 }
-                else if raw_bin <= 6.0 * 3600.0 { 6 * 3600 }
-                else if raw_bin <= 12.0 * 3600.0 { 12 * 3600 }
-                else if raw_bin <= 86400.0 { 86400 }
-                else { (7 * 86400_i64).max(raw_bin as i64) };
-
-            let count = ((visible_range_secs / bin_dur as f64).ceil() as usize).max(1);
-            (start_dt, bin_dur, count)
-        } else {
-            let bin_dur = self.time_range.bin_duration_secs() as i64;
-            let data_start = parsed_nodes.first().unwrap().0;
-            let data_end = parsed_nodes.last().unwrap().0;
-            let range_secs = (data_end - data_start).num_seconds();
-            let count = ((range_secs as f64 / bin_dur as f64).ceil() as usize).max(1);
-            (data_start, bin_dur, count)
-        };
-
-        // Initialize bins with session-level tracking
-        // Use a HashMap per bin to accumulate session tokens, then convert to Vec
-        let mut bin_session_maps: Vec<HashMap<String, (String, i64)>> = Vec::new();
-        let mut bins = Vec::new();
-        for i in 0..bin_count {
-            let bin_start = start_time + chrono::Duration::seconds(i as i64 * bin_duration_secs);
-            let bin_end = start_time + chrono::Duration::seconds((i as i64 + 1) * bin_duration_secs);
-
-            bins.push(TokenBin {
-                timestamp_start: bin_start.to_rfc3339(),
-                timestamp_end: bin_end.to_rfc3339(),
-                sessions: Vec::new(),
-                total_tokens: 0,
-            });
-            bin_session_maps.push(HashMap::new());
-        }
-
-        // Aggregate nodes into bins by session
-        for (timestamp, session_id, project, total) in parsed_nodes {
-            let offset = (timestamp - start_time).num_seconds();
-            if offset < 0 { continue; }
-            let bin_index = (offset / bin_duration_secs) as usize;
-            if bin_index < bins.len() {
-                let entry = bin_session_maps[bin_index]
-                    .entry(session_id.clone())
-                    .or_insert_with(|| (project.clone(), 0));
-                entry.1 += total;
-            }
-        }
-
-        // Convert session maps into sorted SessionTokens vecs
-        for (i, session_map) in bin_session_maps.into_iter().enumerate() {
-            let mut sessions: Vec<SessionTokens> = session_map
-                .into_iter()
-                .map(|(session_id, (project, total))| SessionTokens {
-                    session_id,
-                    project,
-                    total_tokens: total,
-                })
-                .collect();
-            // Sort by total descending for stable stacking (largest at bottom)
-            sessions.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
-            bins[i].total_tokens = sessions.iter().map(|s| s.total_tokens).sum();
-            bins[i].sessions = sessions;
-        }
-
-        bins
-    }
-
     fn render_timeline(&mut self, ui: &mut egui::Ui) {
         if self.graph.timeline.timestamps.is_empty() {
             ui.label("No timestamped nodes");
@@ -3484,19 +3001,6 @@ impl DashboardApp {
             let view_tooltip = if histogram_mode { "Histogram view (click for notches)" } else { "Notch view (click for histogram)" };
             if ui.button(view_label).on_hover_text(view_tooltip).clicked() {
                 self.timeline_histogram_mode = !self.timeline_histogram_mode;
-            }
-
-            ui.separator();
-
-            // Spacing mode toggle
-            let spacing_label = if self.settings.timeline_spacing_even { "═" } else { "≈" };
-            let spacing_tooltip = if self.settings.timeline_spacing_even {
-                "Even spacing (click for time-proportional)"
-            } else {
-                "Time-proportional spacing (click for even)"
-            };
-            if ui.button(spacing_label).on_hover_text(spacing_tooltip).clicked() {
-                self.settings.timeline_spacing_even = !self.settings.timeline_spacing_even;
             }
         });
 
@@ -3912,12 +3416,12 @@ impl eframe::App for DashboardApp {
                 });
         }
 
-        // Main graph area - with optional histogram split
+        // Main graph area
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::bg::GRAPH))
             .show(ctx, |ui| {
-                if self.histogram_panel_enabled {
-                    self.render_split_view(ui);
+                if !self.db_connected || (!self.loading && self.graph.data.nodes.is_empty()) {
+                    self.render_empty_state(ui);
                 } else {
                     self.render_graph(ui);
                 }
@@ -3963,16 +3467,5 @@ fn truncate_lines(s: &str, max_lines: usize, max_chars_per_line: usize) -> Strin
         format!("{}...", result)
     } else {
         result
-    }
-}
-
-/// Format an RFC3339 timestamp to a human-readable format
-fn format_timestamp(ts: &str) -> String {
-    use chrono::DateTime;
-
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
-        parsed.format("%b %d %H:%M").to_string()
-    } else {
-        ts.to_string()
     }
 }

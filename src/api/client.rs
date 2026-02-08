@@ -6,7 +6,9 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-const API_BASE: &str = "http://127.0.0.1:8000";
+fn api_base() -> String {
+    std::env::var("API_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+}
 
 #[derive(Debug, Deserialize)]
 struct GraphResponse {
@@ -64,7 +66,7 @@ impl ApiClient {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
-            base_url: API_BASE.to_string(),
+            base_url: api_base(),
         }
     }
 
