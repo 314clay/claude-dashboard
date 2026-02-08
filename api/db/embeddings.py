@@ -272,12 +272,20 @@ def search_by_query(query_text: str) -> dict[int, float]:
         return {}
 
     # Cosine similarity = dot product of normalized vectors
+    # Raw cosine for text embeddings is always ~0.3-0.9, so use raw values
+    # then min-max normalize per query to stretch to full 0.0-1.0 range
     similarities = cache["matrix"] @ query_vec
 
-    # Convert to dict, mapping cosine similarity from [-1, 1] to [0, 1]
+    raw_min = float(similarities.min())
+    raw_max = float(similarities.max())
+    spread = raw_max - raw_min
+
     scores = {}
     for i, msg_id in enumerate(cache["message_ids"]):
-        score = float((similarities[i] + 1.0) / 2.0)  # Remap to 0-1
+        if spread > 0:
+            score = float((similarities[i] - raw_min) / spread)
+        else:
+            score = 0.5
         scores[msg_id] = score
 
     return scores
