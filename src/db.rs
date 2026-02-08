@@ -112,14 +112,21 @@ impl DbClient {
             // Split on semicolons and execute each statement individually
             // because sqlx doesn't support multiple statements in one query for SQLite.
             for statement in SCHEMA_SQL.split(';') {
-                let trimmed = statement.trim();
-                if trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with("PRAGMA") {
+                // Strip SQL comment lines before checking if the segment is empty,
+                // because comments and CREATE TABLE share the same ;-delimited block.
+                let sql: String = statement
+                    .lines()
+                    .filter(|line| !line.trim().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let sql = sql.trim();
+                if sql.is_empty() || sql.starts_with("PRAGMA") {
                     continue;
                 }
-                sqlx::query(trimmed)
+                sqlx::query(sql)
                     .execute(&pool)
                     .await
-                    .map_err(|e| format!("Schema init failed on: {}... — {}", &trimmed[..trimmed.len().min(60)], e))?;
+                    .map_err(|e| format!("Schema init failed on: {}... — {}", &sql[..sql.len().min(60)], e))?;
             }
 
             Ok::<SqlitePool, String>(pool)
