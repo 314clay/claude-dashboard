@@ -227,7 +227,30 @@ pub struct DashboardApp {
 }
 
 impl DashboardApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Configure fonts - add emoji support
+        // egui's default font doesn't include emoji glyphs, so we load NotoEmoji
+        // as a fallback font for both Proportional and Monospace families.
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "NotoEmoji".to_owned(),
+            egui::FontData::from_static(include_bytes!(
+                "../assets/fonts/NotoEmoji-Regular.ttf"
+            )),
+        );
+        // Add NotoEmoji as fallback (after the default fonts) for both families
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("NotoEmoji".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("NotoEmoji".to_owned());
+        cc.egui_ctx.set_fonts(fonts);
+
         // Load saved settings
         let settings = Settings::load();
 
