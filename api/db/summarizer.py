@@ -81,13 +81,13 @@ def _extract_json(text: str) -> dict | None:
 
 def generate_session_summary(session_id: str) -> dict | None:
     """Generate a summary for a session using the configured LLM."""
-    messages_df = get_session_messages(session_id)
-    if messages_df.empty:
+    messages = get_session_messages(session_id)
+    if not messages:
         return None
 
     # Build conversation text
     conversation_parts = []
-    for _, msg in messages_df.iterrows():
+    for msg in messages:
         role = "USER" if msg['role'] == 'user' else "CLAUDE"
         content = msg['content'] or ""
         if len(content) > 2000:
@@ -162,15 +162,15 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
 
     print(f"Cache miss - generating partial summary for {session_id[:8]}...@{before_timestamp}")
 
-    messages_df = get_session_messages_before(session_id, before_timestamp)
-    if messages_df.empty:
+    messages = get_session_messages_before(session_id, before_timestamp)
+    if not messages:
         return None
 
-    user_count = len(messages_df[messages_df['role'] == 'user'])
-    assistant_count = len(messages_df[messages_df['role'] == 'assistant'])
+    user_count = sum(1 for m in messages if m['role'] == 'user')
+    assistant_count = sum(1 for m in messages if m['role'] == 'assistant')
 
     conversation_parts = []
-    for _, msg in messages_df.iterrows():
+    for msg in messages:
         role = "USER" if msg['role'] == 'user' else "CLAUDE"
         content = msg['content'] or ""
         if len(content) > 2000:

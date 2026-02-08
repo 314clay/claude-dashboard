@@ -31,7 +31,10 @@ def get_all_filters() -> list[dict]:
     cur.close()
     conn.close()
 
-    return [dict(row) for row in rows]
+    filters = [dict(row) for row in rows]
+    for f in filters:
+        f['is_active'] = bool(f.get('is_active'))
+    return filters
 
 
 def create_filter(name: str, query_text: str) -> dict:
@@ -69,7 +72,9 @@ def create_filter(name: str, query_text: str) -> dict:
     cur.close()
     conn.close()
 
-    return dict(row)
+    result = dict(row)
+    result['is_active'] = bool(result.get('is_active'))
+    return result
 
 
 def delete_filter(filter_id: int) -> bool:

@@ -404,11 +404,22 @@ impl ApiClient {
             return Err(format!("API error: {}", resp.status()));
         }
 
-        let filter: SemanticFilter = resp
+        #[derive(Deserialize)]
+        struct CreateResponse {
+            success: bool,
+            filter: Option<SemanticFilter>,
+            error: Option<String>,
+        }
+
+        let response: CreateResponse = resp
             .json()
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        Ok(filter)
+        if !response.success {
+            return Err(response.error.unwrap_or_else(|| "Unknown error".to_string()));
+        }
+
+        response.filter.ok_or_else(|| "No filter in response".to_string())
     }
 
     /// Delete a semantic filter
