@@ -1,6 +1,6 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, RescoreEvent, RescoreProgress, RescoreResult};
+use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
@@ -196,6 +196,17 @@ pub struct DashboardApp {
     // Cached semantic filter visible set (invalidate on filter change or data load)
     semantic_filter_cache: Option<HashSet<String>>,
 
+    // Similarity search (embedding-based)
+    similarity_query: String,
+    similarity_scores: HashMap<String, f32>,  // message_id -> score
+    similarity_threshold: f32,
+    similarity_active: bool,
+    similarity_loading: bool,
+    similarity_receiver: Option<Receiver<Result<HashMap<String, f32>, String>>>,
+    embedding_stats: Option<EmbeddingStats>,
+    embedding_gen_loading: bool,
+    embedding_gen_receiver: Option<Receiver<Result<EmbeddingGenResult, String>>>,
+
     // Summary caches (populated on double-click, shown in tooltip)
     point_in_time_summary_cache: HashMap<String, PartialSummaryData>,  // node_id -> summary
     session_summary_cache: HashMap<String, SessionSummaryData>,        // session_id -> summary
@@ -324,6 +335,17 @@ impl DashboardApp {
             categorizing_filter_id: None,
             categorization_receiver: None,
             semantic_filter_cache: None,
+
+            // Similarity search
+            similarity_query: String::new(),
+            similarity_scores: HashMap::new(),
+            similarity_threshold: 0.0,
+            similarity_active: false,
+            similarity_loading: false,
+            similarity_receiver: None,
+            embedding_stats: None,
+            embedding_gen_loading: false,
+            embedding_gen_receiver: None,
 
             // Summary caches
             point_in_time_summary_cache: HashMap::new(),
@@ -475,6 +497,9 @@ impl DashboardApp {
 
                 // Load semantic filters from API
                 self.load_semantic_filters();
+
+                // Load embedding stats
+                self.load_embedding_stats();
 
                 // Update last synced timestamp
                 self.last_synced = Some(Instant::now());
@@ -798,7 +823,7 @@ impl DashboardApp {
     fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
         // If no filters active, return None (simulate all)
         let semantic_filter_active = self.has_active_semantic_filters();
-        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active {
+        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.similarity_active {
             return None;
         }
 
@@ -827,6 +852,14 @@ impl DashboardApp {
             if let Some(ref sem_visible) = semantic_visible {
                 if !sem_visible.contains(&node.id) {
                     continue;
+                }
+            }
+            // Similarity filter
+            if self.similarity_active {
+                if let Some(&score) = self.similarity_scores.get(&node.id) {
+                    if score < self.similarity_threshold {
+                        continue;
+                    }
                 }
             }
             visible.insert(node.id.clone());
@@ -1017,6 +1050,59 @@ impl DashboardApp {
         // Store the receiver to check later
         // We'll check this in the update loop
         self.categorization_receiver = Some(rx);
+    }
+
+    /// Trigger similarity search (runs in background)
+    fn trigger_similarity_search(&mut self) {
+        let query = self.similarity_query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        self.similarity_loading = true;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            let result = api.fetch_similarity_scores(&query);
+            let _ = tx.send(result);
+        });
+
+        self.similarity_receiver = Some(rx);
+    }
+
+    /// Clear similarity search overlay
+    fn clear_similarity(&mut self) {
+        self.similarity_active = false;
+        self.similarity_scores.clear();
+        self.similarity_query.clear();
+    }
+
+    /// Load embedding stats from the API
+    fn load_embedding_stats(&mut self) {
+        let api = ApiClient::new();
+        match api.fetch_embedding_stats() {
+            Ok(stats) => {
+                self.embedding_stats = Some(stats);
+            }
+            Err(e) => {
+                eprintln!("Failed to load embedding stats: {}", e);
+            }
+        }
+    }
+
+    /// Trigger embedding generation (runs in background)
+    fn trigger_embedding_generation(&mut self) {
+        self.embedding_gen_loading = true;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            let result = api.generate_embeddings(1000);
+            let _ = tx.send(result);
+        });
+
+        self.embedding_gen_receiver = Some(rx);
     }
 
     /// Start rescoring importance for visible nodes (runs in background with progress)
@@ -2015,6 +2101,99 @@ impl DashboardApp {
                 }
             });
 
+        // Similarity Search section
+        egui::CollapsingHeader::new("Similarity Search")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Search input + button
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.similarity_query)
+                            .hint_text("Search concept...")
+                            .desired_width(130.0)
+                    );
+
+                    let can_search = !self.similarity_query.trim().is_empty()
+                        && !self.similarity_loading;
+
+                    if ui.add_enabled(can_search, egui::Button::new("Search")).clicked()
+                        || (response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && can_search)
+                    {
+                        self.trigger_similarity_search();
+                    }
+                });
+
+                // Loading indicator
+                if self.similarity_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Searching...");
+                    });
+                }
+
+                // Quick preset buttons
+                ui.horizontal_wrapped(|ui| {
+                    let presets = ["frustrated", "decisions", "errors", "confused", "breakthrough"];
+                    for preset in presets {
+                        if ui.small_button(preset).clicked() {
+                            self.similarity_query = preset.to_string();
+                            self.trigger_similarity_search();
+                        }
+                    }
+                });
+
+                // Threshold slider (only when active)
+                if self.similarity_active {
+                    ui.add_space(5.0);
+                    ui.add(
+                        egui::Slider::new(&mut self.similarity_threshold, 0.0..=1.0)
+                            .text("Threshold")
+                            .fixed_decimals(2)
+                    );
+
+                    let visible_count = self.similarity_scores.values()
+                        .filter(|&&s| s >= self.similarity_threshold)
+                        .count();
+                    ui.label(format!("{} / {} nodes above threshold",
+                        visible_count, self.similarity_scores.len()));
+
+                    if ui.button("Clear").clicked() {
+                        self.clear_similarity();
+                    }
+                }
+
+                ui.add_space(5.0);
+                ui.separator();
+
+                // Embedding stats and generation
+                // Cache values before closures to avoid borrow conflicts
+                let stats_info = self.embedding_stats.as_ref().map(|s| (s.embedded, s.total, s.unembedded));
+                let gen_loading = self.embedding_gen_loading;
+
+                if let Some((embedded, total, unembedded)) = stats_info {
+                    ui.label(format!("{} / {} embedded", embedded, total));
+
+                    if unembedded > 0 {
+                        let gen_text = if gen_loading { "Generating..." } else { "Generate" };
+                        ui.horizontal(|ui| {
+                            if gen_loading {
+                                ui.spinner();
+                            }
+                            if ui.add_enabled(!gen_loading, egui::Button::new(gen_text)).clicked() {
+                                self.trigger_embedding_generation();
+                            }
+                            ui.label(format!("{} remaining", unembedded));
+                        });
+                    }
+                } else {
+                    if ui.button("Load stats").clicked() {
+                        self.load_embedding_stats();
+                    }
+                }
+            });
+
         // Advanced section (collapsed by default)
         egui::CollapsingHeader::new("Advanced")
             .default_open(false)
@@ -2434,6 +2613,17 @@ impl DashboardApp {
                 }
             }
 
+            // Skip edges where either endpoint is below similarity threshold
+            if self.similarity_active {
+                let source_below = self.similarity_scores.get(&edge.source)
+                    .map_or(true, |&s| s < self.similarity_threshold);
+                let target_below = self.similarity_scores.get(&edge.target)
+                    .map_or(true, |&s| s < self.similarity_threshold);
+                if source_below || target_below {
+                    continue;
+                }
+            }
+
             let source_pos = match self.graph.get_pos(&edge.source) {
                 Some(p) => transform(p),
                 None => continue,
@@ -2502,6 +2692,14 @@ impl DashboardApp {
                         continue;
                     }
                 }
+                // Skip nodes below similarity threshold
+                if self.similarity_active {
+                    if let Some(&score) = self.similarity_scores.get(&node.id) {
+                        if score < self.similarity_threshold {
+                            continue;
+                        }
+                    }
+                }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
                     let distance = screen_pos.distance(hover_pos);
@@ -2565,6 +2763,16 @@ impl DashboardApp {
             if let Some(ref sem_visible) = semantic_visible {
                 if !sem_visible.contains(&node.id) {
                     continue;
+                }
+            }
+
+            // Skip nodes below similarity threshold when overlay is active
+            // (unscored nodes are kept — they render as dim grey)
+            if self.similarity_active {
+                if let Some(&score) = self.similarity_scores.get(&node.id) {
+                    if score < self.similarity_threshold {
+                        continue;
+                    }
                 }
             }
 
@@ -2693,6 +2901,20 @@ impl DashboardApp {
                     } else {
                         base_color
                     }
+                };
+
+                // Apply similarity overlay when active
+                let color = if self.similarity_active {
+                    match self.similarity_scores.get(&node.id) {
+                        Some(&score) if score >= self.similarity_threshold => {
+                            let grey = crate::graph::types::to_greyscale(color);
+                            crate::graph::types::lerp_color(grey, color, score)
+                        }
+                        Some(_) => continue, // Below threshold, skip
+                        None => crate::graph::types::to_greyscale(color).gamma_multiply(0.15),
+                    }
+                } else {
+                    color
                 };
 
                 // Draw node differently for same-project future nodes
@@ -3315,6 +3537,55 @@ impl eframe::App for DashboardApp {
                         self.rescore_receiver = None;
                         break;
                     }
+                }
+            }
+        }
+
+        // Check for similarity search result from background thread
+        if let Some(ref rx) = self.similarity_receiver {
+            match rx.try_recv() {
+                Ok(Ok(scores)) => {
+                    self.similarity_scores = scores;
+                    self.similarity_active = true;
+                    self.similarity_loading = false;
+                    self.similarity_receiver = None;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Similarity search failed: {}", e);
+                    self.similarity_loading = false;
+                    self.similarity_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.similarity_loading = false;
+                    self.similarity_receiver = None;
+                }
+            }
+        }
+
+        // Check for embedding generation result from background thread
+        if let Some(ref rx) = self.embedding_gen_receiver {
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    eprintln!("Generated {} embeddings", result.generated);
+                    self.embedding_gen_loading = false;
+                    self.embedding_gen_receiver = None;
+                    // Refresh stats
+                    self.load_embedding_stats();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Embedding generation failed: {}", e);
+                    self.embedding_gen_loading = false;
+                    self.embedding_gen_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.embedding_gen_loading = false;
+                    self.embedding_gen_receiver = None;
                 }
             }
         }

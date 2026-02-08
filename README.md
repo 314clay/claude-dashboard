@@ -7,7 +7,7 @@ Native desktop dashboard for visualizing your Claude Code conversation history. 
 ## Quickstart
 
 ```bash
-git clone https://github.com/clayarnold/dashboard-native.git
+git clone https://github.com/314clay/dashboard-native.git
 cd dashboard-native
 python3 ingest.py          # Import your Claude Code history
 cargo run --release        # Launch the dashboard
@@ -15,10 +15,19 @@ cargo run --release        # Launch the dashboard
 
 That's it. No database server needed -- data is stored in a local SQLite file at `~/.config/dashboard-native/dashboard.db`, auto-created on first run.
 
-## Requirements
+## Platform Requirements
 
 - **Rust** -- Install via [rustup](https://rustup.rs)
 - **Python 3.10+** -- For the API backend and data ingestion
+
+**macOS**: No extra dependencies.
+
+**Linux**:
+```bash
+sudo apt-get install -y libgtk-3-dev libxdo-dev libatk1.0-dev libglib2.0-dev
+```
+
+**Windows**: Not currently supported (egui may work, untested).
 
 ```bash
 pip install -r api/requirements.txt
@@ -158,7 +167,7 @@ cargo build
 cargo build --release
 
 # Run tests
-cargo test
+make test
 ```
 
 ## Performance

@@ -1,4 +1,4 @@
-.PHONY: setup run build import import-recent api clean help
+.PHONY: setup run build import import-recent api test clean help
 
 help:              ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -23,11 +23,9 @@ import-recent:     ## Import last 7 days of history
 api:               ## Start the Python API server only
 	cd api && python3 -m uvicorn main:app --host 127.0.0.1 --port 8000
 
-docker-up:         ## Start API in Docker (optional)
-	docker compose up -d
-
-docker-down:       ## Stop Docker services
-	docker compose down
+test:              ## Run all tests (Rust + Python)
+	cargo test
+	cd api && python3 -m pytest test_main.py -v
 
 clean:             ## Remove build artifacts
 	cargo clean

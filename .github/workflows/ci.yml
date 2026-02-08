@@ -65,3 +65,6 @@ jobs:
 
       - name: Verify imports
         run: python -c "import fastapi; import uvicorn; print('API dependencies OK')"
+
+      - name: Run Python tests
+        run: cd api && python -m pytest test_main.py -v

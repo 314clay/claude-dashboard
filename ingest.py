@@ -436,6 +436,12 @@ def main():
 
     if args.dry_run:
         sessions = discover_sessions(claude_dir, since)
+        if not sessions:
+            print("No Claude Code sessions found.")
+            print()
+            print("To generate history, use Claude Code: https://claude.ai/claude-code")
+            print(f"Or specify a custom path: python3 ingest.py --path /path/to/.claude/")
+            return
         print(f"Would import {len(sessions)} sessions")
         for s in sessions[:10]:
             print(f"  {s['sessionId'][:8]}... {s.get('summary', s.get('firstPrompt', '')[:60])}")
@@ -454,6 +460,13 @@ def main():
 
     # Discover and import sessions
     sessions = discover_sessions(claude_dir, since)
+    if not sessions:
+        print("No Claude Code sessions found.")
+        print()
+        print("To generate history, use Claude Code: https://claude.ai/claude-code")
+        print(f"Or specify a custom path: python3 ingest.py --path /path/to/.claude/")
+        conn.close()
+        return
     print(f"Found {len(sessions)} sessions to import")
     print()
 

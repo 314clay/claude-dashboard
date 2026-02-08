@@ -161,6 +161,22 @@ CREATE INDEX IF NOT EXISTS idx_sfr_filter_matches ON semantic_filter_results (fi
 CREATE INDEX IF NOT EXISTS idx_sfr_message         ON semantic_filter_results (message_id);
 
 -- ============================================================
+-- MESSAGE EMBEDDINGS TABLE
+-- Vector embeddings for semantic similarity search.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id  INTEGER PRIMARY KEY,
+    model       TEXT    NOT NULL,
+    dimensions  INTEGER NOT NULL,
+    embedding   BLOB    NOT NULL,
+    created_at  TEXT    DEFAULT (datetime('now')),
+
+    FOREIGN KEY (message_id)
+        REFERENCES messages (id)
+        ON DELETE CASCADE
+);
+
+-- ============================================================
 -- DAILY USAGE TABLE
 -- Per-day, per-model token usage from stats-cache.json.
 -- ============================================================

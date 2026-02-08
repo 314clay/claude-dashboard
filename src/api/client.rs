@@ -1,6 +1,7 @@
 //! HTTP client for the dashboard API.
 
 use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SemanticFilter, SessionSummaryData};
+use std::collections::HashMap;
 use crate::mail::MailNetworkData;
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -55,6 +56,27 @@ pub enum RescoreEvent {
     Progress(RescoreProgress),
     Complete(RescoreResult),
     Error(String),
+}
+
+/// Embedding coverage statistics from the API
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingStats {
+    pub total: i64,
+    pub embedded: i64,
+    pub unembedded: i64,
+    pub model: Option<String>,
+}
+
+/// Result from embedding generation
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingGenResult {
+    pub generated: i64,
+    pub model: Option<String>,
+    pub dimensions: Option<i64>,
+    #[serde(default)]
+    pub errors: Option<Vec<String>>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 pub struct ApiClient {
@@ -423,6 +445,84 @@ impl ApiClient {
         }
 
         Ok(())
+    }
+
+    /// Fetch embedding coverage statistics
+    pub fn fetch_embedding_stats(&self) -> Result<EmbeddingStats, String> {
+        let url = format!("{}/embeddings/stats", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let stats: EmbeddingStats = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(stats)
+    }
+
+    /// Generate embeddings for unembedded messages
+    pub fn generate_embeddings(&self, max_messages: i32) -> Result<EmbeddingGenResult, String> {
+        let url = format!(
+            "{}/embeddings/generate?max_messages={}",
+            self.base_url, max_messages
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(120)) // Long timeout for embedding generation
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let result: EmbeddingGenResult = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(result)
+    }
+
+    /// Search messages by semantic similarity
+    pub fn fetch_similarity_scores(
+        &self,
+        query: &str,
+    ) -> Result<HashMap<String, f32>, String> {
+        let url = format!("{}/embeddings/search", self.base_url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "query_text": query }))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            scores: HashMap<String, f32>,
+        }
+
+        let response: SearchResponse = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(response.scores)
     }
 }
 

@@ -2,6 +2,10 @@
 .DS_Store
 __pycache__/
 *.pyc
+*.db
+*.sqlite
+.env
+manage.py
 
 # Gas Town (added by gt)
 .runtime/

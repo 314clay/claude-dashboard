@@ -1210,6 +1210,18 @@ pub fn desaturate(color: egui::Color32, amount: f32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(r, g, b, color.a())
 }
 
+/// Linearly interpolate between two colors
+/// t: 0.0 = color a, 1.0 = color b
+pub fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgba_unmultiplied(
+        (a.r() as f32 * (1.0 - t) + b.r() as f32 * t) as u8,
+        (a.g() as f32 * (1.0 - t) + b.g() as f32 * t) as u8,
+        (a.b() as f32 * (1.0 - t) + b.b() as f32 * t) as u8,
+        (a.a() as f32 * (1.0 - t) + b.a() as f32 * t) as u8,
+    )
+}
+
 // ============================================================================
 // Histogram Data Structures
 // ============================================================================

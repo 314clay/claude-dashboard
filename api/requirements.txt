@@ -10,3 +10,10 @@ openai>=1.0.0
 # Optional providers (install the one you plan to use)
 anthropic>=0.39.0          # pip install anthropic
 # google-generativeai is NOT needed; we use OpenAI-compat endpoint for Gemini
+
+# Embeddings (similarity search)
+numpy>=1.24.0
+
+# Testing (dev dependency)
+pytest>=7.0.0
+httpx>=0.24.0              # required by TestClient

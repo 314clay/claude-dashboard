@@ -49,7 +49,7 @@ def extract_project_from_path(path: str) -> Optional[str]:
     """Extract project name from a file path.
 
     Examples:
-        ~/w/connect/dashboard/app.py -> 'connect'
+        ~/projects/myapp/src/main.py -> 'myapp'
         ~/Documents/GitHub/AnkiThings/src/main.ts -> 'AnkiThings'
     """
     if not path:

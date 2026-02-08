@@ -16,7 +16,7 @@ echo -e "${GREEN}Starting Claude Activity Dashboard (Native)${NC}"
 
 # Find Python - check multiple options
 find_python() {
-    # 1. Check CONNECT_VENV env var (preferred for ConnectingServices)
+    # 1. Check CONNECT_VENV env var (shared Python env)
     if [ -n "$CONNECT_VENV" ] && [ -f "$CONNECT_VENV/bin/python" ]; then
         echo "$CONNECT_VENV/bin/python"
         return

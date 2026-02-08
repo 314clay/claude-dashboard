@@ -42,6 +42,11 @@ from db.semantic_filter_scorer import (
     categorize_messages,
     get_filter_stats,
 )
+from db.embeddings import (
+    get_embedding_stats,
+    generate_embeddings,
+    search_by_query,
+)
 from db.mail import get_mail_network
 # Commented out - health_ingest module not present
 # from db.health_ingest import (
@@ -74,6 +79,10 @@ class SemanticFilterCreate(BaseModel):
 
 class RescoreRequest(BaseModel):
     session_ids: list[str]
+
+
+class SimilaritySearchRequest(BaseModel):
+    query_text: str
 
 
 @app.get("/health")
@@ -415,6 +424,42 @@ def semantic_filter_stats():
     return get_filter_stats()
 
 
+# ==== Embedding / Similarity Search Endpoints ====
+
+@app.get("/embeddings/stats")
+def embedding_stats():
+    """Get embedding coverage statistics.
+
+    Returns: { total, embedded, unembedded, model }
+    """
+    return get_embedding_stats()
+
+
+@app.post("/embeddings/generate")
+def embedding_generate(
+    batch_size: int = Query(default=100, description="Texts per API call"),
+    max_messages: int = Query(default=1000, description="Max messages to embed"),
+):
+    """Generate embeddings for unembedded messages.
+
+    Calls OpenAI text-embedding-3-small (or Google equivalent).
+    Returns: { generated, model, dimensions, errors }
+    """
+    return generate_embeddings(batch_size, max_messages)
+
+
+@app.post("/embeddings/search")
+def embedding_search(body: SimilaritySearchRequest):
+    """Search messages by semantic similarity.
+
+    Body: { query_text: "frustrated" }
+    Returns: { scores: { message_id: float } } for ALL embedded messages.
+    """
+    scores = search_by_query(body.query_text)
+    # Convert int keys to strings for JSON serialization
+    return {"scores": {str(k): v for k, v in scores.items()}}
+
+
 # ==== Mail Network Endpoints ====
 
 @app.get("/mail/network")
@@ -486,6 +531,5 @@ def mail_network():
 
 
 if __name__ == "__main__":
-    # Bind to 0.0.0.0 to allow access via Tailscale
-    # Port 10800 for dashboard API / health ingest
+    # Bind to all interfaces for network access
     uvicorn.run(app, host="0.0.0.0", port=10800)

@@ -1,9 +1,0 @@
-target/
-.git/
-*.rs
-Cargo.toml
-Cargo.lock
-**/__pycache__/
-*.pyc
-.DS_Store
-.env

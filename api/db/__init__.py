@@ -24,6 +24,11 @@ from .semantic_filter_scorer import (
     categorize_messages,
     get_filter_stats,
 )
+from .embeddings import (
+    get_embedding_stats,
+    generate_embeddings,
+    search_by_query,
+)
 
 __all__ = [
     'get_connection',
@@ -43,4 +48,7 @@ __all__ = [
     'get_message_filter_matches',
     'categorize_messages',
     'get_filter_stats',
+    'get_embedding_stats',
+    'generate_embeddings',
+    'search_by_query',
 ]

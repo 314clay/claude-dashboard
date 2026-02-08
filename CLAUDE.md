@@ -28,7 +28,7 @@ This is a native Rust rewrite of the Claude Activity Dashboard. The original Str
 ./start.sh
 
 # Or manually:
-cd api && /Users/clayarnold/w/connect/venv/bin/uvicorn main:app --port 8000 &
+cd api && python3 -m uvicorn main:app --port 8000 &
 source ~/.cargo/env && cargo run --release
 ```
 
@@ -201,10 +201,13 @@ Messages table additions:
 
 ## Database
 
-PostgreSQL on port 5433, schema `claude_sessions`:
+SQLite at `~/.config/dashboard-native/dashboard.db`:
 - `sessions`: session_id, cwd, start_time, end_time
 - `messages`: id, session_id, role, content, timestamp, sequence_num, importance_score
 - `tool_usages`: tool_name, tool_input, timestamp, message_id
 - `session_summaries`: summary, topics, detected_project
 - `session_contexts`: session_id, summary, completed_work, topics (for importance scoring)
-- `session_embeddings`: embedding (pgvector)
+- `daily_usage`: date, model, token counts
+- `model_usage`: per-model cumulative stats
+- `overall_stats`: aggregate counts
+- `semantic_filters` / `semantic_filter_results`: natural-language filters
