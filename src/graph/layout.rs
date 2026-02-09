@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 /// Maximum temporal edges to process per physics frame (stochastic sampling)
 const TEMPORAL_EDGES_PER_FRAME: usize = 2000;
 
+/// Maximum similarity edges to process per physics frame (stochastic sampling)
+const SIMILARITY_EDGES_PER_FRAME: usize = 2000;
+
 /// Force-directed layout parameters
 pub struct ForceLayout {
     /// Repulsion strength between nodes
@@ -33,8 +36,14 @@ pub struct ForceLayout {
     pub ideal_length: f32,
     /// Temporal edge strength multiplier
     pub temporal_strength: f32,
+    /// Similarity edge strength multiplier
+    pub similarity_strength: f32,
     /// How much visual size affects mass/charge (0 = uniform, higher = more differentiation)
     pub size_physics_weight: f32,
+    /// Stiffness multiplier for directed (structural) edges (1.0 = default, higher = stiffer)
+    pub directed_stiffness: f32,
+    /// How much recency boosts centering force (0.0 = uniform, higher = newer nodes hug center)
+    pub recency_centering: f32,
 }
 
 impl Default for ForceLayout {
@@ -48,7 +57,10 @@ impl Default for ForceLayout {
             max_velocity: 50.0,
             ideal_length: 100.0,
             temporal_strength: 0.5,
+            similarity_strength: 0.5,
             size_physics_weight: 0.0,
+            directed_stiffness: 1.0,
+            recency_centering: 0.0,
         }
     }
 }
@@ -141,12 +153,20 @@ impl ForceLayout {
             visible_nodes.map_or(true, |v| v.contains(&e.source) && v.contains(&e.target))
         };
 
-        let (temporal_edges, regular_edges): (Vec<_>, Vec<_>) = state
-            .data
-            .edges
-            .iter()
-            .filter(is_edge_visible)
-            .partition(|e| e.is_temporal);
+        // 3-way partition: temporal, similarity, regular
+        let mut temporal_edges = Vec::new();
+        let mut similarity_edges = Vec::new();
+        let mut regular_edges = Vec::new();
+
+        for edge in state.data.edges.iter().filter(is_edge_visible) {
+            if edge.is_temporal {
+                temporal_edges.push(edge);
+            } else if edge.is_similarity {
+                similarity_edges.push(edge);
+            } else {
+                regular_edges.push(edge);
+            }
+        }
 
         // Process ALL regular edges (structural edges are important)
         for edge in &regular_edges {
@@ -160,7 +180,6 @@ impl ForceLayout {
             let sample_size = temporal_count.min(TEMPORAL_EDGES_PER_FRAME);
             let scale = temporal_count as f32 / sample_size as f32;
 
-            // Sample without replacement
             let mut rng = rand::thread_rng();
             let sampled: Vec<_> = temporal_edges
                 .choose_multiple(&mut rng, sample_size)
@@ -171,11 +190,53 @@ impl ForceLayout {
             }
         }
 
-        // Centering force
+        // Stochastic sampling: process a random subset of similarity edges
+        let similarity_count = similarity_edges.len();
+        if similarity_count > 0 {
+            let sample_size = similarity_count.min(SIMILARITY_EDGES_PER_FRAME);
+            let scale = similarity_count as f32 / sample_size as f32;
+
+            let mut rng = rand::thread_rng();
+            let sampled: Vec<_> = similarity_edges
+                .choose_multiple(&mut rng, sample_size)
+                .collect();
+
+            for edge in sampled {
+                self.apply_edge_force(edge, state, &local_index, &mut forces, scale, &node_masses);
+            }
+        }
+
+        // Centering force (with optional recency bias: newer nodes pull harder toward center)
+        // Precompute recency map if recency_centering > 0
+        let recency_map: Option<HashMap<&String, f32>> = if self.recency_centering > 0.0 {
+            let min_t = state.timeline.min_time;
+            let max_t = state.timeline.max_time;
+            let range = max_t - min_t;
+            if range > 0.0 {
+                Some(node_ids.iter().map(|id| {
+                    let recency = state.node_index.get(id)
+                        .and_then(|&idx| state.data.nodes.get(idx))
+                        .and_then(|n| n.timestamp_secs())
+                        .map(|ts| ((ts - min_t) / range) as f32)
+                        .unwrap_or(0.5);
+                    (id, recency)
+                }).collect())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for (i, id) in node_ids.iter().enumerate() {
             if let Some(&pos) = state.positions.get(id) {
                 let to_center = center - pos;
-                forces[i] += to_center * self.centering;
+                // Scale centering: base + recency_centering * recency (0=oldest, 1=newest)
+                let recency_boost = recency_map.as_ref()
+                    .and_then(|m| m.get(id).copied())
+                    .unwrap_or(0.0);
+                let centering_strength = self.centering * (1.0 + self.recency_centering * recency_boost);
+                forces[i] += to_center * centering_strength;
             }
         }
 
@@ -252,11 +313,11 @@ impl ForceLayout {
             // Temporal edges: use pre-computed similarity * temporal_strength
             edge.similarity.unwrap_or(1.0) * self.temporal_strength
         } else if edge.is_similarity {
-            // Similarity edges also use their strength
-            edge.similarity.unwrap_or(1.0)
+            // Similarity edges: use pre-computed similarity * similarity_strength
+            edge.similarity.unwrap_or(1.0) * self.similarity_strength
         } else {
-            // Regular edges: full strength
-            1.0
+            // Regular (directed/structural) edges: use directed_stiffness
+            self.directed_stiffness
         };
 
         // Scale edge force by geometric mean of node masses

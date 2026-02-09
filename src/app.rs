@@ -2,7 +2,7 @@
 
 use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
-use crate::graph::types::{ColorMode, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
+use crate::graph::types::{ColorMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
 use crate::settings::{Preset, Settings, SizingPreset};
@@ -95,6 +95,39 @@ pub struct ImportanceStats {
     pub scored_messages: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HistogramStackOrder {
+    #[default]
+    MostTokens,
+    OldestFirst,
+    MostMessages,
+}
+
+impl HistogramStackOrder {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::MostTokens => "Most Tokens",
+            Self::OldestFirst => "Oldest First",
+            Self::MostMessages => "Most Messages",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionTokens {
+    session_id: String,
+    project: String,
+    total_tokens: i64,
+    is_filtered: bool,
+}
+
+struct TokenBin {
+    timestamp_start: String,
+    timestamp_end: String,
+    sessions: Vec<SessionTokens>,
+    total_tokens: i64,
+}
+
 /// Main dashboard application
 pub struct DashboardApp {
     // Database client
@@ -168,6 +201,16 @@ pub struct DashboardApp {
     session_summary_loading: bool,
     session_summary_receiver: Option<Receiver<Result<SessionSummaryData, String>>>,
 
+    // Neighborhood summary state (Ctrl+Click cluster)
+    neighborhood_summary_data: Option<NeighborhoodSummaryData>,
+    neighborhood_summary_loading: bool,
+    neighborhood_summary_error: Option<String>,
+    neighborhood_summary_receiver: Option<Receiver<Result<NeighborhoodSummaryData, String>>>,
+    neighborhood_summary_center_node: Option<String>,
+    neighborhood_summary_count: usize,
+    neighborhood_depth: usize,
+    neighborhood_include_temporal: bool,
+
     // Floating summary window state
     summary_window_open: bool,
     summary_window_dragged: bool,
@@ -224,6 +267,23 @@ pub struct DashboardApp {
     // Collapsible side panels
     beads_panel_open: bool,
     mail_panel_open: bool,
+
+    // Token histogram panel
+    histogram_panel_enabled: bool,
+    histogram_split_ratio: f32,
+    histogram_dragging_divider: bool,
+    histogram_hovered_bin: Option<usize>,
+    histogram_bar_width: f32,
+    histogram_scroll_offset: f32,
+    histogram_stack_order: HistogramStackOrder,
+    session_metadata_cache: HashMap<String, (f64, usize)>,
+
+    // Similarity clustering (edge-based, fetched from API)
+    similarity_clustering_enabled: bool,
+    similarity_edge_opacity: f32,
+    similarity_edges_loading: bool,
+    similarity_edge_count: usize,
+    similarity_edges_rx: Option<Receiver<Vec<GraphEdge>>>,
 }
 
 impl DashboardApp {
@@ -261,6 +321,8 @@ impl DashboardApp {
         layout.centering = settings.centering;
         layout.temporal_strength = settings.temporal_strength;
         layout.size_physics_weight = settings.size_physics_weight;
+        layout.directed_stiffness = settings.directed_stiffness;
+        layout.recency_centering = settings.recency_centering;
 
         // Create graph state with saved settings
         let mut graph = GraphState::new();
@@ -329,6 +391,16 @@ impl DashboardApp {
             session_summary_loading: false,
             session_summary_receiver: None,
 
+            // Neighborhood summary state
+            neighborhood_summary_data: None,
+            neighborhood_summary_loading: false,
+            neighborhood_summary_error: None,
+            neighborhood_summary_receiver: None,
+            neighborhood_summary_center_node: None,
+            neighborhood_summary_count: 0,
+            neighborhood_depth: 1,
+            neighborhood_include_temporal: true,
+
             // Floating summary window state
             summary_window_open: false,
             summary_window_dragged: false,
@@ -340,6 +412,16 @@ impl DashboardApp {
             // Collapsible side panels (read before settings move)
             beads_panel_open: settings.beads_panel_open,
             mail_panel_open: settings.mail_panel_open,
+
+            // Token histogram panel
+            histogram_panel_enabled: settings.histogram_panel_enabled,
+            histogram_split_ratio: settings.histogram_split_ratio,
+            histogram_dragging_divider: false,
+            histogram_hovered_bin: None,
+            histogram_bar_width: 40.0,
+            histogram_scroll_offset: 0.0,
+            histogram_stack_order: HistogramStackOrder::MostTokens,
+            session_metadata_cache: HashMap::new(),
 
             // Settings persistence
             settings,
@@ -383,6 +465,13 @@ impl DashboardApp {
             mail_network_state: None,
             mail_network_loading: false,
             mail_network_error: None,
+
+            // Similarity clustering
+            similarity_clustering_enabled: false,
+            similarity_edge_opacity: 0.3,
+            similarity_edges_loading: false,
+            similarity_edge_count: 0,
+            similarity_edges_rx: None,
         };
 
         // Load initial data if connected
@@ -434,12 +523,16 @@ impl DashboardApp {
         self.settings.centering = self.layout.centering;
         self.settings.size_physics_weight = self.layout.size_physics_weight;
         self.settings.temporal_strength = self.layout.temporal_strength;
+        self.settings.directed_stiffness = self.layout.directed_stiffness;
+        self.settings.recency_centering = self.layout.recency_centering;
         self.settings.temporal_attraction_enabled = self.graph.temporal_attraction_enabled;
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
         self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
+        self.settings.histogram_panel_enabled = self.histogram_panel_enabled;
+        self.settings.histogram_split_ratio = self.histogram_split_ratio;
     }
 
     /// Copy settings values to UI fields (used when loading a preset)
@@ -464,6 +557,8 @@ impl DashboardApp {
         self.layout.centering = self.settings.centering;
         self.layout.size_physics_weight = self.settings.size_physics_weight;
         self.layout.temporal_strength = self.settings.temporal_strength;
+        self.layout.directed_stiffness = self.settings.directed_stiffness;
+        self.layout.recency_centering = self.settings.recency_centering;
         self.graph.temporal_attraction_enabled = self.settings.temporal_attraction_enabled;
         self.graph.temporal_window_secs = (self.settings.temporal_window_mins * 60.0) as f64;
         self.temporal_edge_opacity = self.settings.temporal_edge_opacity;
@@ -509,6 +604,18 @@ impl DashboardApp {
                 self.available_projects = sorted_projects;
                 // Select all projects by default
                 self.selected_projects = self.available_projects.iter().cloned().collect();
+
+                // Populate session metadata cache for histogram sorting
+                self.session_metadata_cache.clear();
+                for node in &self.graph.data.nodes {
+                    let entry = self.session_metadata_cache
+                        .entry(node.session_id.clone())
+                        .or_insert((f64::MAX, 0));
+                    if let Some(ts) = node.timestamp_secs() {
+                        if ts < entry.0 { entry.0 = ts; }
+                    }
+                    entry.1 += 1;
+                }
 
                 // Fetch importance stats
                 if let Ok(stats) = db.fetch_importance_stats() {
@@ -656,35 +763,13 @@ impl DashboardApp {
     }
 
     /// Build adjacency list from graph edges for BFS neighbor lookup
-    fn build_adjacency_list(&self) -> HashMap<String, Vec<String>> {
-        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-        for edge in &self.graph.data.edges {
-            adj.entry(edge.source.clone()).or_default().push(edge.target.clone());
-            adj.entry(edge.target.clone()).or_default().push(edge.source.clone());
-        }
-        adj
+    fn build_adjacency_list(&self, include_temporal: bool) -> HashMap<String, Vec<String>> {
+        build_adjacency_list(&self.graph.data.edges, include_temporal)
     }
 
     /// Expand a set of nodes to include neighbors up to given depth using BFS
     fn expand_to_neighbors(&self, seeds: &HashSet<String>, depth: usize, adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
-        let mut visited = seeds.clone();
-        let mut frontier = seeds.clone();
-
-        for _ in 0..depth {
-            let mut next_frontier = HashSet::new();
-            for node_id in &frontier {
-                if let Some(neighbors) = adj.get(node_id) {
-                    for neighbor in neighbors {
-                        if !visited.contains(neighbor) {
-                            visited.insert(neighbor.clone());
-                            next_frontier.insert(neighbor.clone());
-                        }
-                    }
-                }
-            }
-            frontier = next_frontier;
-        }
-        visited
+        expand_to_neighbors(seeds, depth, adj)
     }
 
     /// Compute the set of nodes visible based on semantic filters
@@ -695,8 +780,8 @@ impl DashboardApp {
             return None;
         }
 
-        // Build adjacency list once for BFS
-        let adj = self.build_adjacency_list();
+        // Build adjacency list once for BFS (always include temporal for semantic filters)
+        let adj = self.build_adjacency_list(true);
 
         // Start with all nodes, then apply filters
         let all_node_ids: HashSet<String> = self.graph.data.nodes.iter()
@@ -1007,6 +1092,46 @@ impl DashboardApp {
         }
     }
 
+    /// Trigger neighborhood summary for a Ctrl+Clicked node and its direct neighbors
+    fn trigger_neighborhood_summary(&mut self, node_id: String) {
+        // Build adjacency list and find neighbors at configured depth
+        let adj = self.build_adjacency_list(self.neighborhood_include_temporal);
+        let mut seeds = HashSet::new();
+        seeds.insert(node_id.clone());
+        let neighbor_ids = self.expand_to_neighbors(&seeds, self.neighborhood_depth, &adj);
+
+        let message_ids: Vec<String> = neighbor_ids.into_iter().collect();
+        let count = message_ids.len();
+
+        // Set loading state
+        self.neighborhood_summary_data = None;
+        self.neighborhood_summary_loading = true;
+        self.neighborhood_summary_error = None;
+        self.neighborhood_summary_center_node = Some(node_id);
+        self.neighborhood_summary_count = count;
+
+        // Open summary window
+        if !self.summary_window_dragged {
+            self.summary_window_dragged = false;
+        }
+        self.summary_window_open = true;
+
+        // Create channel and spawn background thread
+        let (tx, rx) = mpsc::channel();
+        self.neighborhood_summary_receiver = Some(rx);
+
+        let api = ApiClient::new();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                api.fetch_neighborhood_summary(message_ids)
+            }));
+            match result {
+                Ok(r) => { let _ = tx.send(r); }
+                Err(_) => { let _ = tx.send(Err("Thread panicked".to_string())); }
+            }
+        });
+    }
+
     /// Load semantic filters from the API
     fn load_semantic_filters(&mut self) {
         self.semantic_filter_loading = true;
@@ -1092,6 +1217,35 @@ impl DashboardApp {
         });
 
         self.similarity_receiver = Some(rx);
+    }
+
+    /// Trigger async fetch of similarity edges from the API
+    fn trigger_similarity_edge_fetch(&mut self) {
+        self.similarity_edges_loading = true;
+
+        let threshold = self.graph.similarity_threshold;
+        let k_nearest = self.graph.similarity_k_nearest;
+        let max_edges = self.graph.max_similarity_edges;
+        let time_window_hours = self.graph.similarity_time_window_hours;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            match api.fetch_similarity_edges(threshold, k_nearest, max_edges, time_window_hours) {
+                Ok(response) => {
+                    let edges: Vec<GraphEdge> = response.edges.into_iter().map(|e| {
+                        GraphEdge::similarity(e.source, e.target, e.similarity)
+                    }).collect();
+                    let _ = tx.send(edges);
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch similarity edges: {}", e);
+                    let _ = tx.send(Vec::new());
+                }
+            }
+        });
+
+        self.similarity_edges_rx = Some(rx);
     }
 
     /// Clear similarity search overlay
@@ -1397,6 +1551,63 @@ impl DashboardApp {
                         }
                     });
 
+                ui.separator();
+
+                // Neighborhood Summary section
+                egui::CollapsingHeader::new("Neighborhood Summary")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        // Depth slider
+                        ui.horizontal(|ui| {
+                            ui.label("Depth:");
+                            ui.add(egui::Slider::new(&mut self.neighborhood_depth, 1..=5).text("edges"));
+                        });
+
+                        // Temporal edge toggle
+                        ui.checkbox(&mut self.neighborhood_include_temporal, "Include temporal edges");
+
+                        ui.add_space(5.0);
+
+                        if self.neighborhood_summary_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Summarizing {} nodes...", self.neighborhood_summary_count));
+                            });
+                            ui.add_space(8.0);
+                            theme::skeleton_lines(ui, 3, ui.available_width() * 0.9);
+                        } else if let Some(ref error) = self.neighborhood_summary_error.clone() {
+                            ui.colored_label(theme::state::ERROR, format!("Error: {}", error));
+                        } else if let Some(ref data) = self.neighborhood_summary_data.clone() {
+                            // Node/session counts
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} nodes across {} sessions",
+                                    data.node_count, data.session_count));
+                            });
+                            ui.add_space(5.0);
+
+                            // Summary
+                            ui.label(egui::RichText::new("Summary").strong());
+                            egui::ScrollArea::vertical()
+                                .max_height(100.0)
+                                .id_salt("window_neighborhood_summary_scroll")
+                                .show(ui, |ui| {
+                                    ui.label(&data.summary);
+                                });
+                            ui.add_space(5.0);
+
+                            // Themes
+                            if !data.themes.is_empty() {
+                                ui.label(egui::RichText::new("Themes").strong().color(Color32::from_rgb(100, 149, 237)));
+                                ui.label(&data.themes);
+                            }
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::GRAY,
+                                "Ctrl+Click a node to summarize\nit and its neighbors.",
+                            );
+                        }
+                    });
+
                 ui.add_space(10.0);
                 ui.separator();
 
@@ -1405,6 +1616,10 @@ impl DashboardApp {
                     self.summary_data = None;
                     self.summary_node_id = None;
                     self.session_summary_data = None;
+                    self.neighborhood_summary_data = None;
+                    self.neighborhood_summary_error = None;
+                    self.neighborhood_summary_center_node = None;
+                    self.neighborhood_summary_count = 0;
                     self.summary_window_open = false;
                     self.summary_window_dragged = false;
                 }
@@ -1587,6 +1802,8 @@ impl DashboardApp {
                         self.layout.attraction = 0.1;
                         self.layout.centering = 0.0001;
                         self.layout.size_physics_weight = 0.0;
+                        self.layout.directed_stiffness = 1.0;
+                        self.layout.recency_centering = 0.0;
                         self.pan_offset = Vec2::ZERO;
                         self.zoom = 1.0;
                         self.load_graph();
@@ -1960,6 +2177,12 @@ impl DashboardApp {
                 }
             });
 
+        ui.separator();
+        if ui.checkbox(&mut self.histogram_panel_enabled, "Token Histogram Panel")
+            .on_hover_text("Show token usage histogram in a split pane")
+            .changed()
+        { self.mark_settings_dirty(); }
+
         // Semantic Filters section
         egui::CollapsingHeader::new("Semantic Filters")
             .default_open(false)
@@ -2315,6 +2538,137 @@ impl DashboardApp {
                 }
             });
 
+        // Layout Shaping section (directed stiffness + recency centering)
+        egui::CollapsingHeader::new("Layout Shaping")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Controls how the graph arranges spatially").small().weak());
+                ui.add_space(5.0);
+
+                if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
+                    .logarithmic(true)
+                    .text("Edge Stiffness")
+                    .fixed_decimals(2)).changed() {
+                    self.mark_settings_dirty();
+                }
+                ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
+
+                ui.add_space(5.0);
+
+                if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
+                    .text("Recency→Center")
+                    .fixed_decimals(1)).changed() {
+                    self.mark_settings_dirty();
+                }
+                ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
+            });
+
+        // Similarity Clustering section
+        egui::CollapsingHeader::new("Similarity Clustering")
+            .default_open(false)
+            .show(ui, |ui| {
+                let was_enabled = self.similarity_clustering_enabled;
+                ui.checkbox(&mut self.similarity_clustering_enabled, "Enable similarity edges");
+
+                if self.similarity_clustering_enabled != was_enabled {
+                    if self.similarity_clustering_enabled {
+                        self.graph.set_similarity_clustering_enabled(true);
+                        self.trigger_similarity_edge_fetch();
+                    } else {
+                        self.graph.set_similarity_clustering_enabled(false);
+                        self.graph.build_similarity_edges(Vec::new());
+                        self.similarity_edge_count = 0;
+                    }
+                }
+
+                if self.similarity_clustering_enabled {
+                    // Threshold slider
+                    let prev_threshold = self.graph.similarity_threshold;
+                    ui.add(egui::Slider::new(&mut self.graph.similarity_threshold, 0.5..=1.0)
+                        .text("Threshold")
+                        .fixed_decimals(2));
+                    let threshold_changed = (self.graph.similarity_threshold - prev_threshold).abs() > 0.001;
+
+                    // Strength slider (physics force multiplier)
+                    ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
+                        .logarithmic(true)
+                        .text("Strength"));
+
+                    // k-nearest slider
+                    let prev_k = self.graph.similarity_k_nearest;
+                    let mut k_val = self.graph.similarity_k_nearest as i32;
+                    ui.add(egui::Slider::new(&mut k_val, 1..=50)
+                        .text("k-nearest"));
+                    self.graph.similarity_k_nearest = k_val as usize;
+                    let k_changed = self.graph.similarity_k_nearest != prev_k;
+
+                    // Edge opacity slider
+                    ui.add(egui::Slider::new(&mut self.similarity_edge_opacity, 0.0..=1.0)
+                        .text("Edge opacity")
+                        .fixed_decimals(2));
+
+                    // Time window slider (0 = no limit)
+                    let prev_tw = self.graph.similarity_time_window_hours.unwrap_or(0.0);
+                    let mut tw_val = prev_tw;
+                    ui.add(egui::Slider::new(&mut tw_val, 0.0..=720.0)
+                        .text("Time window (hrs)")
+                        .fixed_decimals(0));
+                    let new_tw = if tw_val < 0.5 { None } else { Some(tw_val) };
+                    self.graph.similarity_time_window_hours = new_tw;
+                    let tw_changed = (tw_val - prev_tw).abs() > 0.5;
+
+                    // Max edges dropdown
+                    let sim_edge_limits = [
+                        (10_000_usize, "10k"),
+                        (50_000, "50k"),
+                        (100_000, "100k"),
+                        (250_000, "250k"),
+                    ];
+                    let current_sim_limit = self.graph.max_similarity_edges;
+                    let current_sim_label = sim_edge_limits.iter()
+                        .find(|(v, _)| *v == current_sim_limit)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Custom");
+                    let prev_max = self.graph.max_similarity_edges;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max edges:");
+                        egui::ComboBox::from_id_salt("max_similarity_edges")
+                            .selected_text(current_sim_label)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in sim_edge_limits {
+                                    if ui.selectable_label(current_sim_limit == value, label).clicked() {
+                                        self.graph.set_max_similarity_edges(value);
+                                    }
+                                }
+                            });
+                    });
+                    let max_changed = self.graph.max_similarity_edges != prev_max;
+
+                    // Show edge count and loading state
+                    if self.similarity_edges_loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading similarity edges...");
+                        });
+                    } else {
+                        ui.label(format!("Similarity edges: {}", self.similarity_edge_count));
+                    }
+
+                    // Rebuild button
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.similarity_edges_loading, egui::Button::new("Rebuild")).clicked() {
+                            self.trigger_similarity_edge_fetch();
+                        }
+                    });
+
+                    // Auto-refetch when parameters change
+                    if (threshold_changed || k_changed || tw_changed || max_changed) && !self.similarity_edges_loading {
+                        self.trigger_similarity_edge_fetch();
+                    }
+                }
+            });
+
         ui.add_space(10.0);
         ui.separator();
 
@@ -2658,6 +3012,8 @@ impl DashboardApp {
 
             let base_opacity = if edge.is_temporal {
                 self.temporal_edge_opacity
+            } else if edge.is_similarity {
+                self.similarity_edge_opacity
             } else {
                 0.5
             };
@@ -2986,10 +3342,11 @@ impl DashboardApp {
             }
         }
 
-        // Handle click selection with double-click detection
+        // Handle click selection with double-click and Ctrl+Click detection
         // Use the already-computed closest node from hover detection
         if response.clicked() {
             let clicked_node = self.graph.hovered_node.clone();
+            let modifiers = ui.input(|i| i.modifiers);
 
             if let Some(ref node_id) = clicked_node {
                 // Cross-session click: if clicking on a dimmed (non-visible) node, jump timeline to it
@@ -3005,18 +3362,23 @@ impl DashboardApp {
                     }
                 }
 
-                // Check for double-click (same node within 500ms)
-                let now = Instant::now();
-                let elapsed = now.duration_since(self.last_click_time).as_millis();
-                let same_node = self.last_click_node.as_ref() == Some(node_id);
-                let is_double_click = same_node && elapsed < 500;
+                // Ctrl+Click (Cmd+Click on macOS) → neighborhood summary
+                if modifiers.command {
+                    self.trigger_neighborhood_summary(node_id.clone());
+                } else {
+                    // Check for double-click (same node within 500ms)
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(self.last_click_time).as_millis();
+                    let same_node = self.last_click_node.as_ref() == Some(node_id);
+                    let is_double_click = same_node && elapsed < 500;
 
-                if is_double_click {
-                    self.trigger_summary_for_node(node_id.clone());
+                    if is_double_click {
+                        self.trigger_summary_for_node(node_id.clone());
+                    }
+
+                    self.last_click_time = now;
+                    self.last_click_node = clicked_node.clone();
                 }
-
-                self.last_click_time = now;
-                self.last_click_node = clicked_node.clone();
             } else {
                 self.last_click_node = None;
             }
@@ -3166,6 +3528,487 @@ impl DashboardApp {
 
             ui.ctx().request_repaint(); // Keep animating
         }
+    }
+
+    /// Render split view with graph on left and histogram on right
+    fn render_split_view(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_rect_before_wrap();
+
+        // Calculate split dimensions
+        let divider_width = 4.0;
+        let graph_width = available.width() * self.histogram_split_ratio - divider_width / 2.0;
+        let histogram_width = available.width() * (1.0 - self.histogram_split_ratio) - divider_width / 2.0;
+
+        // Graph panel (left)
+        let graph_rect = egui::Rect::from_min_size(
+            available.min,
+            egui::vec2(graph_width, available.height()),
+        );
+
+        // Divider (center)
+        let divider_rect = egui::Rect::from_min_size(
+            egui::pos2(available.min.x + graph_width, available.min.y),
+            egui::vec2(divider_width, available.height()),
+        );
+
+        // Histogram panel (right)
+        let histogram_rect = egui::Rect::from_min_size(
+            egui::pos2(available.min.x + graph_width + divider_width, available.min.y),
+            egui::vec2(histogram_width, available.height()),
+        );
+
+        // Render graph in left pane
+        let mut graph_ui = ui.new_child(egui::UiBuilder::new().max_rect(graph_rect));
+        self.render_graph(&mut graph_ui);
+
+        // Render draggable divider
+        self.render_divider(ui, divider_rect);
+
+        // Render histogram in right pane
+        let mut histogram_ui = ui.new_child(egui::UiBuilder::new().max_rect(histogram_rect));
+        self.render_token_histogram(&mut histogram_ui);
+    }
+
+    /// Render the draggable divider between graph and histogram
+    fn render_divider(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        // Handle dragging
+        if response.dragged() {
+            let drag_delta_x = response.drag_delta().x;
+            let available_width = ui.available_width();
+            let ratio_delta = drag_delta_x / available_width;
+            self.histogram_split_ratio = (self.histogram_split_ratio + ratio_delta).clamp(0.2, 0.8);
+            self.histogram_dragging_divider = true;
+            self.mark_settings_dirty();
+        } else if self.histogram_dragging_divider && !response.is_pointer_button_down_on() {
+            self.histogram_dragging_divider = false;
+        }
+
+        // Visual feedback
+        let color = if response.hovered() || self.histogram_dragging_divider {
+            theme::border::FOCUS
+        } else {
+            theme::border::SUBTLE
+        };
+
+        ui.painter().rect_filled(rect, 0.0, color);
+
+        // Change cursor on hover
+        if response.hovered() || self.histogram_dragging_divider {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+
+    /// Get the color for a session in the histogram, matching graph node colors
+    fn histogram_session_color(&self, session_id: &str, project: &str) -> egui::Color32 {
+        use crate::graph::types::{ColorMode, hsl_to_rgb};
+        match self.graph.color_mode {
+            ColorMode::Project if !project.is_empty() => {
+                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.55)
+            }
+            ColorMode::Hybrid if !project.is_empty() => {
+                let hue = self.graph.project_colors.get(project).copied().unwrap_or(0.0);
+                let t = self.graph.session_position_in_project(session_id, project);
+                let sat = 0.5 + t * 0.4;
+                let light = 0.65 - t * 0.2;
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), sat, light)
+            }
+            _ => {
+                let hue = self.graph.session_colors.get(session_id).copied().unwrap_or(0.0);
+                hsl_to_rgb(self.graph.apply_hue_offset(hue), 0.7, 0.5)
+            }
+        }
+    }
+
+    /// Render the token usage histogram
+    fn render_token_histogram(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Token Usage");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("histogram_stack_order")
+                        .selected_text(self.histogram_stack_order.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.histogram_stack_order, HistogramStackOrder::MostTokens, "Most Tokens");
+                            ui.selectable_value(&mut self.histogram_stack_order, HistogramStackOrder::OldestFirst, "Oldest First");
+                            ui.selectable_value(&mut self.histogram_stack_order, HistogramStackOrder::MostMessages, "Most Messages");
+                        });
+                });
+            });
+
+            ui.separator();
+
+            let bins = self.aggregate_token_bins();
+
+            if bins.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No token data available");
+                });
+                return;
+            }
+
+            self.render_histogram_bars(ui, &bins);
+        });
+    }
+
+    /// Render the histogram bars using direct painter calls.
+    /// Session-colored stacking with grey-out for filtered sessions, click-to-filter, trackpad zoom/pan.
+    fn render_histogram_bars(&mut self, ui: &mut egui::Ui, bins: &[TokenBin]) {
+        if bins.is_empty() {
+            return;
+        }
+
+        let max_total = bins.iter()
+            .map(|b| b.total_tokens)
+            .max()
+            .unwrap_or(1);
+
+        let bar_width = self.histogram_bar_width;
+        let label_height = 20.0;
+        let available_height = (ui.available_height() - label_height).max(40.0);
+        let total_width = bins.len() as f32 * bar_width;
+
+        // Allocate one big rect for the entire histogram
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(total_width.max(ui.available_width()), available_height + label_height),
+            egui::Sense::click_and_drag(),
+        );
+
+        let bar_area = egui::Rect::from_min_size(rect.min, egui::vec2(total_width, available_height));
+        let painter = ui.painter_at(rect);
+
+        // Handle trackpad zoom and pan
+        let pointer_over = ui.rect_contains_pointer(rect);
+        if pointer_over {
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            let modifiers = ui.input(|i| i.modifiers);
+
+            if modifiers.command {
+                // Zoom: cmd + scroll Y (pinch gesture)
+                let zoom_delta = scroll.y * 0.01;
+                self.histogram_bar_width = (self.histogram_bar_width * (1.0 + zoom_delta)).clamp(8.0, 120.0);
+            } else {
+                // Pan: two-finger swipe
+                let pan = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
+                self.histogram_scroll_offset -= pan;
+            }
+        }
+
+        // Pan via drag
+        if response.dragged() {
+            self.histogram_scroll_offset -= response.drag_delta().x;
+        }
+
+        // Clamp scroll offset
+        let max_scroll = (total_width - rect.width()).max(0.0);
+        self.histogram_scroll_offset = self.histogram_scroll_offset.clamp(0.0, max_scroll);
+
+        // Determine which bin is hovered
+        let mut hovered_bin_idx: Option<usize> = None;
+
+        if let Some(pointer) = response.hover_pos() {
+            let rel_x = pointer.x - rect.min.x + self.histogram_scroll_offset;
+            let bin_idx = (rel_x / bar_width) as usize;
+            if bin_idx < bins.len() && pointer.y >= rect.min.y && pointer.y <= rect.min.y + available_height {
+                hovered_bin_idx = Some(bin_idx);
+            }
+        }
+        self.histogram_hovered_bin = hovered_bin_idx;
+
+        // Track click for click-to-filter
+        let clicked = response.clicked();
+        let click_pos = response.interact_pointer_pos();
+        let mut click_hit_segment = false;
+
+        // Paint bars directly
+        for (i, bin) in bins.iter().enumerate() {
+            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
+
+            // Skip bars outside visible area
+            if bar_x + bar_width < rect.min.x || bar_x > rect.max.x {
+                continue;
+            }
+
+            if bin.total_tokens > 0 {
+                let scale = available_height / max_total as f32;
+                let mut y_offset = 0.0;
+
+                // Draw session segments bottom to top
+                for session in &bin.sessions {
+                    let height = session.total_tokens as f32 * scale;
+                    let seg_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_x, bar_area.max.y - y_offset - height),
+                        egui::vec2(bar_width, height),
+                    );
+                    let base_color = self.histogram_session_color(&session.session_id, &session.project);
+                    let color = if session.is_filtered {
+                        // Grey-out filtered sessions
+                        let grey = (base_color.r() as f32 * 0.299
+                            + base_color.g() as f32 * 0.587
+                            + base_color.b() as f32 * 0.114) as u8;
+                        Color32::from_rgba_unmultiplied(grey, grey, grey, 100)
+                    } else {
+                        base_color
+                    };
+                    painter.rect_filled(seg_rect, 0.0, color);
+
+                    // Click-to-filter: if this segment was clicked, toggle the project
+                    if clicked && !session.project.is_empty() {
+                        if let Some(pos) = click_pos {
+                            if seg_rect.contains(pos) {
+                                click_hit_segment = true;
+                                if !self.project_filter_enabled {
+                                    self.project_filter_enabled = true;
+                                }
+                                if self.selected_projects.contains(&session.project) {
+                                    self.selected_projects.remove(&session.project);
+                                } else {
+                                    self.selected_projects.insert(session.project.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    y_offset += height;
+                }
+            }
+        }
+
+        // Click on empty space clears project filter
+        if clicked && !click_hit_segment && self.project_filter_enabled {
+            self.project_filter_enabled = false;
+            self.selected_projects = self.available_projects.iter().cloned().collect();
+        }
+
+        // Date labels: tick marks at regular intervals
+        let label_interval = ((60.0 / bar_width).ceil() as usize).max(1);
+        for (i, bin) in bins.iter().enumerate() {
+            if i % label_interval != 0 {
+                continue;
+            }
+            let bar_x = rect.min.x + i as f32 * bar_width - self.histogram_scroll_offset;
+            if bar_x < rect.min.x - bar_width || bar_x > rect.max.x + bar_width {
+                continue;
+            }
+
+            let tick_top = rect.min.y + available_height;
+            let tick_bottom = tick_top + 4.0;
+            let label_color = theme::text::SECONDARY;
+
+            // Tick mark
+            painter.line_segment(
+                [egui::pos2(bar_x, tick_top), egui::pos2(bar_x, tick_bottom)],
+                egui::Stroke::new(1.0, label_color),
+            );
+
+            // Label
+            let label = format_timestamp(&bin.timestamp_start);
+            painter.text(
+                egui::pos2(bar_x + 2.0, tick_bottom + 1.0),
+                egui::Align2::LEFT_TOP,
+                &label,
+                egui::FontId::proportional(10.0),
+                label_color,
+            );
+        }
+
+        // Hover tooltip
+        if let Some(idx) = hovered_bin_idx {
+            let bin = &bins[idx];
+            let bar_x = rect.min.x + idx as f32 * bar_width - self.histogram_scroll_offset;
+            let tooltip_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_x, rect.min.y),
+                egui::vec2(bar_width, available_height),
+            );
+            // Show hover highlight
+            painter.rect_filled(
+                tooltip_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+            );
+
+            egui::show_tooltip_at_pointer(ui.ctx(), egui::LayerId::new(egui::Order::Tooltip, ui.id().with("hist_layer")), ui.id().with("hist_tooltip"), |ui| {
+                ui.label(format!("{} - {}",
+                    format_timestamp(&bin.timestamp_start),
+                    format_timestamp(&bin.timestamp_end)
+                ));
+                ui.separator();
+                for session in &bin.sessions {
+                    let color = self.histogram_session_color(&session.session_id, &session.project);
+                    let label = if session.project.is_empty() {
+                        format!("{}: {} tokens", &session.session_id[..8.min(session.session_id.len())], session.total_tokens)
+                    } else {
+                        format!("{}{}: {} tokens",
+                            session.project,
+                            if session.is_filtered { " (filtered)" } else { "" },
+                            session.total_tokens)
+                    };
+                    ui.colored_label(color, label);
+                }
+                ui.separator();
+                ui.label(format!("Total: {} tokens", bin.total_tokens));
+            });
+        }
+    }
+
+    /// Aggregate token usage into time bins by session.
+    /// Includes ALL sessions (not filtered by project), but tags them as filtered.
+    /// Sorts session stacking by histogram_stack_order.
+    fn aggregate_token_bins(&self) -> Vec<TokenBin> {
+        use chrono::{DateTime, Utc};
+
+        // Collect all nodes with token data and valid timestamps
+        // Include ALL nodes regardless of project filter (only skip for timeline)
+        let mut timestamped_nodes: Vec<_> = self.graph.data.nodes.iter()
+            .filter_map(|node| {
+                // Skip nodes hidden by timeline
+                if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
+                    return None;
+                }
+
+                let ts = node.timestamp.as_ref()?;
+                let total = node.input_tokens.unwrap_or(0)
+                    + node.output_tokens.unwrap_or(0)
+                    + node.cache_read_tokens.unwrap_or(0)
+                    + node.cache_creation_tokens.unwrap_or(0);
+
+                if total == 0 {
+                    return None;
+                }
+
+                Some((ts.clone(), node.session_id.clone(), node.project.clone(), total as i64))
+            })
+            .collect();
+
+        if timestamped_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort by timestamp
+        timestamped_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Parse timestamps
+        let parsed_nodes: Vec<_> = timestamped_nodes.iter()
+            .filter_map(|(ts, session_id, project, total)| {
+                let parsed = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+                Some((parsed, session_id.clone(), project.clone(), *total))
+            })
+            .collect();
+
+        if parsed_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        // When timeline scrubber is active, synchronize histogram to the visible window
+        let (start_time, bin_duration_secs, bin_count) = if self.timeline_enabled {
+            let scrubber_start_epoch = self.graph.timeline.time_at_position(self.graph.timeline.start_position);
+            let scrubber_end_epoch = self.graph.timeline.time_at_position(self.graph.timeline.position);
+            let visible_range_secs = (scrubber_end_epoch - scrubber_start_epoch).max(1.0);
+
+            let start_dt = DateTime::<Utc>::from_timestamp(scrubber_start_epoch as i64, 0)
+                .unwrap_or_else(|| parsed_nodes.first().unwrap().0);
+
+            let raw_bin = visible_range_secs / 20.0;
+            let bin_dur = if raw_bin <= 60.0 { 60 }
+                else if raw_bin <= 5.0 * 60.0 { 5 * 60 }
+                else if raw_bin <= 15.0 * 60.0 { 15 * 60 }
+                else if raw_bin <= 30.0 * 60.0 { 30 * 60 }
+                else if raw_bin <= 3600.0 { 3600 }
+                else if raw_bin <= 3.0 * 3600.0 { 3 * 3600 }
+                else if raw_bin <= 6.0 * 3600.0 { 6 * 3600 }
+                else if raw_bin <= 12.0 * 3600.0 { 12 * 3600 }
+                else if raw_bin <= 86400.0 { 86400 }
+                else { (7 * 86400_i64).max(raw_bin as i64) };
+
+            let count = ((visible_range_secs / bin_dur as f64).ceil() as usize).max(1);
+            (start_dt, bin_dur, count)
+        } else {
+            let bin_dur = self.time_range.bin_duration_secs() as i64;
+            let data_start = parsed_nodes.first().unwrap().0;
+            let data_end = parsed_nodes.last().unwrap().0;
+            let range_secs = (data_end - data_start).num_seconds();
+            let count = ((range_secs as f64 / bin_dur as f64).ceil() as usize).max(1);
+            (data_start, bin_dur, count)
+        };
+
+        // Initialize bins with session-level tracking
+        let mut bin_session_maps: Vec<HashMap<String, (String, i64)>> = Vec::new();
+        let mut bins = Vec::new();
+        for i in 0..bin_count {
+            let bin_start = start_time + chrono::Duration::seconds(i as i64 * bin_duration_secs);
+            let bin_end = start_time + chrono::Duration::seconds((i as i64 + 1) * bin_duration_secs);
+
+            bins.push(TokenBin {
+                timestamp_start: bin_start.to_rfc3339(),
+                timestamp_end: bin_end.to_rfc3339(),
+                sessions: Vec::new(),
+                total_tokens: 0,
+            });
+            bin_session_maps.push(HashMap::new());
+        }
+
+        // Aggregate nodes into bins by session
+        for (timestamp, session_id, project, total) in parsed_nodes {
+            let offset = (timestamp - start_time).num_seconds();
+            if offset < 0 { continue; }
+            let bin_index = (offset / bin_duration_secs) as usize;
+            if bin_index < bins.len() {
+                let entry = bin_session_maps[bin_index]
+                    .entry(session_id.clone())
+                    .or_insert_with(|| (project.clone(), 0));
+                entry.1 += total;
+            }
+        }
+
+        // Convert session maps into sorted SessionTokens vecs
+        let session_cache = &self.session_metadata_cache;
+        let project_filter_enabled = self.project_filter_enabled;
+        let selected_projects = &self.selected_projects;
+        let stack_order = self.histogram_stack_order;
+
+        for (i, session_map) in bin_session_maps.into_iter().enumerate() {
+            let mut sessions: Vec<SessionTokens> = session_map
+                .into_iter()
+                .map(|(session_id, (project, total))| {
+                    let is_filtered = project_filter_enabled && !selected_projects.contains(&project);
+                    SessionTokens {
+                        session_id,
+                        project,
+                        total_tokens: total,
+                        is_filtered,
+                    }
+                })
+                .collect();
+
+            // Sort by stack order (bottom of bar = first in vec)
+            match stack_order {
+                HistogramStackOrder::MostTokens => {
+                    sessions.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+                }
+                HistogramStackOrder::OldestFirst => {
+                    sessions.sort_by(|a, b| {
+                        let a_ts = session_cache.get(&a.session_id).map(|c| c.0).unwrap_or(f64::MAX);
+                        let b_ts = session_cache.get(&b.session_id).map(|c| c.0).unwrap_or(f64::MAX);
+                        a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                HistogramStackOrder::MostMessages => {
+                    sessions.sort_by(|a, b| {
+                        let a_count = session_cache.get(&a.session_id).map(|c| c.1).unwrap_or(0);
+                        let b_count = session_cache.get(&b.session_id).map(|c| c.1).unwrap_or(0);
+                        b_count.cmp(&a_count)
+                    });
+                }
+            }
+
+            bins[i].total_tokens = sessions.iter().map(|s| s.total_tokens).sum();
+            bins[i].sessions = sessions;
+        }
+
+        bins
     }
 
     fn render_timeline(&mut self, ui: &mut egui::Ui) {
@@ -3495,6 +4338,30 @@ impl eframe::App for DashboardApp {
             }
         }
 
+        // Check for neighborhood summary result from background thread
+        if let Some(ref rx) = self.neighborhood_summary_receiver {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.neighborhood_summary_data = Some(data);
+                    self.neighborhood_summary_loading = false;
+                    self.neighborhood_summary_receiver = None;
+                }
+                Ok(Err(e)) => {
+                    self.neighborhood_summary_error = Some(e);
+                    self.neighborhood_summary_loading = false;
+                    self.neighborhood_summary_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.neighborhood_summary_error = Some("Neighborhood summary fetch disconnected".to_string());
+                    self.neighborhood_summary_loading = false;
+                    self.neighborhood_summary_receiver = None;
+                }
+            }
+        }
+
         // Check for categorization result from background thread
         if let Some(ref rx) = self.categorization_receiver {
             match rx.try_recv() {
@@ -3613,6 +4480,27 @@ impl eframe::App for DashboardApp {
             }
         }
 
+        // Check for similarity edges result from background thread
+        if let Some(ref rx) = self.similarity_edges_rx {
+            match rx.try_recv() {
+                Ok(edges) => {
+                    let count = edges.len();
+                    self.graph.build_similarity_edges(edges);
+                    self.similarity_edge_count = count;
+                    self.similarity_edges_loading = false;
+                    self.similarity_edges_rx = None;
+                    eprintln!("Loaded {} similarity edges", count);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.similarity_edges_loading = false;
+                    self.similarity_edges_rx = None;
+                }
+            }
+        }
+
         // Handle playback
         if self.graph.timeline.playing && !self.timeline_dragging {
             let now = Instant::now();
@@ -3716,6 +4604,8 @@ impl eframe::App for DashboardApp {
             .show(ctx, |ui| {
                 if !self.db_connected || (!self.loading && self.graph.data.nodes.is_empty()) {
                     self.render_empty_state(ui);
+                } else if self.histogram_panel_enabled {
+                    self.render_split_view(ui);
                 } else {
                     self.render_graph(ui);
                 }
@@ -3729,6 +4619,41 @@ impl eframe::App for DashboardApp {
             self.settings.save();
         }
     }
+}
+
+/// Build adjacency list from graph edges, optionally excluding temporal edges.
+fn build_adjacency_list(edges: &[crate::graph::types::GraphEdge], include_temporal: bool) -> HashMap<String, Vec<String>> {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges {
+        if !include_temporal && edge.is_temporal {
+            continue;
+        }
+        adj.entry(edge.source.clone()).or_default().push(edge.target.clone());
+        adj.entry(edge.target.clone()).or_default().push(edge.source.clone());
+    }
+    adj
+}
+
+/// BFS expansion from seed nodes to the given depth.
+fn expand_to_neighbors(seeds: &HashSet<String>, depth: usize, adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    let mut visited = seeds.clone();
+    let mut frontier = seeds.clone();
+
+    for _ in 0..depth {
+        let mut next_frontier = HashSet::new();
+        for node_id in &frontier {
+            if let Some(neighbors) = adj.get(node_id) {
+                for neighbor in neighbors {
+                    if !visited.contains(neighbor) {
+                        visited.insert(neighbor.clone());
+                        next_frontier.insert(neighbor.clone());
+                    }
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+    visited
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -3763,3 +4688,17 @@ fn truncate_lines(s: &str, max_lines: usize, max_chars_per_line: usize) -> Strin
         result
     }
 }
+
+fn format_timestamp(ts: &str) -> String {
+    use chrono::DateTime;
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
+        parsed.format("%b %d %H:%M").to_string()
+    } else {
+        ts.to_string()
+    }
+}
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod app_tests;

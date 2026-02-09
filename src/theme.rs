@@ -245,6 +245,15 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     result.clamp(0.0, 255.0) as u8
 }
 
+/// Token histogram colors for stacked session bars
+pub mod histogram {
+    use super::*;
+    pub const INPUT: Color32 = Color32::from_rgb(59, 130, 246);
+    pub const OUTPUT: Color32 = Color32::from_rgb(255, 149, 0);
+    pub const CACHE_READ: Color32 = Color32::from_rgb(34, 197, 94);
+    pub const CACHE_CREATE: Color32 = Color32::from_rgb(155, 89, 182);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

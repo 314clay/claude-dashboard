@@ -173,6 +173,21 @@ impl GraphEdge {
             similarity: Some(strength),
         }
     }
+
+    /// Create a similarity edge between two nodes
+    pub fn similarity(source: String, target: String, strength: f32) -> Self {
+        Self {
+            source,
+            target,
+            session_id: String::new(),
+            timestamp: None,
+            is_obsidian: false,
+            is_topic: false,
+            is_similarity: true,
+            is_temporal: false,
+            similarity: Some(strength),
+        }
+    }
 }
 
 /// Issue status for Kanban columns
@@ -351,6 +366,21 @@ pub struct SessionSummaryData {
     pub detected_project: Option<String>,
     #[serde(default)]
     pub generated_at: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Neighborhood summary data from the API (cluster of adjacent nodes)
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NeighborhoodSummaryData {
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub themes: String,
+    #[serde(default)]
+    pub node_count: u32,
+    #[serde(default)]
+    pub session_count: u32,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -597,6 +627,16 @@ pub struct GraphState {
     pub max_temporal_edges: usize,
     /// Maximum total tokens across all nodes (for normalization)
     pub max_tokens: i32,
+    /// Whether similarity clustering is enabled
+    pub similarity_clustering_enabled: bool,
+    /// Minimum similarity threshold for edges (0.0 - 1.0)
+    pub similarity_threshold: f32,
+    /// Number of nearest neighbors per node for similarity edges
+    pub similarity_k_nearest: usize,
+    /// Maximum similarity edges to prevent memory issues
+    pub max_similarity_edges: usize,
+    /// Optional time window in hours to restrict similarity comparisons
+    pub similarity_time_window_hours: Option<f32>,
 }
 
 impl GraphState {
@@ -621,6 +661,11 @@ impl GraphState {
             temporal_window_secs: 300.0, // 5 minutes default
             max_temporal_edges: 100_000,
             max_tokens: 1,
+            similarity_clustering_enabled: false,
+            similarity_threshold: 0.7,
+            similarity_k_nearest: 10,
+            max_similarity_edges: 100_000,
+            similarity_time_window_hours: None,
         }
     }
 
@@ -863,6 +908,38 @@ impl GraphState {
         }
     }
 
+    /// Replace all similarity edges with the provided set.
+    /// Removes existing similarity edges via retain, then extends with new ones.
+    pub fn build_similarity_edges(&mut self, edges: Vec<GraphEdge>) {
+        self.data.edges.retain(|e| !e.is_similarity);
+        self.data.edges.extend(edges);
+    }
+
+    /// Set similarity clustering enabled (no auto-rebuild since fetch is async)
+    pub fn set_similarity_clustering_enabled(&mut self, enabled: bool) {
+        self.similarity_clustering_enabled = enabled;
+    }
+
+    /// Set similarity threshold (no auto-rebuild since fetch is async)
+    pub fn set_similarity_threshold(&mut self, threshold: f32) {
+        self.similarity_threshold = threshold;
+    }
+
+    /// Set similarity k-nearest (no auto-rebuild since fetch is async)
+    pub fn set_similarity_k_nearest(&mut self, k: usize) {
+        self.similarity_k_nearest = k;
+    }
+
+    /// Set max similarity edges (no auto-rebuild since fetch is async)
+    pub fn set_max_similarity_edges(&mut self, max_edges: usize) {
+        self.max_similarity_edges = max_edges;
+    }
+
+    /// Set similarity time window in hours (no auto-rebuild since fetch is async)
+    pub fn set_similarity_time_window_hours(&mut self, hours: Option<f32>) {
+        self.similarity_time_window_hours = hours;
+    }
+
     /// Build timeline sorted indices and timestamps for all item types.
     /// This creates a unified timeline that spans nodes, beads, and mail.
     fn build_timeline(&mut self) {
@@ -1040,7 +1117,7 @@ impl GraphState {
     }
 
     /// Apply global hue offset, wrapping around 360°
-    fn apply_hue_offset(&self, hue: f32) -> f32 {
+    pub fn apply_hue_offset(&self, hue: f32) -> f32 {
         (hue + self.hue_offset) % 360.0
     }
 
@@ -1052,7 +1129,7 @@ impl GraphState {
 
     /// Get the position (0.0-1.0) of a session within its project's timeline.
     /// Used for hybrid coloring: earlier sessions = 0.0, later sessions = 1.0.
-    fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
+    pub fn session_position_in_project(&self, session_id: &str, project: &str) -> f32 {
         if let Some(sessions) = self.project_sessions.get(project) {
             if sessions.len() <= 1 {
                 return 0.5; // Single session, use middle

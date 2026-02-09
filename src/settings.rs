@@ -91,6 +91,12 @@ pub struct Preset {
     pub temporal_edge_opacity: f32,
     pub max_temporal_edges: usize,
 
+    // Layout shaping
+    #[serde(default = "default_directed_stiffness")]
+    pub directed_stiffness: f32,
+    #[serde(default)]
+    pub recency_centering: f32,
+
     // Color Snapshot
     #[serde(default)]
     pub hue_offset: f32,
@@ -131,6 +137,8 @@ impl Preset {
             temporal_window_mins: settings.temporal_window_mins,
             temporal_edge_opacity: settings.temporal_edge_opacity,
             max_temporal_edges: settings.max_temporal_edges,
+            directed_stiffness: settings.directed_stiffness,
+            recency_centering: settings.recency_centering,
             // Color snapshot
             hue_offset: graph.hue_offset,
             project_colors: graph.project_colors.clone(),
@@ -162,6 +170,8 @@ impl Preset {
         settings.temporal_window_mins = self.temporal_window_mins;
         settings.temporal_edge_opacity = self.temporal_edge_opacity;
         settings.max_temporal_edges = self.max_temporal_edges;
+        settings.directed_stiffness = self.directed_stiffness;
+        settings.recency_centering = self.recency_centering;
 
         // Restore colors (merge: saved colors take precedence over current)
         graph.hue_offset = self.hue_offset;
@@ -223,6 +233,12 @@ pub struct Settings {
     #[serde(default = "default_max_temporal_edges")]
     pub max_temporal_edges: usize,
 
+    // Layout shaping
+    #[serde(default = "default_directed_stiffness")]
+    pub directed_stiffness: f32,
+    #[serde(default)]
+    pub recency_centering: f32,
+
     // Saved presets
     #[serde(default)]
     pub presets: Vec<Preset>,
@@ -238,6 +254,12 @@ pub struct Settings {
     pub beads_panel_open: bool,
     #[serde(default = "default_mail_panel_open")]
     pub mail_panel_open: bool,
+
+    // Token histogram panel
+    #[serde(default = "default_histogram_panel_enabled")]
+    pub histogram_panel_enabled: bool,
+    #[serde(default = "default_histogram_split_ratio")]
+    pub histogram_split_ratio: f32,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -284,6 +306,11 @@ fn default_mail_panel_open() -> bool {
     false
 }
 
+fn default_directed_stiffness() -> f32 { 1.0 }
+
+fn default_histogram_panel_enabled() -> bool { false }
+fn default_histogram_split_ratio() -> f32 { 0.65 }
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -322,6 +349,10 @@ impl Default for Settings {
             temporal_edge_opacity: 0.3,
             max_temporal_edges: 100_000,
 
+            // Layout shaping
+            directed_stiffness: 1.0,
+            recency_centering: 0.0,
+
             // Presets
             presets: Vec::new(),
 
@@ -332,6 +363,10 @@ impl Default for Settings {
             // Panel visibility
             beads_panel_open: false,
             mail_panel_open: false,
+
+            // Token histogram panel
+            histogram_panel_enabled: false,
+            histogram_split_ratio: 0.65,
         }
     }
 }

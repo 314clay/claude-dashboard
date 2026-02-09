@@ -1,6 +1,6 @@
 //! HTTP client for the dashboard API.
 
-use crate::graph::types::{GraphData, GraphEdge, GraphNode, PartialSummaryData, SemanticFilter, SessionSummaryData};
+use crate::graph::types::{GraphData, GraphEdge, GraphNode, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SessionSummaryData};
 use std::collections::HashMap;
 use crate::mail::MailNetworkData;
 use reqwest::blocking::Client;
@@ -77,6 +77,22 @@ pub struct EmbeddingGenResult {
     pub errors: Option<Vec<String>>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// A single similarity edge from the API
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimilarityEdgeResponse {
+    pub source: String,
+    pub target: String,
+    pub similarity: f32,
+}
+
+/// Response wrapper for similarity edges endpoint
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimilarityEdgesResponse {
+    pub edges: Vec<SimilarityEdgeResponse>,
+    pub count: usize,
+    pub threshold_used: f32,
 }
 
 pub struct ApiClient {
@@ -201,6 +217,36 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(summary)
+    }
+
+    /// Fetch neighborhood summary for a cluster of graph-adjacent nodes
+    pub fn fetch_neighborhood_summary(
+        &self,
+        message_ids: Vec<String>,
+    ) -> Result<NeighborhoodSummaryData, String> {
+        let url = format!("{}/summary/neighborhood", self.base_url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "message_ids": message_ids }))
+            .timeout(Duration::from_secs(45)) // LLM generation can be slow
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let data: NeighborhoodSummaryData = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        if let Some(ref err) = data.error {
+            return Err(err.clone());
+        }
+
+        Ok(data)
     }
 
     /// Fetch importance scoring statistics
@@ -503,6 +549,40 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(result)
+    }
+
+    /// Fetch pre-computed similarity edges from the API
+    pub fn fetch_similarity_edges(
+        &self,
+        threshold: f32,
+        k_nearest: usize,
+        max_edges: usize,
+        time_window_hours: Option<f32>,
+    ) -> Result<SimilarityEdgesResponse, String> {
+        let mut url = format!(
+            "{}/embeddings/similarity-edges?threshold={}&k_nearest={}&max_edges={}",
+            self.base_url, threshold, k_nearest, max_edges
+        );
+        if let Some(hours) = time_window_hours {
+            url.push_str(&format!("&time_window_hours={}", hours));
+        }
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let response: SimilarityEdgesResponse = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(response)
     }
 
     /// Search messages by semantic similarity
