@@ -95,6 +95,15 @@ pub struct SimilarityEdgesResponse {
     pub threshold_used: f32,
 }
 
+/// Result from session ingest operation
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestResult {
+    pub sessions: i64,
+    pub messages: i64,
+    pub tools: i64,
+    pub error: Option<String>,
+}
+
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -121,6 +130,32 @@ impl ApiClient {
             }
             Err(e) => Err(format!("Failed to connect to API: {}", e)),
         }
+    }
+
+    /// Trigger re-ingestion of Claude sessions
+    pub fn trigger_ingest(&self, since: &str) -> Result<IngestResult, String> {
+        let url = format!("{}/ingest?since={}", self.base_url, since);
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let result: IngestResult = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        if let Some(ref err) = result.error {
+            return Err(err.clone());
+        }
+
+        Ok(result)
     }
 
     /// Fetch graph data from the API

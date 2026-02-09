@@ -55,6 +55,7 @@ from db.mail import get_mail_network
 #     get_recent_sleep,
 #     get_health_stats,
 # )
+import subprocess
 from pydantic import BaseModel
 
 app = FastAPI(
@@ -510,6 +511,53 @@ def embedding_similarity_edges(
         "count": len(edges),
         "threshold_used": threshold,
     }
+
+
+# ==== Ingest Endpoint ====
+
+@app.post("/ingest")
+def trigger_ingest(
+    since: str = Query(default="24h", description="Time window to ingest, e.g. '24h', '7d'"),
+):
+    """Trigger re-ingestion of Claude Code sessions from ~/.claude/.
+
+    Runs ingest.py as a subprocess with --since flag.
+    Returns: { sessions, messages, tools, error? }
+    """
+    ingest_script = Path(__file__).parent.parent / "ingest.py"
+    if not ingest_script.exists():
+        return {"error": f"ingest.py not found at {ingest_script}"}
+
+    try:
+        result = subprocess.run(
+            ["python3", str(ingest_script), "--since", since],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        # Parse the "Done: N sessions, N messages, N tool usages" line from output
+        output = result.stdout
+        stats = {"sessions": 0, "messages": 0, "tools": 0, "output": output}
+
+        for line in output.splitlines():
+            if line.startswith("Done:"):
+                import re as _re
+                nums = _re.findall(r"(\d+)", line)
+                if len(nums) >= 3:
+                    stats["sessions"] = int(nums[0])
+                    stats["messages"] = int(nums[1])
+                    stats["tools"] = int(nums[2])
+
+        if result.returncode != 0:
+            stats["error"] = result.stderr or f"Exit code {result.returncode}"
+
+        return stats
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Ingest timed out after 300s"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ==== Mail Network Endpoints ====

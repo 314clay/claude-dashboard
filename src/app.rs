@@ -1,6 +1,6 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, RescoreEvent, RescoreProgress, RescoreResult};
+use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, IngestResult, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
@@ -276,7 +276,13 @@ pub struct DashboardApp {
     histogram_bar_width: f32,
     histogram_scroll_offset: f32,
     histogram_stack_order: HistogramStackOrder,
+    histogram_last_clicked: Option<(String, String)>, // (session_id, project)
+    histogram_drill_level: u8, // 0=none, 1=project, 2=session
+    histogram_session_filter: Option<String>, // session_id to isolate
     session_metadata_cache: HashMap<String, (f64, usize)>,
+
+    // Layout shaping (directed stiffness + recency centering)
+    layout_shaping_enabled: bool,
 
     // Similarity clustering (edge-based, fetched from API)
     similarity_clustering_enabled: bool,
@@ -421,6 +427,9 @@ impl DashboardApp {
             histogram_bar_width: 40.0,
             histogram_scroll_offset: 0.0,
             histogram_stack_order: HistogramStackOrder::MostTokens,
+            histogram_last_clicked: None,
+            histogram_drill_level: 0,
+            histogram_session_filter: None,
             session_metadata_cache: HashMap::new(),
 
             // Settings persistence
@@ -465,6 +474,9 @@ impl DashboardApp {
             mail_network_state: None,
             mail_network_loading: false,
             mail_network_error: None,
+
+            // Layout shaping
+            layout_shaping_enabled: false,
 
             // Similarity clustering
             similarity_clustering_enabled: false,
@@ -956,6 +968,10 @@ impl DashboardApp {
             if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                 continue;
             }
+            // Session filter (histogram drill-down)
+            if let Some(ref sf) = self.histogram_session_filter {
+                if node.session_id != *sf { continue; }
+            }
             // Semantic filter - use pre-computed set for +1/+2, otherwise per-node check
             if let Some(ref sem_visible) = semantic_visible {
                 if !sem_visible.contains(&node.id) {
@@ -1331,6 +1347,10 @@ impl DashboardApp {
             // Check project filter
             if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                 continue;
+            }
+            // Session filter (histogram drill-down)
+            if let Some(ref sf) = self.histogram_session_filter {
+                if node.session_id != *sf { continue; }
             }
             // Check semantic filters
             if let Some(ref sem_visible) = semantic_visible {
@@ -2542,25 +2562,38 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Layout Shaping")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Controls how the graph arranges spatially").small().weak());
-                ui.add_space(5.0);
+                let was_enabled = self.layout_shaping_enabled;
+                ui.checkbox(&mut self.layout_shaping_enabled, "Enable layout shaping");
 
-                if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
-                    .logarithmic(true)
-                    .text("Edge Stiffness")
-                    .fixed_decimals(2)).changed() {
+                if self.layout_shaping_enabled != was_enabled {
+                    if !self.layout_shaping_enabled {
+                        // Reset to defaults when disabled
+                        self.layout.directed_stiffness = 1.0;
+                        self.layout.recency_centering = 0.0;
+                    }
                     self.mark_settings_dirty();
                 }
-                ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
 
-                ui.add_space(5.0);
+                if self.layout_shaping_enabled {
+                    ui.add_space(5.0);
 
-                if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
-                    .text("Recency→Center")
-                    .fixed_decimals(1)).changed() {
-                    self.mark_settings_dirty();
+                    if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
+                        .logarithmic(true)
+                        .text("Edge Stiffness")
+                        .fixed_decimals(2)).changed() {
+                        self.mark_settings_dirty();
+                    }
+                    ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
+
+                    ui.add_space(5.0);
+
+                    if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
+                        .text("Recency→Center")
+                        .fixed_decimals(1)).changed() {
+                        self.mark_settings_dirty();
+                    }
+                    ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
                 }
-                ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
             });
 
         // Similarity Clustering section
@@ -3065,6 +3098,10 @@ impl DashboardApp {
                 if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                     continue;
                 }
+                // Session filter (histogram drill-down)
+                if let Some(ref sf) = self.histogram_session_filter {
+                    if node.session_id != *sf { continue; }
+                }
                 // Skip nodes that don't pass semantic filters
                 if let Some(ref sem_visible) = semantic_visible {
                     if !sem_visible.contains(&node.id) {
@@ -3136,6 +3173,10 @@ impl DashboardApp {
             // Skip nodes not in selected projects when filter is enabled
             if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
                 continue;
+            }
+            // Session filter (histogram drill-down)
+            if let Some(ref sf) = self.histogram_session_filter {
+                if node.session_id != *sf { continue; }
             }
 
             // Skip nodes that don't pass semantic filters
@@ -3755,18 +3796,53 @@ impl DashboardApp {
                     };
                     painter.rect_filled(seg_rect, 0.0, color);
 
-                    // Click-to-filter: if this segment was clicked, toggle the project
+                    // Progressive drill-down on click:
+                    // Same segment repeatedly: project → session → clear
+                    // Different segment: toggle that project
                     if clicked && !session.project.is_empty() {
                         if let Some(pos) = click_pos {
                             if seg_rect.contains(pos) {
                                 click_hit_segment = true;
-                                if !self.project_filter_enabled {
-                                    self.project_filter_enabled = true;
-                                }
-                                if self.selected_projects.contains(&session.project) {
-                                    self.selected_projects.remove(&session.project);
+                                let this_seg = (session.session_id.clone(), session.project.clone());
+                                let same_as_last = self.histogram_last_clicked.as_ref() == Some(&this_seg);
+
+                                if same_as_last {
+                                    // Consecutive click on same segment — advance drill
+                                    match self.histogram_drill_level {
+                                        1 => {
+                                            // Drill to session
+                                            self.histogram_session_filter = Some(session.session_id.clone());
+                                            self.histogram_drill_level = 2;
+                                        }
+                                        2 => {
+                                            // Clear all filters
+                                            self.project_filter_enabled = false;
+                                            self.selected_projects = self.available_projects.iter().cloned().collect();
+                                            self.histogram_session_filter = None;
+                                            self.histogram_last_clicked = None;
+                                            self.histogram_drill_level = 0;
+                                        }
+                                        _ => {}
+                                    }
                                 } else {
-                                    self.selected_projects.insert(session.project.clone());
+                                    // Different segment (or first click)
+                                    if !self.project_filter_enabled {
+                                        // First filter action: select only this project
+                                        self.project_filter_enabled = true;
+                                        self.selected_projects.clear();
+                                        self.selected_projects.insert(session.project.clone());
+                                    } else {
+                                        // Toggle this project
+                                        if self.selected_projects.contains(&session.project) {
+                                            self.selected_projects.remove(&session.project);
+                                        } else {
+                                            self.selected_projects.insert(session.project.clone());
+                                        }
+                                    }
+                                    // Reset drill tracking to this segment
+                                    self.histogram_session_filter = None;
+                                    self.histogram_last_clicked = Some(this_seg);
+                                    self.histogram_drill_level = 1;
                                 }
                             }
                         }
@@ -3777,10 +3853,13 @@ impl DashboardApp {
             }
         }
 
-        // Click on empty space clears project filter
-        if clicked && !click_hit_segment && self.project_filter_enabled {
+        // Click on empty space clears all filters
+        if clicked && !click_hit_segment && (self.project_filter_enabled || self.histogram_session_filter.is_some()) {
             self.project_filter_enabled = false;
             self.selected_projects = self.available_projects.iter().cloned().collect();
+            self.histogram_session_filter = None;
+            self.histogram_last_clicked = None;
+            self.histogram_drill_level = 0;
         }
 
         // Date labels: tick marks at regular intervals
@@ -3967,13 +4046,15 @@ impl DashboardApp {
         let session_cache = &self.session_metadata_cache;
         let project_filter_enabled = self.project_filter_enabled;
         let selected_projects = &self.selected_projects;
+        let session_filter = &self.histogram_session_filter;
         let stack_order = self.histogram_stack_order;
 
         for (i, session_map) in bin_session_maps.into_iter().enumerate() {
             let mut sessions: Vec<SessionTokens> = session_map
                 .into_iter()
                 .map(|(session_id, (project, total))| {
-                    let is_filtered = project_filter_enabled && !selected_projects.contains(&project);
+                    let is_filtered = (project_filter_enabled && !selected_projects.contains(&project))
+                        || session_filter.as_ref().is_some_and(|sf| sf != &session_id);
                     SessionTokens {
                         session_id,
                         project,

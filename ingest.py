@@ -61,44 +61,72 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 
 def discover_sessions(claude_dir: Path, since: datetime | None = None) -> list[dict]:
-    """Find all sessions from sessions-index.json files under projects/."""
+    """Find all sessions from sessions-index.json files and unindexed JSONL files."""
     projects_dir = claude_dir / "projects"
     if not projects_dir.exists():
         print(f"No projects directory found at {projects_dir}", file=sys.stderr)
         return []
 
     sessions = []
+    indexed_ids: set[str] = set()
+
     for project_dir in projects_dir.iterdir():
         if not project_dir.is_dir():
             continue
 
         index_path = project_dir / "sessions-index.json"
-        if not index_path.exists():
-            continue
+        original_path = ""
 
-        try:
-            with open(index_path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"  Skipping {index_path}: {e}", file=sys.stderr)
-            continue
+        # Phase 1: Read the sessions-index.json if it exists
+        if index_path.exists():
+            try:
+                with open(index_path) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"  Skipping {index_path}: {e}", file=sys.stderr)
+                data = {}
 
-        entries = data.get("entries", []) if isinstance(data, dict) else data
-        original_path = data.get("originalPath", "") if isinstance(data, dict) else ""
+            entries = data.get("entries", []) if isinstance(data, dict) else data
+            original_path = data.get("originalPath", "") if isinstance(data, dict) else ""
 
-        for entry in entries:
-            created = entry.get("created", "")
-            if since and created:
-                try:
-                    ts = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    if ts < since:
-                        continue
-                except ValueError:
-                    pass
+            for entry in entries:
+                created = entry.get("created", "")
+                if since and created:
+                    try:
+                        ts = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if ts < since:
+                            continue
+                    except ValueError:
+                        pass
 
-            entry["_project_path"] = entry.get("projectPath", original_path)
-            entry["_project_dir"] = str(project_dir)
-            sessions.append(entry)
+                sid = entry.get("sessionId", "")
+                if sid:
+                    indexed_ids.add(sid)
+                entry["_project_path"] = entry.get("projectPath", original_path)
+                entry["_project_dir"] = str(project_dir)
+                sessions.append(entry)
+
+        # Phase 2: Discover JSONL files not present in the index
+        since_ts = since.timestamp() if since else None
+        for jsonl_path in project_dir.glob("*.jsonl"):
+            session_id = jsonl_path.stem
+            if session_id in indexed_ids:
+                continue
+
+            # Apply --since filter using file mtime
+            if since_ts and jsonl_path.stat().st_mtime < since_ts:
+                continue
+
+            # Build a synthetic index entry from the JSONL file
+            mtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc)
+            sessions.append({
+                "sessionId": session_id,
+                "created": mtime.isoformat(),
+                "modified": mtime.isoformat(),
+                "_project_path": original_path,
+                "_project_dir": str(project_dir),
+                "fullPath": str(jsonl_path),
+            })
 
     return sessions
 
