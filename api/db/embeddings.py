@@ -291,6 +291,115 @@ def search_by_query(query_text: str) -> dict[int, float]:
     return scores
 
 
+def compute_similarity_edges(
+    threshold: float = 0.7,
+    k_nearest: int = 10,
+    max_edges: int = 100000,
+    time_window_hours: float | None = None,
+) -> list[tuple[int, int, float]]:
+    """Compute pairwise similarity edges between embedded messages.
+
+    Uses the cached normalized embedding matrix. For each message, finds the
+    top-k nearest neighbors above the threshold. Optionally filters by a time
+    window so only messages within N hours of each other are linked.
+
+    Args:
+        threshold: Minimum cosine similarity to create an edge.
+        k_nearest: Max neighbors per message to consider.
+        max_edges: Hard cap on total returned edges.
+        time_window_hours: If set, only link messages within this many hours.
+
+    Returns:
+        List of (source_msg_id, target_msg_id, similarity) tuples,
+        upper-triangle only (source < target), sorted by descending similarity.
+    """
+    cache = _load_cache()
+    message_ids = cache["message_ids"]
+    matrix = cache["matrix"]
+
+    if len(message_ids) < 2:
+        return []
+
+    n = len(message_ids)
+
+    # Build time filter lookup if needed
+    timestamps: dict[int, float] | None = None
+    if time_window_hours is not None:
+        conn = get_connection()
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in message_ids)
+        cur.execute(
+            f"SELECT id, timestamp FROM messages WHERE id IN ({placeholders})",
+            message_ids,
+        )
+        from datetime import datetime
+
+        timestamps = {}
+        for row in cur:
+            ts_str = row["timestamp"]
+            if ts_str:
+                try:
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    timestamps[row["id"]] = dt.timestamp()
+                except (ValueError, TypeError):
+                    pass
+        cur.close()
+        conn.close()
+
+    time_window_secs = time_window_hours * 3600.0 if time_window_hours is not None else None
+
+    # Compute full similarity matrix: (n, n)
+    sim_matrix = matrix @ matrix.T
+
+    # Collect edges (upper triangle only)
+    edges: list[tuple[int, int, float]] = []
+
+    # Clamp k to n-1 (can't have more neighbors than other messages)
+    k = min(k_nearest, n - 1)
+
+    for i in range(n):
+        row = sim_matrix[i]
+
+        # Find top-k indices using argpartition (O(n) per row)
+        # We partition so the k largest are at the end
+        if k < n - 1:
+            # argpartition gives indices; pick the k largest
+            part_indices = np.argpartition(row, -(k + 1))[-(k + 1):]
+        else:
+            part_indices = np.arange(n)
+
+        src_id = message_ids[i]
+
+        for j_idx in part_indices:
+            j = int(j_idx)
+            if j <= i:
+                continue  # upper triangle only, skip self
+
+            score = float(row[j])
+            if score < threshold:
+                continue
+
+            tgt_id = message_ids[j]
+
+            # Time window filter
+            if timestamps is not None and time_window_secs is not None:
+                ts_src = timestamps.get(src_id)
+                ts_tgt = timestamps.get(tgt_id)
+                if ts_src is None or ts_tgt is None:
+                    continue
+                if abs(ts_src - ts_tgt) > time_window_secs:
+                    continue
+
+            edges.append((src_id, tgt_id, score))
+
+    # Sort descending by similarity, cap at max_edges
+    edges.sort(key=lambda e: e[2], reverse=True)
+    if len(edges) > max_edges:
+        edges = edges[:max_edges]
+
+    return edges
+
+
 def generate_embeddings(
     batch_size: int = 100,
     max_messages: int = 1000,

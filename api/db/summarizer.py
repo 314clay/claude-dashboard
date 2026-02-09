@@ -368,3 +368,121 @@ def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict
         sessions.append(session)
 
     return sessions
+
+
+# In-memory cache for neighborhood summaries: frozenset(message_ids) -> result
+_neighborhood_summary_cache: dict[frozenset, dict] = {}
+
+NEIGHBORHOOD_SUMMARY_PROMPT = """Analyze this cluster of graph-adjacent Claude Code messages and provide a structured summary.
+These messages are from nodes that are directly connected in a conversation graph.
+
+MESSAGES (grouped by session):
+{conversation}
+
+Respond in exactly this JSON format (no markdown, just raw JSON):
+{{
+    "summary": "One paragraph overview of what this cluster of messages is about and how they relate",
+    "themes": "Comma-separated list of recurring themes across these messages",
+    "node_count": {node_count},
+    "session_count": {session_count}
+}}
+
+Focus on:
+1. What connects these messages? Are they about the same feature, bug, or topic?
+2. What themes emerge across the different sessions?
+3. What was being accomplished across this cluster?
+
+Be concise. Focus on the big picture of what this neighborhood represents."""
+
+
+def generate_neighborhood_summary(message_ids: list[int]) -> dict | None:
+    """Generate a summary for a neighborhood of graph-adjacent messages.
+
+    Args:
+        message_ids: List of message IDs (the clicked node + its neighbors)
+
+    Returns:
+        dict with summary, themes, node_count, session_count
+    """
+    from .queries import get_messages_by_ids
+
+    cache_key = frozenset(message_ids)
+    if cache_key in _neighborhood_summary_cache:
+        print(f"Cache hit for neighborhood summary: {len(message_ids)} nodes")
+        return _neighborhood_summary_cache[cache_key]
+
+    print(f"Generating neighborhood summary for {len(message_ids)} nodes")
+
+    messages = get_messages_by_ids(message_ids)
+    if not messages:
+        return None
+
+    # Group by session
+    sessions: dict[str, list] = {}
+    for msg in messages:
+        sid = msg.get('session_id', 'unknown')
+        sessions.setdefault(sid, []).append(msg)
+
+    # Build labeled conversation text
+    conversation_parts = []
+    for sid, msgs in sessions.items():
+        cwd = msgs[0].get('cwd', '') if msgs else ''
+        conversation_parts.append(f"--- Session {sid[:8]} ({cwd}) ---")
+        for msg in msgs:
+            role = "USER" if msg['role'] == 'user' else "CLAUDE"
+            content = msg.get('content', '') or ""
+            if len(content) > 2000:
+                content = content[:2000] + "..."
+            conversation_parts.append(f"{role}: {content}")
+
+    conversation_text = "\n\n".join(conversation_parts)
+    if len(conversation_text) > 50000:
+        conversation_text = conversation_text[:50000] + "\n\n[TRUNCATED]"
+
+    prompt = NEIGHBORHOOD_SUMMARY_PROMPT.format(
+        conversation=conversation_text,
+        node_count=len(messages),
+        session_count=len(sessions),
+    )
+
+    text = _generate(prompt)
+    if text is None:
+        return {
+            "summary": "Failed to generate summary (LLM not configured)",
+            "themes": "",
+            "node_count": len(messages),
+            "session_count": len(sessions),
+        }
+
+    try:
+        result = _extract_json(text)
+        if result is None:
+            print(f"Could not extract JSON from neighborhood summary: {text[:200]}...")
+            return {
+                "summary": "Failed to parse summary response",
+                "themes": "",
+                "node_count": len(messages),
+                "session_count": len(sessions),
+            }
+
+        def ensure_string(val):
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val) if val else ""
+            return str(val) if val else ""
+
+        summary_result = {
+            "summary": ensure_string(result.get("summary", "")),
+            "themes": ensure_string(result.get("themes", "")),
+            "node_count": len(messages),
+            "session_count": len(sessions),
+        }
+        _neighborhood_summary_cache[cache_key] = summary_result
+        return summary_result
+    except Exception as e:
+        print(f"Error parsing neighborhood summary: {e}")
+        return {
+            "summary": f"Error: {e}",
+            "themes": "",
+            "node_count": len(messages),
+            "session_count": len(sessions),
+        }

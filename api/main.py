@@ -19,7 +19,7 @@ from db.queries import (
     get_tool_usage,
     get_project_session_graph_data,
 )
-from db.summarizer import generate_partial_summary, get_or_create_summary
+from db.summarizer import generate_partial_summary, get_or_create_summary, generate_neighborhood_summary
 from db.importance.backfill import (
     backfill_importance_scores,
     get_importance_stats,
@@ -46,6 +46,7 @@ from db.embeddings import (
     get_embedding_stats,
     generate_embeddings,
     search_by_query,
+    compute_similarity_edges,
 )
 from db.mail import get_mail_network
 # Commented out - health_ingest module not present
@@ -79,6 +80,10 @@ class SemanticFilterCreate(BaseModel):
 
 class RescoreRequest(BaseModel):
     session_ids: list[str]
+
+
+class NeighborhoodSummaryRequest(BaseModel):
+    message_ids: list[str]
 
 
 class SimilaritySearchRequest(BaseModel):
@@ -179,6 +184,27 @@ def session_summary(
         result['generated_at'] = result['generated_at'].isoformat()
 
     return {"exists": True, "generated": True, **result}
+
+
+@app.post("/summary/neighborhood")
+def neighborhood_summary(body: NeighborhoodSummaryRequest):
+    """Generate an AI summary covering a node and its direct graph neighbors.
+
+    Body: { "message_ids": ["123", "456", ...] }
+    Returns: { summary, themes, node_count, session_count }
+    """
+    try:
+        int_ids = [int(mid) for mid in body.message_ids]
+    except ValueError:
+        return {"error": "All message_ids must be numeric strings"}
+
+    if not int_ids:
+        return {"error": "message_ids must not be empty"}
+
+    result = generate_neighborhood_summary(int_ids)
+    if result is None:
+        return {"error": "Failed to generate neighborhood summary"}
+    return result
 
 
 @app.get("/tools")
@@ -458,6 +484,32 @@ def embedding_search(body: SimilaritySearchRequest):
     scores = search_by_query(body.query_text)
     # Convert int keys to strings for JSON serialization
     return {"scores": {str(k): v for k, v in scores.items()}}
+
+
+@app.get("/embeddings/similarity-edges")
+def embedding_similarity_edges(
+    threshold: float = Query(default=0.7, description="Minimum cosine similarity"),
+    k_nearest: int = Query(default=10, description="Max neighbors per message"),
+    max_edges: int = Query(default=100000, description="Hard cap on total edges"),
+    time_window_hours: Optional[float] = Query(default=None, description="Only link messages within N hours"),
+):
+    """Compute pairwise similarity edges between embedded messages.
+
+    Returns edges where cosine similarity exceeds the threshold.
+    Each message keeps at most k_nearest neighbors. Upper-triangle only.
+
+    Returns: { edges: [{source, target, similarity}], count, threshold_used }
+    """
+    raw_edges = compute_similarity_edges(threshold, k_nearest, max_edges, time_window_hours)
+    edges = [
+        {"source": src, "target": tgt, "similarity": round(sim, 4)}
+        for src, tgt, sim in raw_edges
+    ]
+    return {
+        "edges": edges,
+        "count": len(edges),
+        "threshold_used": threshold,
+    }
 
 
 # ==== Mail Network Endpoints ====

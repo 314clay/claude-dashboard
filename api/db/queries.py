@@ -173,6 +173,42 @@ def get_session_messages_before(session_id: str, before_timestamp: str) -> list[
     return df
 
 
+def get_messages_by_ids(message_ids: list[int]) -> list[dict]:
+    """Get messages by their IDs.
+
+    Args:
+        message_ids: List of message IDs to fetch
+
+    Returns:
+        List of dicts with id, role, content, timestamp, session_id, cwd
+    """
+    if not message_ids:
+        return []
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    placeholders = ",".join("?" for _ in message_ids)
+    query = f"""
+        SELECT
+            m.id,
+            m.role,
+            m.content,
+            m.timestamp,
+            m.session_id,
+            s.cwd
+        FROM messages m
+        JOIN sessions s ON m.session_id = s.session_id
+        WHERE m.id IN ({placeholders})
+        ORDER BY m.timestamp
+    """
+
+    rows = _query_to_list(cur, query, tuple(message_ids))
+    cur.close()
+    conn.close()
+    return rows
+
+
 def get_session_summary(session_id: str) -> dict | None:
     """Get the full session summary from session_summaries table.
 
