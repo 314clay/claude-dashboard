@@ -3294,7 +3294,11 @@ impl DashboardApp {
             center + centered * zoom + pan_offset
         };
 
-        // Use cached semantic filter visible set (computed once per frame in update())
+        // Ensure semantic filter cache is fresh (may have been invalidated by sidebar clicks
+        // earlier in this frame, after the top-of-frame refresh in update())
+        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
+            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        }
         let semantic_visible = self.semantic_filter_cache.clone();
 
         // Draw edges first (behind nodes)
@@ -3329,6 +3333,17 @@ impl DashboardApp {
             // Skip edges where either endpoint doesn't pass semantic filters
             if let Some(ref sem_visible) = semantic_visible {
                 if !sem_visible.contains(&edge.source) || !sem_visible.contains(&edge.target) {
+                    continue;
+                }
+            }
+
+            // Session filter (histogram drill-down)
+            if let Some(ref sf) = self.histogram_session_filter {
+                let source_out = self.graph.get_node(&edge.source)
+                    .map_or(true, |n| n.session_id != *sf);
+                let target_out = self.graph.get_node(&edge.target)
+                    .map_or(true, |n| n.session_id != *sf);
+                if source_out || target_out {
                     continue;
                 }
             }
@@ -3408,6 +3423,44 @@ impl DashboardApp {
         // Draw bypass edges (bridging over hidden tool-use nodes)
         if self.hide_tool_uses {
             for edge in &self.tool_use_bypass_edges {
+                // Skip bypass edges where either endpoint is filtered out by semantic filters
+                if let Some(ref sem_visible) = semantic_visible {
+                    if !sem_visible.contains(&edge.source) || !sem_visible.contains(&edge.target) {
+                        continue;
+                    }
+                }
+                // Skip bypass edges where either endpoint is below importance threshold
+                if self.importance_filter_enabled {
+                    let source_below = self.graph.get_node(&edge.source)
+                        .and_then(|n| n.importance_score)
+                        .map_or(false, |s| s < self.importance_threshold);
+                    let target_below = self.graph.get_node(&edge.target)
+                        .and_then(|n| n.importance_score)
+                        .map_or(false, |s| s < self.importance_threshold);
+                    if source_below || target_below {
+                        continue;
+                    }
+                }
+                // Skip bypass edges where either endpoint is not in selected projects
+                if self.project_filter_enabled {
+                    let source_excluded = self.graph.get_node(&edge.source)
+                        .map_or(true, |n| !self.selected_projects.contains(&n.project));
+                    let target_excluded = self.graph.get_node(&edge.target)
+                        .map_or(true, |n| !self.selected_projects.contains(&n.project));
+                    if source_excluded || target_excluded {
+                        continue;
+                    }
+                }
+                // Session filter (histogram drill-down)
+                if let Some(ref sf) = self.histogram_session_filter {
+                    let source_out = self.graph.get_node(&edge.source)
+                        .map_or(true, |n| n.session_id != *sf);
+                    let target_out = self.graph.get_node(&edge.target)
+                        .map_or(true, |n| n.session_id != *sf);
+                    if source_out || target_out {
+                        continue;
+                    }
+                }
                 let source_pos = match self.graph.get_pos(&edge.source) {
                     Some(p) => transform(p),
                     None => continue,
@@ -4070,9 +4123,10 @@ impl DashboardApp {
         let total_width = bins.len() as f32 * bar_width;
 
         // Allocate one big rect for the entire histogram
+        // Use hover sense so trackpad scroll gestures aren't consumed as drags
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(total_width.max(ui.available_width()), available_height + label_height),
-            egui::Sense::click_and_drag(),
+            egui::Sense::click(),
         );
 
         let bar_area = egui::Rect::from_min_size(rect.min, egui::vec2(total_width, available_height));
@@ -4082,6 +4136,7 @@ impl DashboardApp {
         let pointer_over = ui.rect_contains_pointer(rect);
         if pointer_over {
             let scroll = ui.input(|i| i.smooth_scroll_delta);
+            let raw_scroll = ui.input(|i| i.raw_scroll_delta);
             let modifiers = ui.input(|i| i.modifiers);
 
             if modifiers.command {
@@ -4089,15 +4144,14 @@ impl DashboardApp {
                 let zoom_delta = scroll.y * 0.01;
                 self.histogram_bar_width = (self.histogram_bar_width * (1.0 + zoom_delta)).clamp(8.0, 120.0);
             } else {
-                // Pan: two-finger swipe
-                let pan = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
+                // Pan: use horizontal scroll directly (trackpad two-finger swipe),
+                // fall back to vertical scroll if no horizontal component
+                let pan_smooth = if scroll.x.abs() > 0.5 { scroll.x } else { scroll.y };
+                let pan_raw = if raw_scroll.x.abs() > 0.5 { raw_scroll.x } else { raw_scroll.y };
+                // Prefer raw scroll (direct trackpad input), fall back to smooth
+                let pan = if pan_raw.abs() > 0.1 { pan_raw } else { pan_smooth };
                 self.histogram_scroll_offset -= pan;
             }
-        }
-
-        // Pan via drag
-        if response.dragged() {
-            self.histogram_scroll_offset -= response.drag_delta().x;
         }
 
         // Clamp scroll offset
