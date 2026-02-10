@@ -96,6 +96,16 @@ pub struct ProximityEdgesResponse {
     pub query: String,
 }
 
+/// Progress for semantic filter categorization
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterStatusResponse {
+    pub filter_id: i32,
+    pub total: i64,
+    pub scored: i64,
+    pub pending: i64,
+    pub matches: i64,
+}
+
 /// Result from session ingest operation
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestResult {
@@ -540,6 +550,25 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Fetch filter scoring progress (for polling during categorization)
+    pub fn fetch_filter_status(&self, filter_id: i32) -> Result<FilterStatusResponse, String> {
+        let url = format!("{}/semantic-filters/{}/status", self.base_url, filter_id);
+
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        resp.json::<FilterStatusResponse>()
+            .map_err(|e| format!("Parse error: {}", e))
+    }
+
     /// Fetch embedding coverage statistics
     pub fn fetch_embedding_stats(&self) -> Result<EmbeddingStats, String> {
         let url = format!("{}/embeddings/stats", self.base_url);
@@ -593,6 +622,7 @@ impl ApiClient {
         query_text: &str,
         delta: f32,
         max_edges: usize,
+        max_neighbors: usize,
     ) -> Result<ProximityEdgesResponse, String> {
         let url = format!("{}/embeddings/proximity-edges", self.base_url);
 
@@ -603,6 +633,7 @@ impl ApiClient {
                 "query_text": query_text,
                 "delta": delta,
                 "max_edges": max_edges,
+                "max_neighbors": max_neighbors,
             }))
             .timeout(Duration::from_secs(60))
             .send()

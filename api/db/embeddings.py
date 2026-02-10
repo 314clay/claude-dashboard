@@ -295,6 +295,7 @@ def compute_proximity_edges(
     query_text: str,
     delta: float = 0.1,
     max_edges: int = 100_000,
+    max_neighbors: int = 0,
 ) -> dict:
     """Compute score-proximity edges: link nodes whose similarity scores
     to a query phrase are within `delta` of each other.
@@ -305,6 +306,8 @@ def compute_proximity_edges(
         query_text: The concept to score nodes against (e.g. "breakthrough").
         delta: Maximum score difference to create an edge.
         max_edges: Hard cap on total returned edges.
+        max_neighbors: Per-node edge cap (0 = unlimited). When > 0, each node
+            connects to at most this many nearest neighbors by score.
 
     Returns:
         dict with edges, scores, count.
@@ -319,6 +322,7 @@ def compute_proximity_edges(
 
     edges: list[tuple[int, int, float]] = []
     j = 0  # trailing pointer
+    degree: dict = {} if max_neighbors > 0 else None
 
     for i in range(n):
         id_i, score_i = sorted_nodes[i]
@@ -327,12 +331,26 @@ def compute_proximity_edges(
         while j < i and (score_i - sorted_nodes[j][1]) > delta:
             j += 1
 
-        # Link node i with all nodes in [j, i)
-        for k in range(j, i):
+        if max_neighbors > 0 and degree.get(id_i, 0) >= max_neighbors:
+            continue
+
+        # Link node i with neighbors in window — reverse to prioritize nearest
+        for k in range(i - 1, j - 1, -1):
             id_k, score_k = sorted_nodes[k]
+
+            if max_neighbors > 0:
+                if degree.get(id_i, 0) >= max_neighbors:
+                    break  # node i full, remaining are farther
+                if degree.get(id_k, 0) >= max_neighbors:
+                    continue  # node k full, try next
+
             diff = abs(score_i - score_k)
             strength = 1.0 - diff / delta if delta > 0 else 1.0
             edges.append((id_k, id_i, strength))
+
+            if max_neighbors > 0:
+                degree[id_i] = degree.get(id_i, 0) + 1
+                degree[id_k] = degree.get(id_k, 0) + 1
 
             if len(edges) >= max_edges:
                 return {

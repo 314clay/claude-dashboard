@@ -5,7 +5,7 @@ use crate::db::DbClient;
 use crate::graph::types::{ColorMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
-use crate::settings::{Preset, Settings, SizingPreset};
+use crate::settings::{Preset, Settings, SidebarTab, SizingPreset};
 use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -140,6 +140,7 @@ pub struct DashboardApp {
     layout: ForceLayout,
 
     // UI state
+    sidebar_tab: SidebarTab,
     time_range: TimeRange,
     node_size: f32,
     show_arrows: bool,
@@ -166,6 +167,10 @@ pub struct DashboardApp {
     rescore_receiver: Option<Receiver<RescoreEvent>>,
     rescore_result: Option<RescoreResult>,
     rescore_progress: Option<RescoreProgress>,
+
+    // Tool usage filtering
+    hide_tool_uses: bool,
+    tool_use_bypass_edges: Vec<crate::graph::types::GraphEdge>,
 
     // Project filtering
     project_filter_enabled: bool,
@@ -360,6 +365,7 @@ impl DashboardApp {
             db_error,
             graph,
             layout,
+            sidebar_tab: settings.sidebar_tab,
             time_range: TimeRange::from_hours(settings.time_range_hours),
             node_size: settings.node_size,
             show_arrows: settings.show_arrows,
@@ -380,6 +386,8 @@ impl DashboardApp {
             rescore_receiver: None,
             rescore_result: None,
             rescore_progress: None,
+            hide_tool_uses: false,
+            tool_use_bypass_edges: Vec::new(),
             project_filter_enabled: false,
             selected_projects: HashSet::new(),
             available_projects: Vec::new(),
@@ -563,10 +571,12 @@ impl DashboardApp {
         self.settings.proximity_delta = self.graph.score_proximity_delta;
         self.settings.proximity_strength = self.layout.similarity_strength;
         self.settings.max_proximity_edges = self.graph.max_proximity_edges;
+        self.settings.max_neighbors_per_node = self.graph.max_neighbors_per_node;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
         self.settings.histogram_panel_enabled = self.histogram_panel_enabled;
         self.settings.histogram_split_ratio = self.histogram_split_ratio;
+        self.settings.sidebar_tab = self.sidebar_tab;
     }
 
     /// Copy settings values to UI fields (used when loading a preset)
@@ -602,6 +612,7 @@ impl DashboardApp {
         self.graph.score_proximity_delta = self.settings.proximity_delta;
         self.layout.similarity_strength = self.settings.proximity_strength;
         self.graph.max_proximity_edges = self.settings.max_proximity_edges;
+        self.graph.max_neighbors_per_node = self.settings.max_neighbors_per_node;
     }
 
     /// Save settings if dirty and enough time has passed (debounce)
@@ -632,6 +643,11 @@ impl DashboardApp {
                 self.graph.load(data, bounds);
                 self.loading = false;
                 self.semantic_filter_cache = None;  // Invalidate cache
+
+                // Recompute bypass edges if tool-use hiding is on
+                if self.hide_tool_uses {
+                    self.tool_use_bypass_edges = self.compute_tool_use_bypass_edges();
+                }
 
                 // Extract available projects from nodes
                 let projects: HashSet<String> = self.graph.data.nodes.iter()
@@ -793,6 +809,66 @@ impl DashboardApp {
         }
 
         closest_node.cloned()
+    }
+
+    /// Compute bypass edges for hiding tool-use nodes.
+    /// For each session chain A → T1 → T2 → ... → B where T* are tool-use nodes,
+    /// creates a direct edge A → B.
+    fn compute_tool_use_bypass_edges(&self) -> Vec<crate::graph::types::GraphEdge> {
+        let tool_use_ids: HashSet<&str> = self.graph.data.nodes.iter()
+            .filter(|n| n.has_tool_usage)
+            .map(|n| n.id.as_str())
+            .collect();
+
+        if tool_use_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Build per-node successor map from session edges (non-temporal only)
+        let mut next: HashMap<&str, &str> = HashMap::new();
+        for edge in &self.graph.data.edges {
+            if !edge.is_temporal && !edge.is_similarity {
+                next.insert(&edge.source, &edge.target);
+            }
+        }
+
+        // For each non-tool-use node, walk forward through tool-use nodes to find the next visible node
+        let mut bypass = Vec::new();
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+
+        for node in &self.graph.data.nodes {
+            if tool_use_ids.contains(node.id.as_str()) {
+                continue; // Skip tool-use nodes as sources
+            }
+
+            // Walk the chain from this node
+            let mut cursor = node.id.as_str();
+            while let Some(&successor) = next.get(cursor) {
+                if !tool_use_ids.contains(successor) {
+                    // Successor is visible — if we skipped any nodes, create bypass edge
+                    if cursor != node.id.as_str() {
+                        let pair = (node.id.clone(), successor.to_string());
+                        if seen_pairs.insert(pair) {
+                            bypass.push(GraphEdge {
+                                source: node.id.clone(),
+                                target: successor.to_string(),
+                                session_id: node.session_id.clone(),
+                                timestamp: None,
+                                is_obsidian: false,
+                                is_topic: false,
+                                is_similarity: false,
+                                is_temporal: false,
+                                similarity: None,
+                            });
+                        }
+                    }
+                    break;
+                }
+                cursor = successor;
+            }
+        }
+
+        bypass
     }
 
     /// Check if any semantic filters are active (not Off)
@@ -970,7 +1046,7 @@ impl DashboardApp {
     fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
         // If no filters active, return None (simulate all)
         let semantic_filter_active = self.has_active_semantic_filters();
-        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.proximity_active {
+        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.proximity_active && !self.hide_tool_uses {
             return None;
         }
 
@@ -1004,6 +1080,10 @@ impl DashboardApp {
                 if !sem_visible.contains(&node.id) {
                     continue;
                 }
+            }
+            // Hide tool uses
+            if self.hide_tool_uses && node.has_tool_usage {
+                continue;
             }
             // Proximity filter: when active, all scored nodes participate in physics
             // (no threshold-based hiding — proximity colors by heat map instead)
@@ -1267,11 +1347,12 @@ impl DashboardApp {
 
         let delta = self.graph.score_proximity_delta;
         let max_edges = self.graph.max_proximity_edges;
+        let max_neighbors = self.graph.max_neighbors_per_node;
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let api = ApiClient::new();
-            match api.fetch_proximity_edges(&query, delta, max_edges) {
+            match api.fetch_proximity_edges(&query, delta, max_edges, max_neighbors) {
                 Ok(response) => {
                     let edges: Vec<GraphEdge> = response.edges.into_iter().map(|e| {
                         GraphEdge::similarity(e.source, e.target, e.strength)
@@ -1813,9 +1894,27 @@ impl DashboardApp {
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Graph Controls");
-        ui.add_space(10.0);
+        // Tab bar at top
+        let prev_tab = self.sidebar_tab;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Data, "Data");
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Visual, "Visual");
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Analysis, "Analysis");
+        });
+        if self.sidebar_tab != prev_tab {
+            self.mark_settings_dirty();
+        }
+        ui.separator();
 
+        // Tab content
+        match self.sidebar_tab {
+            SidebarTab::Data => self.render_sidebar_data(ui),
+            SidebarTab::Visual => self.render_sidebar_visual(ui),
+            SidebarTab::Analysis => self.render_sidebar_analysis(ui),
+        }
+    }
+
+    fn render_sidebar_data(&mut self, ui: &mut egui::Ui) {
         // Database status
         ui.horizontal(|ui| {
             if self.db_connected {
@@ -1953,35 +2052,6 @@ impl DashboardApp {
                 }
             });
 
-        // Mail Network Graph section
-        egui::CollapsingHeader::new("Mail Network")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Agent Communication").size(11.0).color(Color32::GRAY));
-
-                // Load button
-                if self.mail_network_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Loading...");
-                    });
-                } else if ui.button("Load Mail Network").clicked() {
-                    self.load_mail_network();
-                }
-
-                // Error message
-                if let Some(ref err) = self.mail_network_error {
-                    ui.colored_label(Color32::RED, format!("Error: {}", err));
-                }
-
-                // Render the mail network graph
-                if let Some(ref mut state) = self.mail_network_state {
-                    ui.add_space(5.0);
-                    let size = Vec2::new(ui.available_width().min(250.0), 200.0);
-                    render_mail_network(ui, state, size);
-                }
-            });
-
         // Presets section
         egui::CollapsingHeader::new("Presets")
             .default_open(false)
@@ -2054,6 +2124,151 @@ impl DashboardApp {
                 }
             });
 
+        // Filtering section
+        egui::CollapsingHeader::new("Filtering")
+            .default_open(true)
+            .show(ui, |ui| {
+                if ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance").changed() {
+                    self.mark_settings_dirty();
+                }
+                if self.importance_filter_enabled {
+                    if ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
+                        .text("Min importance")
+                        .fixed_decimals(2)).changed() {
+                        self.mark_settings_dirty();
+                    }
+                    // Show count
+                    let visible = self.graph.data.nodes.iter()
+                        .filter(|n| n.importance_score.map_or(true, |s| s >= self.importance_threshold))
+                        .count();
+                    ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
+                }
+
+                // Show importance scoring stats
+                if let Some(ref stats) = self.importance_stats {
+                    ui.add_space(5.0);
+                    ui.label(format!("Scored: {} / {}", stats.scored_messages, stats.total_messages));
+                }
+
+                // Rescore button
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    let button_enabled = !self.rescore_loading && !self.graph.data.nodes.is_empty();
+                    if ui.add_enabled(button_enabled, egui::Button::new("Rescore Visible")).clicked() {
+                        self.start_rescore_visible();
+                    }
+                });
+
+                // Show rescore progress or result
+                if self.rescore_loading {
+                    if let Some(ref progress) = self.rescore_progress {
+                        // Show progress bar and text
+                        let fraction = if progress.total > 0 {
+                            (progress.current + 1) as f32 / progress.total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(fraction)
+                            .text(format!("{}/{}", progress.current + 1, progress.total)));
+                        ui.label(format!("Session {}... ({} msgs)",
+                            progress.session_id, progress.messages_so_far));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Starting...");
+                        });
+                    }
+                } else if let Some(ref result) = self.rescore_result {
+                    if result.errors.is_empty() {
+                        ui.label(format!("Rescored {} msgs in {} sessions",
+                            result.messages_rescored, result.sessions_processed));
+                    } else {
+                        ui.colored_label(Color32::YELLOW, format!(
+                            "Rescored {} msgs, {} errors",
+                            result.messages_rescored, result.errors.len()
+                        ));
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Project filter
+                ui.checkbox(&mut self.project_filter_enabled, "Filter by project");
+                if self.project_filter_enabled && !self.available_projects.is_empty() {
+                    // Cache available_projects to avoid borrow issues
+                    let available = self.available_projects.clone();
+                    ui.indent("project_filter_list", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for project in &available {
+                                    let mut selected = self.selected_projects.contains(project);
+                                    if ui.checkbox(&mut selected, project).changed() {
+                                        if selected {
+                                            self.selected_projects.insert(project.clone());
+                                        } else {
+                                            self.selected_projects.remove(project);
+                                        }
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("All").clicked() {
+                                self.selected_projects = available.iter().cloned().collect();
+                            }
+                            if ui.small_button("None").clicked() {
+                                self.selected_projects.clear();
+                            }
+                        });
+                        // Show count
+                        let visible = self.graph.data.nodes.iter()
+                            .filter(|n| self.selected_projects.contains(&n.project))
+                            .count();
+                        ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
+                    });
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Hide tool uses toggle
+                if ui.checkbox(&mut self.hide_tool_uses, "Hide tool uses").changed() {
+                    if self.hide_tool_uses {
+                        self.tool_use_bypass_edges = self.compute_tool_use_bypass_edges();
+                    } else {
+                        self.tool_use_bypass_edges.clear();
+                    }
+                    self.semantic_filter_cache = None;
+                }
+                if self.hide_tool_uses {
+                    let tool_count = self.graph.data.nodes.iter().filter(|n| n.has_tool_usage).count();
+                    let total = self.graph.data.nodes.len();
+                    ui.label(format!("Hiding: {} / {} nodes", tool_count, total));
+                }
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+
+        // Info section
+        ui.label("Info");
+        let visible_count = self.graph.timeline.visible_nodes.len();
+        let total_count = self.graph.data.nodes.len();
+        if self.timeline_enabled && visible_count < total_count {
+            ui.label(format!("Nodes: {} / {}", visible_count, total_count));
+        } else {
+            ui.label(format!("Nodes: {}", total_count));
+        }
+        ui.label(format!("Edges: {}", self.graph.data.edges.len()));
+        ui.label(format!("FPS: {:.1}", self.fps));
+
+        let user_count = self.graph.data.nodes.iter().filter(|n| n.role == crate::graph::types::Role::User).count();
+        let assistant_count = self.graph.data.nodes.iter().filter(|n| n.role == crate::graph::types::Role::Assistant).count();
+        ui.label(format!("You: {} | Claude: {}", user_count, assistant_count));
+    }
+
+    fn render_sidebar_visual(&mut self, ui: &mut egui::Ui) {
         // Display section
         egui::CollapsingHeader::new("Display")
             .default_open(true)
@@ -2178,118 +2393,202 @@ impl DashboardApp {
                 ui.label(egui::RichText::new("Largest node will be this multiple of base size").weak().small());
             });
 
-        // Filtering section
-        egui::CollapsingHeader::new("Filtering")
-            .default_open(true)
+        // Layout Shaping section (directed stiffness + recency centering)
+        egui::CollapsingHeader::new("Layout Shaping")
+            .default_open(false)
             .show(ui, |ui| {
-                if ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance").changed() {
+                let was_enabled = self.layout_shaping_enabled;
+                ui.checkbox(&mut self.layout_shaping_enabled, "Enable layout shaping");
+
+                if self.layout_shaping_enabled != was_enabled {
+                    if !self.layout_shaping_enabled {
+                        // Reset to defaults when disabled
+                        self.layout.directed_stiffness = 1.0;
+                        self.layout.recency_centering = 0.0;
+                    }
                     self.mark_settings_dirty();
                 }
-                if self.importance_filter_enabled {
-                    if ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
-                        .text("Min importance")
+
+                if self.layout_shaping_enabled {
+                    ui.add_space(5.0);
+
+                    if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
+                        .logarithmic(true)
+                        .text("Edge Stiffness")
                         .fixed_decimals(2)).changed() {
                         self.mark_settings_dirty();
                     }
-                    // Show count
-                    let visible = self.graph.data.nodes.iter()
-                        .filter(|n| n.importance_score.map_or(true, |s| s >= self.importance_threshold))
-                        .count();
-                    ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
-                }
+                    ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
 
-                // Show importance scoring stats
-                if let Some(ref stats) = self.importance_stats {
                     ui.add_space(5.0);
-                    ui.label(format!("Scored: {} / {}", stats.scored_messages, stats.total_messages));
-                }
 
-                // Rescore button
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    let button_enabled = !self.rescore_loading && !self.graph.data.nodes.is_empty();
-                    if ui.add_enabled(button_enabled, egui::Button::new("Rescore Visible")).clicked() {
-                        self.start_rescore_visible();
+                    if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
+                        .text("Recency→Center")
+                        .fixed_decimals(1)).changed() {
+                        self.mark_settings_dirty();
                     }
-                });
-
-                // Show rescore progress or result
-                if self.rescore_loading {
-                    if let Some(ref progress) = self.rescore_progress {
-                        // Show progress bar and text
-                        let fraction = if progress.total > 0 {
-                            (progress.current + 1) as f32 / progress.total as f32
-                        } else {
-                            0.0
-                        };
-                        ui.add(egui::ProgressBar::new(fraction)
-                            .text(format!("{}/{}", progress.current + 1, progress.total)));
-                        ui.label(format!("Session {}... ({} msgs)",
-                            progress.session_id, progress.messages_so_far));
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Starting...");
-                        });
-                    }
-                } else if let Some(ref result) = self.rescore_result {
-                    if result.errors.is_empty() {
-                        ui.label(format!("Rescored {} msgs in {} sessions",
-                            result.messages_rescored, result.sessions_processed));
-                    } else {
-                        ui.colored_label(Color32::YELLOW, format!(
-                            "Rescored {} msgs, {} errors",
-                            result.messages_rescored, result.errors.len()
-                        ));
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-
-                // Project filter
-                ui.checkbox(&mut self.project_filter_enabled, "Filter by project");
-                if self.project_filter_enabled && !self.available_projects.is_empty() {
-                    // Cache available_projects to avoid borrow issues
-                    let available = self.available_projects.clone();
-                    ui.indent("project_filter_list", |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                for project in &available {
-                                    let mut selected = self.selected_projects.contains(project);
-                                    if ui.checkbox(&mut selected, project).changed() {
-                                        if selected {
-                                            self.selected_projects.insert(project.clone());
-                                        } else {
-                                            self.selected_projects.remove(project);
-                                        }
-                                    }
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            if ui.small_button("All").clicked() {
-                                self.selected_projects = available.iter().cloned().collect();
-                            }
-                            if ui.small_button("None").clicked() {
-                                self.selected_projects.clear();
-                            }
-                        });
-                        // Show count
-                        let visible = self.graph.data.nodes.iter()
-                            .filter(|n| self.selected_projects.contains(&n.project))
-                            .count();
-                        ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
-                    });
+                    ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
                 }
             });
 
+        // Advanced section (collapsed by default)
+        egui::CollapsingHeader::new("Advanced")
+            .default_open(false)
+            .show(ui, |ui| {
+                if ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled").changed() {
+                    self.mark_settings_dirty();
+                }
+                ui.add_space(5.0);
+                ui.label("Physics Tuning");
+                if ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
+                    self.mark_settings_dirty();
+                }
+                if ui.add(egui::Slider::new(&mut self.layout.size_physics_weight, 0.0..=5.0)
+                    .text("Size→Physics")
+                    .fixed_decimals(2)).changed() {
+                    self.mark_settings_dirty();
+                }
+                ui.label(egui::RichText::new("↑ Small nodes become less significant").small().weak());
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label("Temporal Clustering");
+
+                let temporal_enabled = self.graph.temporal_attraction_enabled;
+                let mut new_temporal_enabled = temporal_enabled;
+                ui.checkbox(&mut new_temporal_enabled, "Enable temporal edges");
+                if new_temporal_enabled != temporal_enabled {
+                    self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
+                    self.mark_settings_dirty();
+                }
+
+                if self.graph.temporal_attraction_enabled {
+                    if ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
+                        .logarithmic(true)
+                        .text("Strength")).changed() {
+                        self.mark_settings_dirty();
+                    }
+
+                    // Temporal window slider (in minutes for UX, stored as seconds)
+                    let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
+                    let prev_window_mins = window_mins;
+                    ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
+                        .text("Window (min)")
+                        .fixed_decimals(0));
+                    if (window_mins - prev_window_mins).abs() > 0.1 {
+                        self.graph.set_temporal_window(window_mins as f64 * 60.0);
+                        self.mark_settings_dirty();
+                    }
+
+                    // Temporal edge opacity slider
+                    if ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
+                        .text("Edge opacity")
+                        .fixed_decimals(2)).changed() {
+                        self.mark_settings_dirty();
+                    }
+
+                    // Max temporal edges dropdown
+                    let edge_limits = [
+                        (10_000, "10k"),
+                        (50_000, "50k"),
+                        (100_000, "100k"),
+                        (250_000, "250k"),
+                        (500_000, "500k"),
+                        (1_000_000, "1M"),
+                    ];
+                    let current_limit = self.graph.max_temporal_edges;
+                    let current_label = edge_limits.iter()
+                        .find(|(v, _)| *v == current_limit)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Custom");
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max edges:");
+                        egui::ComboBox::from_id_salt("max_temporal_edges")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in edge_limits {
+                                    if ui.selectable_label(current_limit == value, label).clicked() {
+                                        self.graph.set_max_temporal_edges(value);
+                                        self.settings.max_temporal_edges = value;
+                                        self.mark_settings_dirty();
+                                    }
+                                }
+                            });
+                    });
+
+                    // Show temporal edge count
+                    let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
+                    ui.label(format!("Temporal edges: {}", temporal_count));
+                }
+            });
+
+        ui.add_space(5.0);
         ui.separator();
+
+        // View / Zoom controls
+        ui.label("View");
+        ui.horizontal(|ui| {
+            if ui.button("Reset View").clicked() {
+                self.pan_offset = Vec2::ZERO;
+                self.zoom = 1.0;
+            }
+            ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
+        });
+
+        ui.add_space(5.0);
+        ui.separator();
+
+        // Token Histogram toggle
         if ui.checkbox(&mut self.histogram_panel_enabled, "Token Histogram Panel")
             .on_hover_text("Show token usage histogram in a split pane")
             .changed()
         { self.mark_settings_dirty(); }
 
+        ui.add_space(5.0);
+        ui.separator();
+
+        // Legend
+        if self.graph.color_mode != ColorMode::Session {
+            ui.label(if self.graph.color_mode == ColorMode::Hybrid { "Projects (Hybrid)" } else { "Projects" });
+            // Show top projects by color
+            let mut projects: Vec<_> = self.graph.project_colors.iter().collect();
+            projects.sort_by(|a, b| a.0.cmp(b.0));
+            for (project, &hue) in projects.iter().take(8) {
+                ui.horizontal(|ui| {
+                    let color = crate::graph::types::hsl_to_rgb(hue, 0.7, 0.55);
+                    ui.colored_label(color, "●");
+                    let label = if project.len() > 15 {
+                        format!("{}…", &project[..14])
+                    } else {
+                        project.to_string()
+                    };
+                    ui.label(label);
+                });
+            }
+            if projects.len() > 8 {
+                ui.label(format!("  +{} more", projects.len() - 8));
+            }
+        } else {
+            ui.label("Legend");
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::WHITE, "●");
+                ui.label("You");
+            });
+            ui.horizontal(|ui| {
+                ui.colored_label(Color32::from_rgb(255, 149, 0), "●");
+                ui.label("Claude");
+            });
+        }
+    }
+
+    fn render_sidebar_analysis(&mut self, ui: &mut egui::Ui) {
         // Semantic Filters section
         egui::CollapsingHeader::new("Semantic Filters")
             .default_open(false)
@@ -2311,31 +2610,36 @@ impl DashboardApp {
                     }
                 }
 
-                // Categorization in progress indicator with progress bar
+                // Categorization in progress indicator (only when detail panel is collapsed)
                 if let Some(filter_id) = self.categorizing_filter_id {
-                    let filter_name = self.semantic_filters.iter()
-                        .find(|f| f.id == filter_id)
-                        .map(|f| f.name.clone())
-                        .unwrap_or_default();
-                    if let Some((scored, total)) = self.categorization_progress {
-                        let fraction = if total > 0 { scored as f32 / total as f32 } else { 0.0 };
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(format!("Scoring '{}' ({}/{})", filter_name, scored, total));
-                        });
-                        ui.add(egui::ProgressBar::new(fraction).animate(true));
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(format!("Scoring '{}'...", filter_name));
-                        });
+                    if !self.expanded_filter_ids.contains(&filter_id) {
+                        let filter_name = self.semantic_filters.iter()
+                            .find(|f| f.id == filter_id)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default();
+                        if let Some((scored, total)) = self.categorization_progress {
+                            let fraction = if total > 0 { scored as f32 / total as f32 } else { 0.0 };
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Scoring '{}' ({}/{})", filter_name, scored, total));
+                            });
+                            ui.add(egui::ProgressBar::new(fraction).animate(true));
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Scoring '{}'...", filter_name));
+                            });
+                        }
                     }
                 }
 
                 // List existing filters with five-state toggles
                 if !self.semantic_filters.is_empty() {
                     let filters = self.semantic_filters.clone();
+                    let total_nodes = self.graph.data.nodes.len() as i64;
                     for filter in &filters {
+                        let is_expanded = self.expanded_filter_ids.contains(&filter.id);
+
                         ui.horizontal(|ui| {
                             // Get current mode for this filter
                             let current_mode = self.semantic_filter_modes
@@ -2400,16 +2704,21 @@ impl DashboardApp {
                                 self.semantic_filter_cache = None;
                             }
 
-                            // Filter name and match count
-                            ui.label(format!("{} ({}/{})", filter.name, filter.matches, filter.total_scored));
-
-                            // Categorize button
-                            let is_categorizing = self.categorizing_filter_id == Some(filter.id);
-                            ui.add_enabled_ui(!is_categorizing && self.categorizing_filter_id.is_none(), |ui| {
-                                if ui.small_button("Run").on_hover_text("Categorize messages with this filter").clicked() {
-                                    self.trigger_categorization(filter.id);
+                            // Clickable filter name to toggle detail panel
+                            let label_text = format!("{} ({}/{})", filter.name, filter.matches, filter.total_scored);
+                            let label_response = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&label_text).underline()
+                                ).sense(egui::Sense::click())
+                            );
+                            if label_response.clicked() {
+                                if self.expanded_filter_ids.contains(&filter.id) {
+                                    self.expanded_filter_ids.remove(&filter.id);
+                                } else {
+                                    self.expanded_filter_ids.insert(filter.id);
                                 }
-                            });
+                            }
+                            label_response.on_hover_text("Click to toggle details");
 
                             // Delete button
                             ui.add_enabled_ui(self.categorizing_filter_id.is_none(), |ui| {
@@ -2418,6 +2727,89 @@ impl DashboardApp {
                                 }
                             });
                         });
+
+                        // Expanded detail panel
+                        if is_expanded {
+                            let is_categorizing = self.categorizing_filter_id == Some(filter.id);
+
+                            egui::Frame::none()
+                                .fill(ui.visuals().faint_bg_color)
+                                .rounding(4.0)
+                                .inner_margin(egui::Margin::same(6.0))
+                                .outer_margin(egui::Margin::symmetric(0.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.style_mut().spacing.item_spacing.y = 3.0;
+
+                                    // Query text
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Query:").weak());
+                                        ui.label(&filter.query_text);
+                                    });
+
+                                    // Unscored count
+                                    let unscored = total_nodes - filter.total_scored;
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Unscored:").weak());
+                                        if unscored > 0 {
+                                            ui.label(egui::RichText::new(format!("{}", unscored)).color(egui::Color32::from_rgb(255, 180, 80)));
+                                        } else {
+                                            ui.label("0");
+                                        }
+                                    });
+
+                                    // Mode counts
+                                    let match_count = filter.matches;
+                                    let exclude_count = total_nodes.saturating_sub(match_count);
+
+                                    // Compute +1 and +2 neighbor expansions
+                                    let matching_ids: HashSet<String> = self.graph.data.nodes.iter()
+                                        .filter(|n| n.semantic_filter_matches.contains(&filter.id))
+                                        .map(|n| n.id.clone())
+                                        .collect();
+                                    let adj = self.build_adjacency_list(true);
+                                    let plus1_set = expand_to_neighbors(&matching_ids, 1, &adj);
+                                    let plus2_set = expand_to_neighbors(&matching_ids, 2, &adj);
+
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Visibility by mode:").weak());
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new(format!("+ {}", match_count)).color(theme::filter::INCLUDE));
+                                        ui.label(egui::RichText::new("|").weak());
+                                        ui.label(egui::RichText::new(format!("+1 {}", plus1_set.len())).color(theme::filter::INCLUDE_PLUS1));
+                                        ui.label(egui::RichText::new("|").weak());
+                                        ui.label(egui::RichText::new(format!("+2 {}", plus2_set.len())).color(theme::filter::INCLUDE_PLUS2));
+                                        ui.label(egui::RichText::new("|").weak());
+                                        ui.label(egui::RichText::new(format!("- {}", exclude_count)).color(theme::filter::EXCLUDE));
+                                    });
+
+                                    ui.add_space(2.0);
+
+                                    // Rescore button + progress
+                                    if is_categorizing {
+                                        if let Some((scored, total)) = self.categorization_progress {
+                                            let fraction = if total > 0 { scored as f32 / total as f32 } else { 0.0 };
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(format!("Scoring... ({}/{})", scored, total));
+                                            });
+                                            ui.add(egui::ProgressBar::new(fraction).animate(true));
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label("Scoring...");
+                                            });
+                                        }
+                                    } else {
+                                        ui.add_enabled_ui(self.categorizing_filter_id.is_none(), |ui| {
+                                            if ui.button("Rescore").on_hover_text("Categorize all messages with this filter").clicked() {
+                                                self.trigger_categorization(filter.id);
+                                            }
+                                        });
+                                    }
+                                });
+                        }
                     }
                     ui.add_space(5.0);
                 } else if !self.semantic_filter_loading {
@@ -2569,6 +2961,38 @@ impl DashboardApp {
                     });
                     let max_changed = self.graph.max_proximity_edges != prev_max;
 
+                    // Max neighbors per node dropdown
+                    let neighbor_limits: [(usize, &str); 8] = [
+                        (0, "Unlimited"),
+                        (1, "1"),
+                        (2, "2"),
+                        (3, "3"),
+                        (5, "5"),
+                        (8, "8"),
+                        (12, "12"),
+                        (20, "20"),
+                    ];
+                    let current_neighbors = self.graph.max_neighbors_per_node;
+                    let current_n_label = neighbor_limits.iter()
+                        .find(|(v, _)| *v == current_neighbors)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Custom");
+                    let prev_neighbors = self.graph.max_neighbors_per_node;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max neighbors:");
+                        egui::ComboBox::from_id_salt("max_neighbors_per_node")
+                            .selected_text(current_n_label)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in neighbor_limits {
+                                    if ui.selectable_label(current_neighbors == value, label).clicked() {
+                                        self.graph.max_neighbors_per_node = value;
+                                    }
+                                }
+                            });
+                    });
+                    let max_n_changed = self.graph.max_neighbors_per_node != prev_neighbors;
+
                     // Show edge count and scored nodes (only count nodes in current graph)
                     ui.label(format!("Edges: {}", self.proximity_edge_count));
                     if self.proximity_active {
@@ -2590,8 +3014,8 @@ impl DashboardApp {
                         }
                     });
 
-                    // Auto-refetch when delta or max_edges change
-                    if (delta_changed || max_changed) && !self.proximity_loading && !self.proximity_query.trim().is_empty() {
+                    // Auto-refetch when delta, max_edges, or max_neighbors change
+                    if (delta_changed || max_changed || max_n_changed) && !self.proximity_loading && !self.proximity_query.trim().is_empty() {
                         self.trigger_proximity_fetch();
                     }
                 }
@@ -2625,175 +3049,34 @@ impl DashboardApp {
                 }
             });
 
-        // Advanced section (collapsed by default)
-        egui::CollapsingHeader::new("Advanced")
+        // Mail Network Graph section
+        egui::CollapsingHeader::new("Mail Network")
             .default_open(false)
             .show(ui, |ui| {
-                if ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled").changed() {
-                    self.mark_settings_dirty();
-                }
-                ui.add_space(5.0);
-                ui.label("Physics Tuning");
-                if ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.size_physics_weight, 0.0..=5.0)
-                    .text("Size→Physics")
-                    .fixed_decimals(2)).changed() {
-                    self.mark_settings_dirty();
-                }
-                ui.label(egui::RichText::new("↑ Small nodes become less significant").small().weak());
+                ui.label(egui::RichText::new("Agent Communication").size(11.0).color(Color32::GRAY));
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label("Temporal Clustering");
-
-                let temporal_enabled = self.graph.temporal_attraction_enabled;
-                let mut new_temporal_enabled = temporal_enabled;
-                ui.checkbox(&mut new_temporal_enabled, "Enable temporal edges");
-                if new_temporal_enabled != temporal_enabled {
-                    self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
-                    self.mark_settings_dirty();
-                }
-
-                if self.graph.temporal_attraction_enabled {
-                    if ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
-                        .logarithmic(true)
-                        .text("Strength")).changed() {
-                        self.mark_settings_dirty();
-                    }
-
-                    // Temporal window slider (in minutes for UX, stored as seconds)
-                    let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
-                    let prev_window_mins = window_mins;
-                    ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
-                        .text("Window (min)")
-                        .fixed_decimals(0));
-                    if (window_mins - prev_window_mins).abs() > 0.1 {
-                        self.graph.set_temporal_window(window_mins as f64 * 60.0);
-                        self.mark_settings_dirty();
-                    }
-
-                    // Temporal edge opacity slider
-                    if ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
-                        .text("Edge opacity")
-                        .fixed_decimals(2)).changed() {
-                        self.mark_settings_dirty();
-                    }
-
-                    // Max temporal edges dropdown
-                    let edge_limits = [
-                        (10_000, "10k"),
-                        (50_000, "50k"),
-                        (100_000, "100k"),
-                        (250_000, "250k"),
-                        (500_000, "500k"),
-                        (1_000_000, "1M"),
-                    ];
-                    let current_limit = self.graph.max_temporal_edges;
-                    let current_label = edge_limits.iter()
-                        .find(|(v, _)| *v == current_limit)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Custom");
-
+                // Load button
+                if self.mail_network_loading {
                     ui.horizontal(|ui| {
-                        ui.label("Max edges:");
-                        egui::ComboBox::from_id_salt("max_temporal_edges")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in edge_limits {
-                                    if ui.selectable_label(current_limit == value, label).clicked() {
-                                        self.graph.set_max_temporal_edges(value);
-                                        self.settings.max_temporal_edges = value;
-                                        self.mark_settings_dirty();
-                                    }
-                                }
-                            });
+                        ui.spinner();
+                        ui.label("Loading...");
                     });
+                } else if ui.button("Load Mail Network").clicked() {
+                    self.load_mail_network();
+                }
 
-                    // Show temporal edge count
-                    let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
-                    ui.label(format!("Temporal edges: {}", temporal_count));
+                // Error message
+                if let Some(ref err) = self.mail_network_error {
+                    ui.colored_label(Color32::RED, format!("Error: {}", err));
+                }
+
+                // Render the mail network graph
+                if let Some(ref mut state) = self.mail_network_state {
+                    ui.add_space(5.0);
+                    let size = Vec2::new(ui.available_width().min(250.0), 200.0);
+                    render_mail_network(ui, state, size);
                 }
             });
-
-        // Layout Shaping section (directed stiffness + recency centering)
-        egui::CollapsingHeader::new("Layout Shaping")
-            .default_open(false)
-            .show(ui, |ui| {
-                let was_enabled = self.layout_shaping_enabled;
-                ui.checkbox(&mut self.layout_shaping_enabled, "Enable layout shaping");
-
-                if self.layout_shaping_enabled != was_enabled {
-                    if !self.layout_shaping_enabled {
-                        // Reset to defaults when disabled
-                        self.layout.directed_stiffness = 1.0;
-                        self.layout.recency_centering = 0.0;
-                    }
-                    self.mark_settings_dirty();
-                }
-
-                if self.layout_shaping_enabled {
-                    ui.add_space(5.0);
-
-                    if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
-                        .logarithmic(true)
-                        .text("Edge Stiffness")
-                        .fixed_decimals(2)).changed() {
-                        self.mark_settings_dirty();
-                    }
-                    ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
-
-                    ui.add_space(5.0);
-
-                    if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
-                        .text("Recency→Center")
-                        .fixed_decimals(1)).changed() {
-                        self.mark_settings_dirty();
-                    }
-                    ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
-                }
-            });
-
-        // (Similarity Clustering section removed — merged into Score-Proximity Edges above)
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        // Info section (always visible)
-        ui.label("Info");
-        let visible_count = self.graph.timeline.visible_nodes.len();
-        let total_count = self.graph.data.nodes.len();
-        if self.timeline_enabled && visible_count < total_count {
-            ui.label(format!("Nodes: {} / {}", visible_count, total_count));
-        } else {
-            ui.label(format!("Nodes: {}", total_count));
-        }
-        ui.label(format!("Edges: {}", self.graph.data.edges.len()));
-        ui.label(format!("FPS: {:.1}", self.fps));
-
-        let user_count = self.graph.data.nodes.iter().filter(|n| n.role == crate::graph::types::Role::User).count();
-        let assistant_count = self.graph.data.nodes.iter().filter(|n| n.role == crate::graph::types::Role::Assistant).count();
-        ui.label(format!("You: {} | Claude: {}", user_count, assistant_count));
-
-        ui.add_space(5.0);
-        ui.separator();
-
-        // Zoom controls
-        ui.label("View");
-        ui.horizontal(|ui| {
-            if ui.button("Reset View").clicked() {
-                self.pan_offset = Vec2::ZERO;
-                self.zoom = 1.0;
-            }
-            ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
-        });
 
         ui.add_space(10.0);
         ui.separator();
@@ -2848,42 +3131,6 @@ impl DashboardApp {
                 });
         } else {
             ui.label("No nodes loaded");
-        }
-
-        ui.add_space(10.0);
-
-        // Legend
-        ui.separator();
-        if self.graph.color_mode != ColorMode::Session {
-            ui.label(if self.graph.color_mode == ColorMode::Hybrid { "Projects (Hybrid)" } else { "Projects" });
-            // Show top projects by color
-            let mut projects: Vec<_> = self.graph.project_colors.iter().collect();
-            projects.sort_by(|a, b| a.0.cmp(b.0));
-            for (project, &hue) in projects.iter().take(8) {
-                ui.horizontal(|ui| {
-                    let color = crate::graph::types::hsl_to_rgb(hue, 0.7, 0.55);
-                    ui.colored_label(color, "●");
-                    let label = if project.len() > 15 {
-                        format!("{}…", &project[..14])
-                    } else {
-                        project.to_string()
-                    };
-                    ui.label(label);
-                });
-            }
-            if projects.len() > 8 {
-                ui.label(format!("  +{} more", projects.len() - 8));
-            }
-        } else {
-            ui.label("Legend");
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::WHITE, "●");
-                ui.label("You");
-            });
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(255, 149, 0), "●");
-                ui.label("Claude");
-            });
         }
     }
 
@@ -3086,6 +3333,14 @@ impl DashboardApp {
                 }
             }
 
+            // Skip edges touching tool-use nodes (bypass edges drawn separately)
+            if self.hide_tool_uses && !edge.is_temporal && !edge.is_similarity {
+                let source_tool = self.graph.get_node(&edge.source).map_or(false, |n| n.has_tool_usage);
+                let target_tool = self.graph.get_node(&edge.target).map_or(false, |n| n.has_tool_usage);
+                if source_tool || target_tool {
+                    continue;
+                }
+            }
 
             let source_pos = match self.graph.get_pos(&edge.source) {
                 Some(p) => transform(p),
@@ -3150,6 +3405,23 @@ impl DashboardApp {
             }
         }
 
+        // Draw bypass edges (bridging over hidden tool-use nodes)
+        if self.hide_tool_uses {
+            for edge in &self.tool_use_bypass_edges {
+                let source_pos = match self.graph.get_pos(&edge.source) {
+                    Some(p) => transform(p),
+                    None => continue,
+                };
+                let target_pos = match self.graph.get_pos(&edge.target) {
+                    Some(p) => transform(p),
+                    None => continue,
+                };
+                let color = self.graph.edge_color(edge).gamma_multiply(0.5);
+                let stroke = Stroke::new(1.5 * self.zoom, color);
+                painter.line_segment([source_pos, target_pos], stroke);
+            }
+        }
+
         // Detect hover - select closest node to cursor
         // Note: Timeline-dimmed nodes are hoverable (they're greyed out, not hidden)
         let mut new_hovered = None;
@@ -3178,6 +3450,10 @@ impl DashboardApp {
                     if !sem_visible.contains(&node.id) {
                         continue;
                     }
+                }
+                // Skip hidden tool-use nodes
+                if self.hide_tool_uses && node.has_tool_usage {
+                    continue;
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
                     let screen_pos = transform(pos);
@@ -3267,6 +3543,10 @@ impl DashboardApp {
                 }
             }
 
+            // Skip hidden tool-use nodes
+            if self.hide_tool_uses && node.has_tool_usage {
+                continue;
+            }
 
             if self.graph.get_pos(&node.id).is_some() {
                 // Unified node sizing formula:

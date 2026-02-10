@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Sidebar tab selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SidebarTab {
+    #[default]
+    Data,
+    Visual,
+    Analysis,
+}
+
 /// Preset configurations for node sizing formula
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SizingPreset {
@@ -108,6 +117,8 @@ pub struct Preset {
     pub proximity_strength: f32,
     #[serde(default = "default_max_proximity_edges")]
     pub max_proximity_edges: usize,
+    #[serde(default = "default_max_neighbors_per_node")]
+    pub max_neighbors_per_node: usize,
 
     // Color Snapshot
     #[serde(default)]
@@ -157,6 +168,7 @@ impl Preset {
             proximity_delta: settings.proximity_delta,
             proximity_strength: settings.proximity_strength,
             max_proximity_edges: settings.max_proximity_edges,
+            max_neighbors_per_node: settings.max_neighbors_per_node,
             // Color snapshot
             hue_offset: graph.hue_offset,
             project_colors: graph.project_colors.clone(),
@@ -195,6 +207,7 @@ impl Preset {
         settings.proximity_delta = self.proximity_delta;
         settings.proximity_strength = self.proximity_strength;
         settings.max_proximity_edges = self.max_proximity_edges;
+        settings.max_neighbors_per_node = self.max_neighbors_per_node;
 
         // Restore colors (merge: saved colors take precedence over current)
         graph.hue_offset = self.hue_offset;
@@ -273,6 +286,8 @@ pub struct Settings {
     pub proximity_strength: f32,
     #[serde(default = "default_max_proximity_edges")]
     pub max_proximity_edges: usize,
+    #[serde(default = "default_max_neighbors_per_node")]
+    pub max_neighbors_per_node: usize,
 
     // Saved presets
     #[serde(default)]
@@ -295,6 +310,10 @@ pub struct Settings {
     pub histogram_panel_enabled: bool,
     #[serde(default = "default_histogram_split_ratio")]
     pub histogram_split_ratio: f32,
+
+    // Sidebar tab
+    #[serde(default)]
+    pub sidebar_tab: SidebarTab,
 }
 
 fn default_timeline_speed() -> f32 {
@@ -348,6 +367,7 @@ fn default_proximity_stiffness() -> f32 { 1.0 }
 fn default_proximity_delta() -> f32 { 0.1 }
 fn default_proximity_strength() -> f32 { 0.5 }
 fn default_max_proximity_edges() -> usize { 100_000 }
+fn default_max_neighbors_per_node() -> usize { 0 }
 
 fn default_histogram_panel_enabled() -> bool { false }
 fn default_histogram_split_ratio() -> f32 { 0.65 }
@@ -400,6 +420,7 @@ impl Default for Settings {
             proximity_delta: 0.1,
             proximity_strength: 0.5,
             max_proximity_edges: 100_000,
+            max_neighbors_per_node: 0,
 
             // Presets
             presets: Vec::new(),
@@ -415,6 +436,9 @@ impl Default for Settings {
             // Token histogram panel
             histogram_panel_enabled: false,
             histogram_split_ratio: 0.65,
+
+            // Sidebar tab
+            sidebar_tab: SidebarTab::Data,
         }
     }
 }

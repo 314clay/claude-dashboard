@@ -258,6 +258,7 @@ impl DbClient {
                     cache_read_tokens: row.cache_read_tokens,
                     cache_creation_tokens: row.cache_creation_tokens,
                     semantic_filter_matches: Vec::new(), // Populated below
+                    has_tool_usage: false, // Populated below
                 });
 
                 // Create edge from previous message in same session
@@ -328,6 +329,44 @@ impl DbClient {
                         if let Ok(msg_id) = node.id.parse::<i32>() {
                             if let Some(filter_ids) = matches_map.get(&msg_id) {
                                 node.semantic_filter_matches = filter_ids.clone();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Identify messages with tool usages
+            if !nodes.is_empty() {
+                let message_ids: Vec<i32> = nodes.iter()
+                    .filter_map(|n| n.id.parse::<i32>().ok())
+                    .collect();
+
+                if !message_ids.is_empty() {
+                    let placeholders: Vec<String> = (1..=message_ids.len())
+                        .map(|i| format!("?{}", i))
+                        .collect();
+                    let in_clause = placeholders.join(", ");
+                    let sql = format!(
+                        "SELECT DISTINCT message_id FROM tool_usages WHERE message_id IN ({})",
+                        in_clause
+                    );
+
+                    let mut query = sqlx::query_scalar::<_, i32>(&sql);
+                    for id in &message_ids {
+                        query = query.bind(id);
+                    }
+
+                    let tool_msg_ids: std::collections::HashSet<i32> = query
+                        .fetch_all(&self.pool)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+
+                    for node in &mut nodes {
+                        if let Ok(msg_id) = node.id.parse::<i32>() {
+                            if tool_msg_ids.contains(&msg_id) {
+                                node.has_tool_usage = true;
                             }
                         }
                     }

@@ -96,6 +96,7 @@ class ProximityEdgesRequest(BaseModel):
     query_text: str
     delta: float = 0.1
     max_edges: int = 100_000
+    max_neighbors: int = 0
 
 
 @app.get("/health")
@@ -504,7 +505,7 @@ def embedding_proximity_edges(body: ProximityEdgesRequest):
     Body: { query_text: "...", delta: 0.1, max_edges: 100000 }
     Returns: { edges: [{source, target, strength}], scores: {msg_id: float}, count, query }
     """
-    result = compute_proximity_edges(body.query_text, body.delta, body.max_edges)
+    result = compute_proximity_edges(body.query_text, body.delta, body.max_edges, body.max_neighbors)
     edges = [
         {"source": str(src), "target": str(tgt), "strength": round(strength, 4)}
         for src, tgt, strength in result["edges"]

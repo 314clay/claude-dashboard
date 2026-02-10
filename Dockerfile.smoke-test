@@ -1,0 +1,86 @@
+# Smoke test: simulates a new user cloning the repo on a fresh machine.
+#
+# Validates:
+#   1. All system dependencies install correctly
+#   2. Python deps install and API imports work
+#   3. Rust compiles in release mode
+#   4. All tests pass (Rust + Python)
+#   5. ingest.py discovers and imports session data
+#   6. API serves ingested sessions and graph nodes
+#
+# Usage:
+#   ./scripts/smoke-test.sh          # build + run
+#   docker build -f Dockerfile.smoke-test -t dashboard-smoke .  # build only
+
+FROM ubuntu:22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_TERM_COLOR=always
+
+# ── System deps (matches CI and README) ──────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    pkg-config \
+    libgtk-3-dev \
+    libxdo-dev \
+    libatk1.0-dev \
+    libglib2.0-dev \
+    libssl-dev \
+    python3 \
+    python3-pip \
+    python3-venv \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust via rustup ──────────────────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# ── Copy repo (simulates git clone) ─────────────────────────────
+COPY . .
+
+# ── Stage 1: Python setup ───────────────────────────────────────
+FROM base AS python-check
+
+RUN pip install -r api/requirements.txt
+
+# Verify all imports work
+RUN python3 -c "\
+import fastapi; \
+import uvicorn; \
+import openai; \
+import numpy; \
+print('All Python imports OK')"
+
+# Run Python tests
+RUN cd api && python3 -m pytest test_main.py -v
+
+# ── Stage 2: Rust build ─────────────────────────────────────────
+FROM base AS rust-check
+
+# Build release binary (the real test — catches missing deps, compile errors)
+RUN cargo build --release
+
+# Run Rust tests
+RUN cargo test
+
+# ── Stage 3: Integration smoke test ─────────────────────────────
+FROM base AS integration
+
+RUN pip install -r api/requirements.txt
+
+COPY --from=rust-check /app/target/release/dashboard-native /app/target/release/dashboard-native
+
+# Initialize DB schema
+RUN mkdir -p /root/.config/dashboard-native \
+    && sqlite3 /root/.config/dashboard-native/dashboard.db < schema.sqlite.sql
+
+# Create synthetic Claude sessions and ingest them (simulates: python3 ingest.py)
+RUN python3 scripts/create-fixture-sessions.py \
+    && python3 ingest.py --path /root/.claude
+
+# Smoke test: start API, hit endpoints, verify ingested data appears
+RUN python3 scripts/verify-endpoints.py

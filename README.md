@@ -24,7 +24,7 @@ That's it. No database server needed -- data is stored in a local SQLite file at
 
 **Linux**:
 ```bash
-sudo apt-get install -y libgtk-3-dev libxdo-dev libatk1.0-dev libglib2.0-dev
+sudo apt-get install -y libgtk-3-dev libxdo-dev libatk1.0-dev libglib2.0-dev libssl-dev
 ```
 
 **Windows**: Not currently supported (egui may work, untested).

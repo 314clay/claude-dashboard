@@ -79,6 +79,8 @@ pub struct GraphNode {
     pub cache_creation_tokens: Option<i32>,
     #[serde(default)]
     pub semantic_filter_matches: Vec<i32>,
+    #[serde(default)]
+    pub has_tool_usage: bool,
 }
 
 impl GraphNode {
@@ -633,6 +635,8 @@ pub struct GraphState {
     pub score_proximity_delta: f32,
     /// Maximum proximity edges to prevent memory issues
     pub max_proximity_edges: usize,
+    /// Per-node edge cap for proximity edges (0 = unlimited)
+    pub max_neighbors_per_node: usize,
 }
 
 impl GraphState {
@@ -660,6 +664,7 @@ impl GraphState {
             score_proximity_enabled: false,
             score_proximity_delta: 0.1,
             max_proximity_edges: 100_000,
+            max_neighbors_per_node: 0,
         }
     }
 

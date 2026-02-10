@@ -1,0 +1,8 @@
+# Don't send build artifacts or local state to Docker
+target/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+*.db
