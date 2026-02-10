@@ -2,4 +2,4 @@
 
 mod client;
 
-pub use client::{ApiClient, EmbeddingGenResult, EmbeddingStats, ImportanceStats, RescoreEvent, RescoreProgress, RescoreResult};
+pub use client::{ApiClient, EmbeddingGenResult, EmbeddingStats, ImportanceStats, IngestResult, ProximityEdgesResponse, RescoreEvent, RescoreProgress, RescoreResult};

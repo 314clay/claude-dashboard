@@ -239,13 +239,15 @@ pub struct DashboardApp {
     // Cached semantic filter visible set (invalidate on filter change or data load)
     semantic_filter_cache: Option<HashSet<String>>,
 
-    // Similarity search (embedding-based)
-    similarity_query: String,
-    similarity_scores: HashMap<String, f32>,  // message_id -> score
-    similarity_threshold: f32,
-    similarity_active: bool,
-    similarity_loading: bool,
-    similarity_receiver: Option<Receiver<Result<HashMap<String, f32>, String>>>,
+    // Score-proximity edges (unified similarity search + clustering)
+    proximity_query: String,
+    proximity_scores: HashMap<String, f32>,  // message_id -> score
+    proximity_active: bool,
+    proximity_loading: bool,
+    proximity_edge_opacity: f32,
+    proximity_edge_count: usize,
+    proximity_stiffness: f32,
+    proximity_rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
     embedding_stats: Option<EmbeddingStats>,
     embedding_gen_loading: bool,
     embedding_gen_receiver: Option<Receiver<Result<EmbeddingGenResult, String>>>,
@@ -284,12 +286,11 @@ pub struct DashboardApp {
     // Layout shaping (directed stiffness + recency centering)
     layout_shaping_enabled: bool,
 
-    // Similarity clustering (edge-based, fetched from API)
-    similarity_clustering_enabled: bool,
-    similarity_edge_opacity: f32,
-    similarity_edges_loading: bool,
-    similarity_edge_count: usize,
-    similarity_edges_rx: Option<Receiver<Vec<GraphEdge>>>,
+
+    // Session ingest (re-import from ~/.claude/)
+    ingest_loading: bool,
+    ingest_receiver: Option<Receiver<Result<IngestResult, String>>>,
+    ingest_result: Option<IngestResult>,
 }
 
 impl DashboardApp {
@@ -450,13 +451,15 @@ impl DashboardApp {
             categorization_receiver: None,
             semantic_filter_cache: None,
 
-            // Similarity search
-            similarity_query: String::new(),
-            similarity_scores: HashMap::new(),
-            similarity_threshold: 0.0,
-            similarity_active: false,
-            similarity_loading: false,
-            similarity_receiver: None,
+            // Score-proximity edges
+            proximity_query: String::new(),
+            proximity_scores: HashMap::new(),
+            proximity_active: false,
+            proximity_loading: false,
+            proximity_edge_opacity: 0.3,
+            proximity_edge_count: 0,
+            proximity_stiffness: 1.0,
+            proximity_rx: None,
             embedding_stats: None,
             embedding_gen_loading: false,
             embedding_gen_receiver: None,
@@ -478,12 +481,10 @@ impl DashboardApp {
             // Layout shaping
             layout_shaping_enabled: false,
 
-            // Similarity clustering
-            similarity_clustering_enabled: false,
-            similarity_edge_opacity: 0.3,
-            similarity_edges_loading: false,
-            similarity_edge_count: 0,
-            similarity_edges_rx: None,
+            // Session ingest
+            ingest_loading: false,
+            ingest_receiver: None,
+            ingest_result: None,
         };
 
         // Load initial data if connected
@@ -541,6 +542,11 @@ impl DashboardApp {
         self.settings.temporal_window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
         self.settings.temporal_edge_opacity = self.temporal_edge_opacity;
         self.settings.max_temporal_edges = self.graph.max_temporal_edges;
+        self.settings.proximity_edge_opacity = self.proximity_edge_opacity;
+        self.settings.proximity_stiffness = self.proximity_stiffness;
+        self.settings.proximity_delta = self.graph.score_proximity_delta;
+        self.settings.proximity_strength = self.layout.similarity_strength;
+        self.settings.max_proximity_edges = self.graph.max_proximity_edges;
         self.settings.beads_panel_open = self.beads_panel_open;
         self.settings.mail_panel_open = self.mail_panel_open;
         self.settings.histogram_panel_enabled = self.histogram_panel_enabled;
@@ -575,6 +581,11 @@ impl DashboardApp {
         self.graph.temporal_window_secs = (self.settings.temporal_window_mins * 60.0) as f64;
         self.temporal_edge_opacity = self.settings.temporal_edge_opacity;
         self.graph.max_temporal_edges = self.settings.max_temporal_edges;
+        self.proximity_edge_opacity = self.settings.proximity_edge_opacity;
+        self.proximity_stiffness = self.settings.proximity_stiffness;
+        self.graph.score_proximity_delta = self.settings.proximity_delta;
+        self.layout.similarity_strength = self.settings.proximity_strength;
+        self.graph.max_proximity_edges = self.settings.max_proximity_edges;
     }
 
     /// Save settings if dirty and enough time has passed (debounce)
@@ -943,7 +954,7 @@ impl DashboardApp {
     fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
         // If no filters active, return None (simulate all)
         let semantic_filter_active = self.has_active_semantic_filters();
-        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.similarity_active {
+        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.proximity_active {
             return None;
         }
 
@@ -978,14 +989,8 @@ impl DashboardApp {
                     continue;
                 }
             }
-            // Similarity filter
-            if self.similarity_active {
-                if let Some(&score) = self.similarity_scores.get(&node.id) {
-                    if score < self.similarity_threshold {
-                        continue;
-                    }
-                }
-            }
+            // Proximity filter: when active, all scored nodes participate in physics
+            // (no threshold-based hiding — proximity colors by heat map instead)
             visible.insert(node.id.clone());
         }
 
@@ -1216,59 +1221,45 @@ impl DashboardApp {
         self.categorization_receiver = Some(rx);
     }
 
-    /// Trigger similarity search (runs in background)
-    fn trigger_similarity_search(&mut self) {
-        let query = self.similarity_query.trim().to_string();
+    /// Trigger proximity fetch (edges + scores in one call, runs in background)
+    fn trigger_proximity_fetch(&mut self) {
+        let query = self.proximity_query.trim().to_string();
         if query.is_empty() {
             return;
         }
 
-        self.similarity_loading = true;
+        self.proximity_loading = true;
+
+        let delta = self.graph.score_proximity_delta;
+        let max_edges = self.graph.max_proximity_edges;
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let api = ApiClient::new();
-            let result = api.fetch_similarity_scores(&query);
-            let _ = tx.send(result);
-        });
-
-        self.similarity_receiver = Some(rx);
-    }
-
-    /// Trigger async fetch of similarity edges from the API
-    fn trigger_similarity_edge_fetch(&mut self) {
-        self.similarity_edges_loading = true;
-
-        let threshold = self.graph.similarity_threshold;
-        let k_nearest = self.graph.similarity_k_nearest;
-        let max_edges = self.graph.max_similarity_edges;
-        let time_window_hours = self.graph.similarity_time_window_hours;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let api = ApiClient::new();
-            match api.fetch_similarity_edges(threshold, k_nearest, max_edges, time_window_hours) {
+            match api.fetch_proximity_edges(&query, delta, max_edges) {
                 Ok(response) => {
                     let edges: Vec<GraphEdge> = response.edges.into_iter().map(|e| {
-                        GraphEdge::similarity(e.source, e.target, e.similarity)
+                        GraphEdge::similarity(e.source, e.target, e.strength)
                     }).collect();
-                    let _ = tx.send(edges);
+                    let _ = tx.send(Ok((edges, response.scores)));
                 }
                 Err(e) => {
-                    eprintln!("Failed to fetch similarity edges: {}", e);
-                    let _ = tx.send(Vec::new());
+                    let _ = tx.send(Err(e));
                 }
             }
         });
 
-        self.similarity_edges_rx = Some(rx);
+        self.proximity_rx = Some(rx);
     }
 
-    /// Clear similarity search overlay
-    fn clear_similarity(&mut self) {
-        self.similarity_active = false;
-        self.similarity_scores.clear();
-        self.similarity_query.clear();
+    /// Clear proximity edges and overlay
+    fn clear_proximity(&mut self) {
+        self.proximity_active = false;
+        self.proximity_scores.clear();
+        self.proximity_query.clear();
+        self.proximity_edge_count = 0;
+        self.graph.set_proximity_edges(Vec::new());
+        self.graph.score_proximity_enabled = false;
     }
 
     /// Load embedding stats from the API
@@ -1322,6 +1313,43 @@ impl DashboardApp {
         });
 
         self.rescore_receiver = Some(rx);
+    }
+
+    /// Start re-ingestion of Claude sessions in background thread.
+    /// Computes the since window from the most recent node timestamp.
+    fn start_ingest(&mut self) {
+        self.ingest_loading = true;
+        self.ingest_result = None;
+
+        // Find the most recent node timestamp to determine staleness
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let max_ts = self.graph.data.nodes.iter()
+            .filter_map(|n| n.timestamp_secs())
+            .fold(0.0_f64, f64::max);
+
+        let hours_stale = if max_ts > 0.0 {
+            ((now - max_ts) / 3600.0).ceil() as u64
+        } else {
+            24 // fallback if no nodes loaded
+        };
+
+        // Convert to a --since string, minimum 1h, add 1h padding
+        let since = if hours_stale + 1 >= 48 {
+            format!("{}d", (hours_stale + 1 + 23) / 24) // round up to days
+        } else {
+            format!("{}h", (hours_stale + 1).max(1))
+        };
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            let _ = tx.send(api.trigger_ingest(&since));
+        });
+
+        self.ingest_receiver = Some(rx);
     }
 
     /// Get unique session IDs from currently visible nodes
@@ -1829,6 +1857,30 @@ impl DashboardApp {
                         self.load_graph();
                     }
                 });
+
+                // Re-ingest sessions from ~/.claude/
+                if self.ingest_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Ingesting sessions...");
+                    });
+                } else {
+                    if ui.button("↻ Re-ingest Sessions").on_hover_text(
+                        "Import new sessions from ~/.claude/ into the database"
+                    ).clicked() {
+                        self.start_ingest();
+                    }
+                }
+                if let Some(ref result) = self.ingest_result {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Imported {} sessions, {} msgs",
+                            result.sessions, result.messages
+                        ))
+                        .size(11.0)
+                        .color(theme::state::SUCCESS),
+                    );
+                }
 
                 // Last synced timestamp
                 if let Some(last_synced) = self.last_synced {
@@ -2367,66 +2419,133 @@ impl DashboardApp {
                 }
             });
 
-        // Similarity Search section
-        egui::CollapsingHeader::new("Similarity Search")
+        // Score-Proximity Edges section (unified similarity search + clustering)
+        egui::CollapsingHeader::new("Score-Proximity Edges")
             .default_open(false)
             .show(ui, |ui| {
+                // Enable checkbox
+                let was_enabled = self.graph.score_proximity_enabled;
+                ui.checkbox(&mut self.graph.score_proximity_enabled, "Enable");
+
+                if self.graph.score_proximity_enabled != was_enabled && !self.graph.score_proximity_enabled {
+                    self.clear_proximity();
+                }
+
                 // Search input + button
                 ui.horizontal(|ui| {
                     let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.similarity_query)
+                        egui::TextEdit::singleline(&mut self.proximity_query)
                             .hint_text("Search concept...")
                             .desired_width(130.0)
                     );
 
-                    let can_search = !self.similarity_query.trim().is_empty()
-                        && !self.similarity_loading;
+                    let can_search = !self.proximity_query.trim().is_empty()
+                        && !self.proximity_loading;
 
                     if ui.add_enabled(can_search, egui::Button::new("Search")).clicked()
                         || (response.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter))
                             && can_search)
                     {
-                        self.trigger_similarity_search();
+                        self.graph.score_proximity_enabled = true;
+                        self.trigger_proximity_fetch();
                     }
                 });
-
-                // Loading indicator
-                if self.similarity_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Searching...");
-                    });
-                }
 
                 // Quick preset buttons
                 ui.horizontal_wrapped(|ui| {
                     let presets = ["frustrated", "decisions", "errors", "confused", "breakthrough"];
                     for preset in presets {
                         if ui.small_button(preset).clicked() {
-                            self.similarity_query = preset.to_string();
-                            self.trigger_similarity_search();
+                            self.proximity_query = preset.to_string();
+                            self.graph.score_proximity_enabled = true;
+                            self.trigger_proximity_fetch();
                         }
                     }
                 });
 
-                // Threshold slider (only when active)
-                if self.similarity_active {
-                    ui.add_space(5.0);
-                    ui.add(
-                        egui::Slider::new(&mut self.similarity_threshold, 0.0..=1.0)
-                            .text("Threshold")
-                            .fixed_decimals(2)
-                    );
+                // Loading indicator
+                if self.proximity_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading...");
+                    });
+                }
 
-                    let visible_count = self.similarity_scores.values()
-                        .filter(|&&s| s >= self.similarity_threshold)
-                        .count();
-                    ui.label(format!("{} / {} nodes above threshold",
-                        visible_count, self.similarity_scores.len()));
+                if self.graph.score_proximity_enabled {
+                    // Strength slider (physics force multiplier)
+                    ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
+                        .logarithmic(true)
+                        .text("Strength"));
 
-                    if ui.button("Clear").clicked() {
-                        self.clear_similarity();
+                    // Delta slider
+                    let prev_delta = self.graph.score_proximity_delta;
+                    ui.add(egui::Slider::new(&mut self.graph.score_proximity_delta, 0.01..=0.5)
+                        .text("Delta (window)")
+                        .fixed_decimals(2));
+                    let delta_changed = (self.graph.score_proximity_delta - prev_delta).abs() > 0.001;
+
+                    // Edge opacity slider
+                    ui.add(egui::Slider::new(&mut self.proximity_edge_opacity, 0.0..=1.0)
+                        .text("Edge opacity")
+                        .fixed_decimals(2));
+
+                    // Stiffness slider
+                    ui.add(egui::Slider::new(&mut self.proximity_stiffness, 0.1..=10.0)
+                        .logarithmic(true)
+                        .text("Stiffness"));
+
+                    // Max edges dropdown
+                    let edge_limits = [
+                        (10_000_usize, "10k"),
+                        (50_000, "50k"),
+                        (100_000, "100k"),
+                        (250_000, "250k"),
+                        (500_000, "500k"),
+                        (1_000_000, "1M"),
+                    ];
+                    let current_limit = self.graph.max_proximity_edges;
+                    let current_label = edge_limits.iter()
+                        .find(|(v, _)| *v == current_limit)
+                        .map(|(_, l)| *l)
+                        .unwrap_or("Custom");
+                    let prev_max = self.graph.max_proximity_edges;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Max edges:");
+                        egui::ComboBox::from_id_salt("max_proximity_edges")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in edge_limits {
+                                    if ui.selectable_label(current_limit == value, label).clicked() {
+                                        self.graph.max_proximity_edges = value;
+                                    }
+                                }
+                            });
+                    });
+                    let max_changed = self.graph.max_proximity_edges != prev_max;
+
+                    // Show edge count and scored nodes
+                    ui.label(format!("Edges: {}", self.proximity_edge_count));
+                    if self.proximity_active {
+                        ui.label(format!("Scored nodes: {}", self.proximity_scores.len()));
+                    }
+
+                    // Rebuild / Clear buttons
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!self.proximity_loading && !self.proximity_query.trim().is_empty(),
+                            egui::Button::new("Rebuild")).clicked()
+                        {
+                            self.trigger_proximity_fetch();
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.clear_proximity();
+                        }
+                    });
+
+                    // Auto-refetch when delta or max_edges change
+                    if (delta_changed || max_changed) && !self.proximity_loading && !self.proximity_query.trim().is_empty() {
+                        self.trigger_proximity_fetch();
                     }
                 }
 
@@ -2434,7 +2553,6 @@ impl DashboardApp {
                 ui.separator();
 
                 // Embedding stats and generation
-                // Cache values before closures to avoid borrow conflicts
                 let stats_info = self.embedding_stats.as_ref().map(|s| (s.embedded, s.total, s.unembedded));
                 let gen_loading = self.embedding_gen_loading;
 
@@ -2596,111 +2714,7 @@ impl DashboardApp {
                 }
             });
 
-        // Similarity Clustering section
-        egui::CollapsingHeader::new("Similarity Clustering")
-            .default_open(false)
-            .show(ui, |ui| {
-                let was_enabled = self.similarity_clustering_enabled;
-                ui.checkbox(&mut self.similarity_clustering_enabled, "Enable similarity edges");
-
-                if self.similarity_clustering_enabled != was_enabled {
-                    if self.similarity_clustering_enabled {
-                        self.graph.set_similarity_clustering_enabled(true);
-                        self.trigger_similarity_edge_fetch();
-                    } else {
-                        self.graph.set_similarity_clustering_enabled(false);
-                        self.graph.build_similarity_edges(Vec::new());
-                        self.similarity_edge_count = 0;
-                    }
-                }
-
-                if self.similarity_clustering_enabled {
-                    // Threshold slider
-                    let prev_threshold = self.graph.similarity_threshold;
-                    ui.add(egui::Slider::new(&mut self.graph.similarity_threshold, 0.5..=1.0)
-                        .text("Threshold")
-                        .fixed_decimals(2));
-                    let threshold_changed = (self.graph.similarity_threshold - prev_threshold).abs() > 0.001;
-
-                    // Strength slider (physics force multiplier)
-                    ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
-                        .logarithmic(true)
-                        .text("Strength"));
-
-                    // k-nearest slider
-                    let prev_k = self.graph.similarity_k_nearest;
-                    let mut k_val = self.graph.similarity_k_nearest as i32;
-                    ui.add(egui::Slider::new(&mut k_val, 1..=50)
-                        .text("k-nearest"));
-                    self.graph.similarity_k_nearest = k_val as usize;
-                    let k_changed = self.graph.similarity_k_nearest != prev_k;
-
-                    // Edge opacity slider
-                    ui.add(egui::Slider::new(&mut self.similarity_edge_opacity, 0.0..=1.0)
-                        .text("Edge opacity")
-                        .fixed_decimals(2));
-
-                    // Time window slider (0 = no limit)
-                    let prev_tw = self.graph.similarity_time_window_hours.unwrap_or(0.0);
-                    let mut tw_val = prev_tw;
-                    ui.add(egui::Slider::new(&mut tw_val, 0.0..=720.0)
-                        .text("Time window (hrs)")
-                        .fixed_decimals(0));
-                    let new_tw = if tw_val < 0.5 { None } else { Some(tw_val) };
-                    self.graph.similarity_time_window_hours = new_tw;
-                    let tw_changed = (tw_val - prev_tw).abs() > 0.5;
-
-                    // Max edges dropdown
-                    let sim_edge_limits = [
-                        (10_000_usize, "10k"),
-                        (50_000, "50k"),
-                        (100_000, "100k"),
-                        (250_000, "250k"),
-                    ];
-                    let current_sim_limit = self.graph.max_similarity_edges;
-                    let current_sim_label = sim_edge_limits.iter()
-                        .find(|(v, _)| *v == current_sim_limit)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Custom");
-                    let prev_max = self.graph.max_similarity_edges;
-
-                    ui.horizontal(|ui| {
-                        ui.label("Max edges:");
-                        egui::ComboBox::from_id_salt("max_similarity_edges")
-                            .selected_text(current_sim_label)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in sim_edge_limits {
-                                    if ui.selectable_label(current_sim_limit == value, label).clicked() {
-                                        self.graph.set_max_similarity_edges(value);
-                                    }
-                                }
-                            });
-                    });
-                    let max_changed = self.graph.max_similarity_edges != prev_max;
-
-                    // Show edge count and loading state
-                    if self.similarity_edges_loading {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Loading similarity edges...");
-                        });
-                    } else {
-                        ui.label(format!("Similarity edges: {}", self.similarity_edge_count));
-                    }
-
-                    // Rebuild button
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.similarity_edges_loading, egui::Button::new("Rebuild")).clicked() {
-                            self.trigger_similarity_edge_fetch();
-                        }
-                    });
-
-                    // Auto-refetch when parameters change
-                    if (threshold_changed || k_changed || tw_changed || max_changed) && !self.similarity_edges_loading {
-                        self.trigger_similarity_edge_fetch();
-                    }
-                }
-            });
+        // (Similarity Clustering section removed — merged into Score-Proximity Edges above)
 
         ui.add_space(10.0);
         ui.separator();
@@ -2969,6 +2983,8 @@ impl DashboardApp {
 
         // Run physics simulation (uses graph-space center, unaffected by viewport pan)
         // Only simulate visible nodes (respects timeline + importance filters)
+        // Wire proximity stiffness into layout before step
+        self.layout.similarity_stiffness = self.proximity_stiffness;
         let physics_visible = self.compute_physics_visible_nodes();
         let node_sizes = self.compute_node_sizes();
         self.layout.step(&mut self.graph, center, physics_visible.as_ref(), node_sizes.as_ref());
@@ -3023,16 +3039,6 @@ impl DashboardApp {
                 }
             }
 
-            // Skip edges where either endpoint is below similarity threshold
-            if self.similarity_active {
-                let source_below = self.similarity_scores.get(&edge.source)
-                    .map_or(true, |&s| s < self.similarity_threshold);
-                let target_below = self.similarity_scores.get(&edge.target)
-                    .map_or(true, |&s| s < self.similarity_threshold);
-                if source_below || target_below {
-                    continue;
-                }
-            }
 
             let source_pos = match self.graph.get_pos(&edge.source) {
                 Some(p) => transform(p),
@@ -3046,7 +3052,7 @@ impl DashboardApp {
             let base_opacity = if edge.is_temporal {
                 self.temporal_edge_opacity
             } else if edge.is_similarity {
-                self.similarity_edge_opacity
+                self.proximity_edge_opacity
             } else {
                 0.5
             };
@@ -3106,14 +3112,6 @@ impl DashboardApp {
                 if let Some(ref sem_visible) = semantic_visible {
                     if !sem_visible.contains(&node.id) {
                         continue;
-                    }
-                }
-                // Skip nodes below similarity threshold
-                if self.similarity_active {
-                    if let Some(&score) = self.similarity_scores.get(&node.id) {
-                        if score < self.similarity_threshold {
-                            continue;
-                        }
                     }
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
@@ -3186,15 +3184,6 @@ impl DashboardApp {
                 }
             }
 
-            // Skip nodes below similarity threshold when overlay is active
-            // (unscored nodes are kept — they render as dim grey)
-            if self.similarity_active {
-                if let Some(&score) = self.similarity_scores.get(&node.id) {
-                    if score < self.similarity_threshold {
-                        continue;
-                    }
-                }
-            }
 
             if self.graph.get_pos(&node.id).is_some() {
                 // Unified node sizing formula:
@@ -3323,14 +3312,14 @@ impl DashboardApp {
                     }
                 };
 
-                // Apply similarity overlay when active
-                let color = if self.similarity_active {
-                    match self.similarity_scores.get(&node.id) {
-                        Some(&score) if score >= self.similarity_threshold => {
+                // Apply proximity heat-map overlay when active
+                let color = if self.proximity_active {
+                    match self.proximity_scores.get(&node.id) {
+                        Some(&score) => {
+                            // Heat map: dim low scores, bright high scores
                             let grey = crate::graph::types::to_greyscale(color);
-                            crate::graph::types::lerp_color(grey, color, score)
+                            crate::graph::types::lerp_color(grey.gamma_multiply(0.3), color, score)
                         }
-                        Some(_) => continue, // Below threshold, skip
                         None => crate::graph::types::to_greyscale(color).gamma_multiply(0.15),
                     }
                 } else {
@@ -4512,26 +4501,55 @@ impl eframe::App for DashboardApp {
             }
         }
 
-        // Check for similarity search result from background thread
-        if let Some(ref rx) = self.similarity_receiver {
+        // Check for ingest result from background thread
+        if let Some(ref rx) = self.ingest_receiver {
             match rx.try_recv() {
-                Ok(Ok(scores)) => {
-                    self.similarity_scores = scores;
-                    self.similarity_active = true;
-                    self.similarity_loading = false;
-                    self.similarity_receiver = None;
+                Ok(Ok(result)) => {
+                    self.ingest_result = Some(result);
+                    self.ingest_loading = false;
+                    self.ingest_receiver = None;
+                    // Reload graph to show newly ingested data
+                    self.load_graph();
                 }
                 Ok(Err(e)) => {
-                    eprintln!("Similarity search failed: {}", e);
-                    self.similarity_loading = false;
-                    self.similarity_receiver = None;
+                    eprintln!("Ingest failed: {}", e);
+                    self.ingest_loading = false;
+                    self.ingest_receiver = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.similarity_loading = false;
-                    self.similarity_receiver = None;
+                    self.ingest_loading = false;
+                    self.ingest_receiver = None;
+                }
+            }
+        }
+
+        // Check for proximity edges + scores result from background thread
+        if let Some(ref rx) = self.proximity_rx {
+            match rx.try_recv() {
+                Ok(Ok((edges, scores))) => {
+                    let count = edges.len();
+                    self.graph.set_proximity_edges(edges);
+                    self.proximity_scores = scores;
+                    self.proximity_edge_count = count;
+                    self.proximity_active = true;
+                    self.proximity_loading = false;
+                    self.proximity_rx = None;
+                    eprintln!("Loaded {} proximity edges, {} scored nodes", count, self.proximity_scores.len());
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Proximity fetch failed: {}", e);
+                    self.proximity_loading = false;
+                    self.proximity_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.proximity_loading = false;
+                    self.proximity_rx = None;
                 }
             }
         }
@@ -4561,26 +4579,6 @@ impl eframe::App for DashboardApp {
             }
         }
 
-        // Check for similarity edges result from background thread
-        if let Some(ref rx) = self.similarity_edges_rx {
-            match rx.try_recv() {
-                Ok(edges) => {
-                    let count = edges.len();
-                    self.graph.build_similarity_edges(edges);
-                    self.similarity_edge_count = count;
-                    self.similarity_edges_loading = false;
-                    self.similarity_edges_rx = None;
-                    eprintln!("Loaded {} similarity edges", count);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint();
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.similarity_edges_loading = false;
-                    self.similarity_edges_rx = None;
-                }
-            }
-        }
 
         // Handle playback
         if self.graph.timeline.playing && !self.timeline_dragging {

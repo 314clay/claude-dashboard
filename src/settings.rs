@@ -97,6 +97,18 @@ pub struct Preset {
     #[serde(default)]
     pub recency_centering: f32,
 
+    // Score-proximity edges
+    #[serde(default = "default_proximity_edge_opacity")]
+    pub proximity_edge_opacity: f32,
+    #[serde(default = "default_proximity_stiffness")]
+    pub proximity_stiffness: f32,
+    #[serde(default = "default_proximity_delta")]
+    pub proximity_delta: f32,
+    #[serde(default = "default_proximity_strength")]
+    pub proximity_strength: f32,
+    #[serde(default = "default_max_proximity_edges")]
+    pub max_proximity_edges: usize,
+
     // Color Snapshot
     #[serde(default)]
     pub hue_offset: f32,
@@ -139,6 +151,12 @@ impl Preset {
             max_temporal_edges: settings.max_temporal_edges,
             directed_stiffness: settings.directed_stiffness,
             recency_centering: settings.recency_centering,
+            // Score-proximity edges
+            proximity_edge_opacity: settings.proximity_edge_opacity,
+            proximity_stiffness: settings.proximity_stiffness,
+            proximity_delta: settings.proximity_delta,
+            proximity_strength: settings.proximity_strength,
+            max_proximity_edges: settings.max_proximity_edges,
             // Color snapshot
             hue_offset: graph.hue_offset,
             project_colors: graph.project_colors.clone(),
@@ -172,6 +190,11 @@ impl Preset {
         settings.max_temporal_edges = self.max_temporal_edges;
         settings.directed_stiffness = self.directed_stiffness;
         settings.recency_centering = self.recency_centering;
+        settings.proximity_edge_opacity = self.proximity_edge_opacity;
+        settings.proximity_stiffness = self.proximity_stiffness;
+        settings.proximity_delta = self.proximity_delta;
+        settings.proximity_strength = self.proximity_strength;
+        settings.max_proximity_edges = self.max_proximity_edges;
 
         // Restore colors (merge: saved colors take precedence over current)
         graph.hue_offset = self.hue_offset;
@@ -238,6 +261,18 @@ pub struct Settings {
     pub directed_stiffness: f32,
     #[serde(default)]
     pub recency_centering: f32,
+
+    // Score-proximity edges
+    #[serde(default = "default_proximity_edge_opacity")]
+    pub proximity_edge_opacity: f32,
+    #[serde(default = "default_proximity_stiffness")]
+    pub proximity_stiffness: f32,
+    #[serde(default = "default_proximity_delta")]
+    pub proximity_delta: f32,
+    #[serde(default = "default_proximity_strength")]
+    pub proximity_strength: f32,
+    #[serde(default = "default_max_proximity_edges")]
+    pub max_proximity_edges: usize,
 
     // Saved presets
     #[serde(default)]
@@ -308,6 +343,12 @@ fn default_mail_panel_open() -> bool {
 
 fn default_directed_stiffness() -> f32 { 1.0 }
 
+fn default_proximity_edge_opacity() -> f32 { 0.3 }
+fn default_proximity_stiffness() -> f32 { 1.0 }
+fn default_proximity_delta() -> f32 { 0.1 }
+fn default_proximity_strength() -> f32 { 0.5 }
+fn default_max_proximity_edges() -> usize { 100_000 }
+
 fn default_histogram_panel_enabled() -> bool { false }
 fn default_histogram_split_ratio() -> f32 { 0.65 }
 
@@ -352,6 +393,13 @@ impl Default for Settings {
             // Layout shaping
             directed_stiffness: 1.0,
             recency_centering: 0.0,
+
+            // Score-proximity edges
+            proximity_edge_opacity: 0.3,
+            proximity_stiffness: 1.0,
+            proximity_delta: 0.1,
+            proximity_strength: 0.5,
+            max_proximity_edges: 100_000,
 
             // Presets
             presets: Vec::new(),

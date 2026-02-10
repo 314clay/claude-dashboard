@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 import json
 import uvicorn
+from pathlib import Path as FilePath
 
 # Import from local db module (self-contained)
 from db.queries import (
@@ -46,7 +47,7 @@ from db.embeddings import (
     get_embedding_stats,
     generate_embeddings,
     search_by_query,
-    compute_similarity_edges,
+    compute_proximity_edges,
 )
 from db.mail import get_mail_network
 # Commented out - health_ingest module not present
@@ -89,6 +90,12 @@ class NeighborhoodSummaryRequest(BaseModel):
 
 class SimilaritySearchRequest(BaseModel):
     query_text: str
+
+
+class ProximityEdgesRequest(BaseModel):
+    query_text: str
+    delta: float = 0.1
+    max_edges: int = 100_000
 
 
 @app.get("/health")
@@ -487,29 +494,27 @@ def embedding_search(body: SimilaritySearchRequest):
     return {"scores": {str(k): v for k, v in scores.items()}}
 
 
-@app.get("/embeddings/similarity-edges")
-def embedding_similarity_edges(
-    threshold: float = Query(default=0.7, description="Minimum cosine similarity"),
-    k_nearest: int = Query(default=10, description="Max neighbors per message"),
-    max_edges: int = Query(default=100000, description="Hard cap on total edges"),
-    time_window_hours: Optional[float] = Query(default=None, description="Only link messages within N hours"),
-):
-    """Compute pairwise similarity edges between embedded messages.
+@app.post("/embeddings/proximity-edges")
+def embedding_proximity_edges(body: ProximityEdgesRequest):
+    """Compute score-proximity edges between embedded messages.
 
-    Returns edges where cosine similarity exceeds the threshold.
-    Each message keeps at most k_nearest neighbors. Upper-triangle only.
+    Given a query phrase, scores all nodes by similarity to that phrase,
+    then links nodes whose scores are within `delta` of each other.
 
-    Returns: { edges: [{source, target, similarity}], count, threshold_used }
+    Body: { query_text: "...", delta: 0.1, max_edges: 100000 }
+    Returns: { edges: [{source, target, strength}], scores: {msg_id: float}, count, query }
     """
-    raw_edges = compute_similarity_edges(threshold, k_nearest, max_edges, time_window_hours)
+    result = compute_proximity_edges(body.query_text, body.delta, body.max_edges)
     edges = [
-        {"source": src, "target": tgt, "similarity": round(sim, 4)}
-        for src, tgt, sim in raw_edges
+        {"source": str(src), "target": str(tgt), "strength": round(strength, 4)}
+        for src, tgt, strength in result["edges"]
     ]
+    scores = {str(k): v for k, v in result["scores"].items()}
     return {
         "edges": edges,
+        "scores": scores,
         "count": len(edges),
-        "threshold_used": threshold,
+        "query": body.query_text,
     }
 
 
@@ -524,7 +529,7 @@ def trigger_ingest(
     Runs ingest.py as a subprocess with --since flag.
     Returns: { sessions, messages, tools, error? }
     """
-    ingest_script = Path(__file__).parent.parent / "ingest.py"
+    ingest_script = FilePath(__file__).parent.parent / "ingest.py"
     if not ingest_script.exists():
         return {"error": f"ingest.py not found at {ingest_script}"}
 

@@ -79,20 +79,21 @@ pub struct EmbeddingGenResult {
     pub error: Option<String>,
 }
 
-/// A single similarity edge from the API
+/// A single proximity edge from the API
 #[derive(Debug, Clone, Deserialize)]
-pub struct SimilarityEdgeResponse {
+pub struct ProximityEdgeResponse {
     pub source: String,
     pub target: String,
-    pub similarity: f32,
+    pub strength: f32,
 }
 
-/// Response wrapper for similarity edges endpoint
+/// Response wrapper for proximity edges endpoint
 #[derive(Debug, Clone, Deserialize)]
-pub struct SimilarityEdgesResponse {
-    pub edges: Vec<SimilarityEdgeResponse>,
+pub struct ProximityEdgesResponse {
+    pub edges: Vec<ProximityEdgeResponse>,
+    pub scores: HashMap<String, f32>,
     pub count: usize,
-    pub threshold_used: f32,
+    pub query: String,
 }
 
 /// Result from session ingest operation
@@ -586,52 +587,24 @@ impl ApiClient {
         Ok(result)
     }
 
-    /// Fetch pre-computed similarity edges from the API
-    pub fn fetch_similarity_edges(
+    /// Fetch proximity edges and scores from the API
+    pub fn fetch_proximity_edges(
         &self,
-        threshold: f32,
-        k_nearest: usize,
+        query_text: &str,
+        delta: f32,
         max_edges: usize,
-        time_window_hours: Option<f32>,
-    ) -> Result<SimilarityEdgesResponse, String> {
-        let mut url = format!(
-            "{}/embeddings/similarity-edges?threshold={}&k_nearest={}&max_edges={}",
-            self.base_url, threshold, k_nearest, max_edges
-        );
-        if let Some(hours) = time_window_hours {
-            url.push_str(&format!("&time_window_hours={}", hours));
-        }
-
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .map_err(|e| format!("Request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("API error: {}", resp.status()));
-        }
-
-        let response: SimilarityEdgesResponse = resp
-            .json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        Ok(response)
-    }
-
-    /// Search messages by semantic similarity
-    pub fn fetch_similarity_scores(
-        &self,
-        query: &str,
-    ) -> Result<HashMap<String, f32>, String> {
-        let url = format!("{}/embeddings/search", self.base_url);
+    ) -> Result<ProximityEdgesResponse, String> {
+        let url = format!("{}/embeddings/proximity-edges", self.base_url);
 
         let resp = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "query_text": query }))
-            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({
+                "query_text": query_text,
+                "delta": delta,
+                "max_edges": max_edges,
+            }))
+            .timeout(Duration::from_secs(60))
             .send()
             .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -639,16 +612,11 @@ impl ApiClient {
             return Err(format!("API error: {}", resp.status()));
         }
 
-        #[derive(Deserialize)]
-        struct SearchResponse {
-            scores: HashMap<String, f32>,
-        }
-
-        let response: SearchResponse = resp
+        let response: ProximityEdgesResponse = resp
             .json()
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        Ok(response.scores)
+        Ok(response)
     }
 }
 

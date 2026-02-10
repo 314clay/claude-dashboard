@@ -38,6 +38,8 @@ pub struct ForceLayout {
     pub temporal_strength: f32,
     /// Similarity edge strength multiplier
     pub similarity_strength: f32,
+    /// Stiffness for similarity/proximity edges (higher = shorter rest length = tighter clusters)
+    pub similarity_stiffness: f32,
     /// How much visual size affects mass/charge (0 = uniform, higher = more differentiation)
     pub size_physics_weight: f32,
     /// Stiffness multiplier for directed (structural) edges (1.0 = default, higher = stiffer)
@@ -58,6 +60,7 @@ impl Default for ForceLayout {
             ideal_length: 100.0,
             temporal_strength: 0.5,
             similarity_strength: 0.5,
+            similarity_stiffness: 1.0,
             size_physics_weight: 0.0,
             directed_stiffness: 1.0,
             recency_centering: 0.0,
@@ -231,11 +234,14 @@ impl ForceLayout {
         for (i, id) in node_ids.iter().enumerate() {
             if let Some(&pos) = state.positions.get(id) {
                 let to_center = center - pos;
-                // Scale centering: base + recency_centering * recency (0=oldest, 1=newest)
-                let recency_boost = recency_map.as_ref()
+                // Remap recency from [0,1] to [-1,1]: oldest = -1 (outward), newest = +1 (inward)
+                // At recency_centering=0: all nodes get base centering (uniform)
+                // At recency_centering=5: newest gets 6x inward, oldest gets -4x (outward push)
+                let recency_factor = recency_map.as_ref()
                     .and_then(|m| m.get(id).copied())
+                    .map(|r| r * 2.0 - 1.0)
                     .unwrap_or(0.0);
-                let centering_strength = self.centering * (1.0 + self.recency_centering * recency_boost);
+                let centering_strength = self.centering * (1.0 + self.recency_centering * recency_factor);
                 forces[i] += to_center * centering_strength;
             }
         }
@@ -306,7 +312,12 @@ impl ForceLayout {
 
         let delta = pos_target - pos_source;
         let distance = delta.length().max(self.min_distance);
-        let displacement = distance - self.ideal_length;
+        let rest_length = if edge.is_similarity {
+            self.ideal_length / self.similarity_stiffness
+        } else {
+            self.ideal_length
+        };
+        let displacement = distance - rest_length;
 
         // Base attraction, modified by edge strength for temporal/similarity edges
         let edge_multiplier = if edge.is_temporal {

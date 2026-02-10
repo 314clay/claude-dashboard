@@ -627,16 +627,12 @@ pub struct GraphState {
     pub max_temporal_edges: usize,
     /// Maximum total tokens across all nodes (for normalization)
     pub max_tokens: i32,
-    /// Whether similarity clustering is enabled
-    pub similarity_clustering_enabled: bool,
-    /// Minimum similarity threshold for edges (0.0 - 1.0)
-    pub similarity_threshold: f32,
-    /// Number of nearest neighbors per node for similarity edges
-    pub similarity_k_nearest: usize,
-    /// Maximum similarity edges to prevent memory issues
-    pub max_similarity_edges: usize,
-    /// Optional time window in hours to restrict similarity comparisons
-    pub similarity_time_window_hours: Option<f32>,
+    /// Whether score-proximity edges are enabled
+    pub score_proximity_enabled: bool,
+    /// Maximum score difference to create a proximity edge
+    pub score_proximity_delta: f32,
+    /// Maximum proximity edges to prevent memory issues
+    pub max_proximity_edges: usize,
 }
 
 impl GraphState {
@@ -661,11 +657,9 @@ impl GraphState {
             temporal_window_secs: 300.0, // 5 minutes default
             max_temporal_edges: 100_000,
             max_tokens: 1,
-            similarity_clustering_enabled: false,
-            similarity_threshold: 0.7,
-            similarity_k_nearest: 10,
-            max_similarity_edges: 100_000,
-            similarity_time_window_hours: None,
+            score_proximity_enabled: false,
+            score_proximity_delta: 0.1,
+            max_proximity_edges: 100_000,
         }
     }
 
@@ -908,36 +902,11 @@ impl GraphState {
         }
     }
 
-    /// Replace all similarity edges with the provided set.
+    /// Replace all proximity (similarity) edges with the provided set.
     /// Removes existing similarity edges via retain, then extends with new ones.
-    pub fn build_similarity_edges(&mut self, edges: Vec<GraphEdge>) {
+    pub fn set_proximity_edges(&mut self, edges: Vec<GraphEdge>) {
         self.data.edges.retain(|e| !e.is_similarity);
         self.data.edges.extend(edges);
-    }
-
-    /// Set similarity clustering enabled (no auto-rebuild since fetch is async)
-    pub fn set_similarity_clustering_enabled(&mut self, enabled: bool) {
-        self.similarity_clustering_enabled = enabled;
-    }
-
-    /// Set similarity threshold (no auto-rebuild since fetch is async)
-    pub fn set_similarity_threshold(&mut self, threshold: f32) {
-        self.similarity_threshold = threshold;
-    }
-
-    /// Set similarity k-nearest (no auto-rebuild since fetch is async)
-    pub fn set_similarity_k_nearest(&mut self, k: usize) {
-        self.similarity_k_nearest = k;
-    }
-
-    /// Set max similarity edges (no auto-rebuild since fetch is async)
-    pub fn set_max_similarity_edges(&mut self, max_edges: usize) {
-        self.max_similarity_edges = max_edges;
-    }
-
-    /// Set similarity time window in hours (no auto-rebuild since fetch is async)
-    pub fn set_similarity_time_window_hours(&mut self, hours: Option<f32>) {
-        self.similarity_time_window_hours = hours;
     }
 
     /// Build timeline sorted indices and timestamps for all item types.
