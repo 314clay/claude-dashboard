@@ -1,6 +1,6 @@
 //! Main application state and UI.
 
-use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, IngestResult, RescoreEvent, RescoreProgress, RescoreResult};
+use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, FilterStatusResponse, IngestResult, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
 use crate::graph::types::{ColorMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
@@ -211,6 +211,9 @@ pub struct DashboardApp {
     neighborhood_depth: usize,
     neighborhood_include_temporal: bool,
 
+    // Cmd+Hover neighborhood preview
+    cmd_hover_neighbors: HashSet<String>,
+
     // Floating summary window state
     summary_window_open: bool,
     summary_window_dragged: bool,
@@ -235,9 +238,15 @@ pub struct DashboardApp {
     semantic_filter_loading: bool,
     categorizing_filter_id: Option<i32>,
     categorization_receiver: Option<Receiver<Result<(), String>>>,
+    categorization_progress_rx: Option<Receiver<FilterStatusResponse>>,
+    categorization_progress: Option<(i64, i64)>, // (scored, total)
+    categorization_done_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
     // Cached semantic filter visible set (invalidate on filter change or data load)
     semantic_filter_cache: Option<HashSet<String>>,
+
+    // Expanded filter detail panels (toggled by clicking filter name)
+    expanded_filter_ids: HashSet<i32>,
 
     // Score-proximity edges (unified similarity search + clustering)
     proximity_query: String,
@@ -408,6 +417,9 @@ impl DashboardApp {
             neighborhood_depth: 1,
             neighborhood_include_temporal: true,
 
+            // Cmd+Hover neighborhood preview
+            cmd_hover_neighbors: HashSet::new(),
+
             // Floating summary window state
             summary_window_open: false,
             summary_window_dragged: false,
@@ -449,7 +461,11 @@ impl DashboardApp {
             semantic_filter_loading: false,
             categorizing_filter_id: None,
             categorization_receiver: None,
+            categorization_progress_rx: None,
+            categorization_progress: None,
+            categorization_done_flag: None,
             semantic_filter_cache: None,
+            expanded_filter_ids: HashSet::new(),
 
             // Score-proximity edges
             proximity_query: String::new(),
@@ -1206,6 +1222,7 @@ impl DashboardApp {
     /// Trigger categorization for a semantic filter (runs in background)
     fn trigger_categorization(&mut self, filter_id: i32) {
         self.categorizing_filter_id = Some(filter_id);
+        self.categorization_progress = None;
 
         // Run categorization in background thread
         let (tx, rx) = mpsc::channel();
@@ -1216,9 +1233,27 @@ impl DashboardApp {
             let _ = tx.send(result);
         });
 
-        // Store the receiver to check later
-        // We'll check this in the update loop
+        // Poll progress in a separate thread
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag_clone = done_flag.clone();
+
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            while !done_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(status) = api.fetch_filter_status(filter_id) {
+                    if progress_tx.send(status).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+
+        // Store the done flag so we can stop polling when categorization finishes
+        self.categorization_done_flag = Some(done_flag);
         self.categorization_receiver = Some(rx);
+        self.categorization_progress_rx = Some(progress_rx);
     }
 
     /// Trigger proximity fetch (edges + scores in one call, runs in background)
@@ -2131,7 +2166,7 @@ impl DashboardApp {
                 ui.separator();
 
                 // Max node size slider
-                if ui.add(egui::Slider::new(&mut self.max_node_multiplier, 1.0..=100.0)
+                if ui.add(egui::Slider::new(&mut self.max_node_multiplier, 0.1..=100.0)
                     .logarithmic(true)
                     .text("Max size")
                     .fixed_decimals(1)).changed() {
@@ -2276,16 +2311,25 @@ impl DashboardApp {
                     }
                 }
 
-                // Categorization in progress indicator
+                // Categorization in progress indicator with progress bar
                 if let Some(filter_id) = self.categorizing_filter_id {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        if let Some(filter) = self.semantic_filters.iter().find(|f| f.id == filter_id) {
-                            ui.label(format!("Categorizing '{}'...", filter.name));
-                        } else {
-                            ui.label("Categorizing...");
-                        }
-                    });
+                    let filter_name = self.semantic_filters.iter()
+                        .find(|f| f.id == filter_id)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default();
+                    if let Some((scored, total)) = self.categorization_progress {
+                        let fraction = if total > 0 { scored as f32 / total as f32 } else { 0.0 };
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Scoring '{}' ({}/{})", filter_name, scored, total));
+                        });
+                        ui.add(egui::ProgressBar::new(fraction).animate(true));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Scoring '{}'...", filter_name));
+                        });
+                    }
                 }
 
                 // List existing filters with five-state toggles
@@ -2525,10 +2569,13 @@ impl DashboardApp {
                     });
                     let max_changed = self.graph.max_proximity_edges != prev_max;
 
-                    // Show edge count and scored nodes
+                    // Show edge count and scored nodes (only count nodes in current graph)
                     ui.label(format!("Edges: {}", self.proximity_edge_count));
                     if self.proximity_active {
-                        ui.label(format!("Scored nodes: {}", self.proximity_scores.len()));
+                        let matched = self.graph.data.nodes.iter()
+                            .filter(|n| self.proximity_scores.contains_key(&n.id))
+                            .count();
+                        ui.label(format!("Scored nodes: {} / {}", matched, self.graph.data.nodes.len()));
                     }
 
                     // Rebuild / Clear buttons
@@ -3064,7 +3111,25 @@ impl DashboardApp {
             }
             let stroke = Stroke::new(1.5 * self.zoom, color);
 
-            painter.line_segment([source_pos, target_pos], stroke);
+            if edge.is_similarity {
+                // Draw dotted line for similarity/proximity edges
+                let diff = target_pos - source_pos;
+                let length = diff.length();
+                let dir = diff / length;
+                let dot_len = 4.0 * self.zoom;
+                let gap_len = 4.0 * self.zoom;
+                let step = dot_len + gap_len;
+                let mut d = 0.0;
+                while d < length {
+                    let seg_end = (d + dot_len).min(length);
+                    let p0 = source_pos + dir * d;
+                    let p1 = source_pos + dir * seg_end;
+                    painter.line_segment([p0, p1], stroke);
+                    d += step;
+                }
+            } else {
+                painter.line_segment([source_pos, target_pos], stroke);
+            }
 
             // Draw arrow if enabled
             if self.show_arrows {
@@ -3146,6 +3211,24 @@ impl DashboardApp {
                 }
                 // Cross-session (dimmed) nodes: do nothing on hover, handled by click
             }
+        }
+
+        // Cmd+Hover: compute neighborhood preview while Cmd is held
+        let modifiers = ui.input(|i| i.modifiers);
+        if modifiers.command {
+            if let Some(ref hovered_id) = self.graph.hovered_node {
+                let adj = self.build_adjacency_list(self.neighborhood_include_temporal);
+                let mut seeds = HashSet::new();
+                seeds.insert(hovered_id.clone());
+                self.cmd_hover_neighbors = self.expand_to_neighbors(&seeds, self.neighborhood_depth, &adj);
+            } else {
+                self.cmd_hover_neighbors.clear();
+            }
+        } else {
+            self.cmd_hover_neighbors.clear();
+        }
+        if !self.cmd_hover_neighbors.is_empty() {
+            ui.ctx().request_repaint();
         }
 
         // Two-pass node rendering:
@@ -3347,14 +3430,17 @@ impl DashboardApp {
                     }
                 }
 
-                // Draw border - cyan for summary node, yellow for selected, white for hovered
+                // Draw border - cyan for summary/cmd-neighbor, yellow for selected, white for hovered
                 // Skip border for same-project future nodes (they already have a stroke)
                 if !is_same_project_future {
                     let is_summary_node = self.summary_node_id.as_ref() == Some(&node.id);
+                    let is_cmd_neighbor = self.cmd_hover_neighbors.contains(&node.id);
                     let border_color = if is_summary_node {
                         theme::state::ACTIVE // Cyan for summary node
                     } else if is_selected {
                         theme::state::SELECTED
+                    } else if is_cmd_neighbor {
+                        theme::state::ACTIVE // Cyan for cmd-hover neighbor
                     } else if is_hovered {
                         theme::state::HOVER
                     } else {
@@ -3364,6 +3450,8 @@ impl DashboardApp {
                         theme::stroke_width::ACTIVE
                     } else if is_selected || is_hovered {
                         theme::stroke_width::SELECTED
+                    } else if is_cmd_neighbor {
+                        theme::stroke_width::HOVER
                     } else {
                         theme::stroke_width::NORMAL
                     };
@@ -4432,29 +4520,54 @@ impl eframe::App for DashboardApp {
             }
         }
 
+        // Drain categorization progress updates
+        if let Some(ref rx) = self.categorization_progress_rx {
+            while let Ok(status) = rx.try_recv() {
+                self.categorization_progress = Some((status.scored, status.total));
+            }
+        }
+
         // Check for categorization result from background thread
         if let Some(ref rx) = self.categorization_receiver {
             match rx.try_recv() {
                 Ok(Ok(())) => {
-                    // Categorization completed - reload filters to get updated stats
+                    // Categorization completed - stop polling thread and reload
+                    if let Some(ref flag) = self.categorization_done_flag {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.categorizing_filter_id = None;
                     self.categorization_receiver = None;
+                    self.categorization_progress_rx = None;
+                    self.categorization_progress = None;
+                    self.categorization_done_flag = None;
                     self.load_semantic_filters();
                     // Also reload graph to get updated semantic_filter_matches
                     self.load_graph();
                 }
                 Ok(Err(e)) => {
                     eprintln!("Categorization failed: {}", e);
+                    if let Some(ref flag) = self.categorization_done_flag {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.categorizing_filter_id = None;
                     self.categorization_receiver = None;
+                    self.categorization_progress_rx = None;
+                    self.categorization_progress = None;
+                    self.categorization_done_flag = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Still loading, request repaint to check again
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(ref flag) = self.categorization_done_flag {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.categorizing_filter_id = None;
                     self.categorization_receiver = None;
+                    self.categorization_progress_rx = None;
+                    self.categorization_progress = None;
+                    self.categorization_done_flag = None;
                 }
             }
         }
