@@ -48,6 +48,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
 
     if SCHEMA_FILE.exists():
@@ -89,6 +90,52 @@ def discover_sessions(claude_dir: Path, since: datetime | None = None) -> list[d
             entries = data.get("entries", []) if isinstance(data, dict) else data
             original_path = data.get("originalPath", "") if isinstance(data, dict) else ""
 
+        # Decode directory name to real path when no index provides one.
+        # Dir names use '-' as separator, but real dirs may contain hyphens
+        # (e.g. "dashboard-native"). Greedily resolve segments left-to-right.
+        if not original_path:
+            parts = project_dir.name.lstrip("-").split("-")
+            built = "/"
+            i = 0
+            while i < len(parts):
+                # Try joining progressively more segments with hyphens
+                for j in range(len(parts), i, -1):
+                    candidate = built.rstrip("/") + "/" + "-".join(parts[i:j])
+                    if Path(candidate).exists():
+                        built = candidate
+                        i = j
+                        break
+                else:
+                    # No combination matched; look for Gas Town structural keywords
+                    rest = parts[i:]
+                    gt_keywords = {"polecats", "crew", "witness", "refinery"}
+                    # Check if we already resolved onto a keyword (e.g. .../polecats)
+                    parent_seg = Path(built).name
+                    if parent_seg in gt_keywords and rest:
+                        if parent_seg == "polecats" and len(rest) >= 2:
+                            built = built + "/" + rest[0] + "/" + "-".join(rest[1:])
+                        else:
+                            built = built + "/" + "-".join(rest)
+                    else:
+                        split_idx = next((k for k, p in enumerate(rest) if p in gt_keywords), None)
+                        if split_idx is not None:
+                            if split_idx > 0:
+                                built = built.rstrip("/") + "/" + "-".join(rest[:split_idx])
+                            remaining = rest[split_idx:]
+                            kw = remaining[0]
+                            built = built.rstrip("/") + "/" + kw
+                            after = remaining[1:]
+                            if kw == "polecats" and len(after) >= 2:
+                                built = built + "/" + after[0] + "/" + "-".join(after[1:])
+                            elif after:
+                                built = built + "/" + "-".join(after)
+                        else:
+                            built = built.rstrip("/") + "/" + "-".join(rest)
+                    break
+            if built != "/":
+                original_path = built
+
+        if index_path.exists():
             for entry in entries:
                 created = entry.get("created", "")
                 if since and created:
@@ -247,6 +294,7 @@ def import_session(conn: sqlite3.Connection, session_info: dict, claude_dir: Pat
         """INSERT INTO sessions (session_id, cwd, start_time, end_time, source, transcript_path)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT (session_id) DO UPDATE SET
+               cwd = CASE WHEN sessions.cwd = 'unknown' AND excluded.cwd != 'unknown' THEN excluded.cwd ELSE sessions.cwd END,
                end_time = COALESCE(excluded.end_time, sessions.end_time),
                updated_at = datetime('now')""",
         (
