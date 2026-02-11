@@ -260,6 +260,7 @@ pub struct DashboardApp {
     proximity_loading: bool,
     proximity_edge_opacity: f32,
     proximity_edge_count: usize,
+    proximity_edge_count_filtered: usize,
     proximity_stiffness: f32,
     proximity_rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
     embedding_stats: Option<EmbeddingStats>,
@@ -482,6 +483,7 @@ impl DashboardApp {
             proximity_loading: false,
             proximity_edge_opacity: 0.3,
             proximity_edge_count: 0,
+            proximity_edge_count_filtered: 0,
             proximity_stiffness: 1.0,
             proximity_rx: None,
             embedding_stats: None,
@@ -1374,6 +1376,7 @@ impl DashboardApp {
         self.proximity_scores.clear();
         self.proximity_query.clear();
         self.proximity_edge_count = 0;
+        self.proximity_edge_count_filtered = 0;
         self.graph.set_proximity_edges(Vec::new());
         self.graph.score_proximity_enabled = false;
     }
@@ -2994,7 +2997,12 @@ impl DashboardApp {
                     let max_n_changed = self.graph.max_neighbors_per_node != prev_neighbors;
 
                     // Show edge count and scored nodes (only count nodes in current graph)
-                    ui.label(format!("Edges: {}", self.proximity_edge_count));
+                    let display_count = if self.graph.max_neighbors_per_node > 0 {
+                        self.proximity_edge_count_filtered
+                    } else {
+                        self.proximity_edge_count
+                    };
+                    ui.label(format!("Edges: {}", display_count));
                     if self.proximity_active {
                         let matched = self.graph.data.nodes.iter()
                             .filter(|n| self.proximity_scores.contains_key(&n.id))
@@ -3302,6 +3310,10 @@ impl DashboardApp {
         let semantic_visible = self.semantic_filter_cache.clone();
 
         // Draw edges first (behind nodes)
+        // Per-node neighbor cap for similarity edges (client-side filtering)
+        let max_neighbors = self.graph.max_neighbors_per_node;
+        let mut sim_degree: HashMap<&str, usize> = HashMap::new();
+
         for edge in &self.graph.data.edges {
             // Check if edge is dimmed (timeline-hidden) vs fully hidden (other filters)
             let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_edge_visible(edge);
@@ -3355,6 +3367,17 @@ impl DashboardApp {
                 if source_tool || target_tool {
                     continue;
                 }
+            }
+
+            // Per-node neighbor cap: skip similarity edges once a node hits the limit
+            if edge.is_similarity && max_neighbors > 0 {
+                let src_deg = sim_degree.get(edge.source.as_str()).copied().unwrap_or(0);
+                let tgt_deg = sim_degree.get(edge.target.as_str()).copied().unwrap_or(0);
+                if src_deg >= max_neighbors || tgt_deg >= max_neighbors {
+                    continue;
+                }
+                *sim_degree.entry(edge.source.as_str()).or_insert(0) += 1;
+                *sim_degree.entry(edge.target.as_str()).or_insert(0) += 1;
             }
 
             let source_pos = match self.graph.get_pos(&edge.source) {
@@ -3418,6 +3441,12 @@ impl DashboardApp {
                     Stroke::NONE,
                 ));
             }
+        }
+
+        // Update filtered edge count for UI display
+        if max_neighbors > 0 {
+            let total: usize = sim_degree.values().sum();
+            self.proximity_edge_count_filtered = total / 2; // each edge counted twice
         }
 
         // Draw bypass edges (bridging over hidden tool-use nodes)
