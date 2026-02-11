@@ -3873,87 +3873,60 @@ impl DashboardApp {
                     let screen_pos = transform(pos);
                     let tooltip_pos = screen_pos + Vec2::new(self.node_size * self.zoom + 10.0, 0.0);
 
-                    // DEBUG: Show node classification and expected rendering
-                    let mut properties = Vec::new();
-
-                    if self.is_after_playhead(node) {
-                        properties.push("after playhead");
-                    } else {
-                        properties.push("before/at playhead");
-                    }
-
-                    if self.is_same_session_as_selected(node) {
-                        properties.push("same session as selected");
-                    } else {
-                        properties.push("different session");
-                    }
-
-                    if self.is_same_project_as_selected(node) {
-                        properties.push("same project as selected");
-                    } else {
-                        properties.push("different project");
-                    }
-
-                    let properties_str = properties.join(", ");
-
-                    // Derive display logic from properties
-                    let mut display_props = Vec::new();
-
-                    // Check if node is timeline-dimmed or same-project future
-                    let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_node_visible(&node.id);
-                    let is_same_project_future = self.is_same_project_future_node(node);
-
-                    // Hollow vs filled
-                    if is_same_project_future {
-                        display_props.push("HOLLOW");
-                    } else {
-                        display_props.push("filled");
-                    }
-
-                    // Physics
-                    if is_same_project_future {
-                        display_props.push("physics enabled");
-                    } else if is_timeline_dimmed {
-                        display_props.push("no physics");
-                    } else {
-                        display_props.push("physics enabled");
-                    }
-
-                    // Color/saturation
-                    if is_same_project_future {
-                        display_props.push("greyscale");
-                    } else if is_timeline_dimmed {
-                        display_props.push("greyscale");
-                        display_props.push("40% opacity");
-                    } else {
-                        let is_future = self.is_after_playhead(node);
-                        if is_future {
-                            display_props.push("desaturated (70%)");
+                    // Content preview — word-wrap to ~50 chars, max 3 lines
+                    let mut lines: Vec<String> = Vec::new();
+                    let preview = &node.content_preview;
+                    let max_line_len = 50;
+                    let mut char_iter = preview.chars().peekable();
+                    let mut preview_lines = 0;
+                    while char_iter.peek().is_some() && preview_lines < 3 {
+                        let chunk: String = char_iter.by_ref().take(max_line_len).collect();
+                        let has_more = char_iter.peek().is_some();
+                        if has_more && preview_lines == 2 {
+                            // Last allowed line — add ellipsis
+                            lines.push(format!("{}...", chunk.trim_end()));
                         } else {
-                            display_props.push("full color");
+                            lines.push(chunk.trim_end().to_string());
                         }
+                        preview_lines += 1;
                     }
 
-                    // Size
-                    if is_same_project_future {
-                        display_props.push("variable size");
-                    } else if is_timeline_dimmed {
-                        display_props.push("0.5x size");
-                    } else {
-                        display_props.push("variable size");
+                    lines.push(String::new());
+
+                    // Project
+                    lines.push(format!("Project: {}", node.project));
+
+                    // Timestamp — compact "YYYY-MM-DD HH:MM"
+                    if let Some(ref ts) = node.timestamp {
+                        let display_ts = if ts.len() >= 16 {
+                            ts[..16].replace('T', " ")
+                        } else {
+                            ts.clone()
+                        };
+                        lines.push(format!("Time: {}", display_ts));
                     }
 
-                    let display_logic = display_props.join(", ");
+                    // Tokens — compact "1.2k in / 3.4k out"
+                    let in_tok = node.input_tokens.unwrap_or(0);
+                    let out_tok = node.output_tokens.unwrap_or(0);
+                    if in_tok > 0 || out_tok > 0 {
+                        let fmt_tok = |t: i32| -> String {
+                            if t >= 1000 { format!("{:.1}k", t as f64 / 1000.0) }
+                            else { format!("{}", t) }
+                        };
+                        lines.push(format!("Tokens: {} in / {} out", fmt_tok(in_tok), fmt_tok(out_tok)));
+                    }
 
-                    let tooltip_text = format!(
-                        "DEBUG NODE CLASSIFICATION\n\nNode properties: ({})\n\nDisplay logic: -> {}",
-                        properties_str,
-                        display_logic
-                    );
+                    // Tools used
+                    if node.has_tool_usage {
+                        lines.push("Tools used".to_string());
+                    }
+
+                    let tooltip_text = lines.join("\n");
 
                     let galley = painter.layout_no_wrap(
                         tooltip_text,
-                        egui::FontId::default(),
+                        egui::FontId::new(13.0, egui::FontFamily::Proportional),
                         Color32::WHITE,
                     );
 
