@@ -10,8 +10,9 @@ use std::path::PathBuf;
 pub enum SidebarTab {
     #[default]
     Data,
-    Visual,
-    Analysis,
+    Nodes,
+    Edges,
+    Filters,
 }
 
 /// Preset configurations for node sizing formula
@@ -105,6 +106,8 @@ pub struct Preset {
     pub directed_stiffness: f32,
     #[serde(default)]
     pub recency_centering: f32,
+    #[serde(default)]
+    pub momentum: f32,
 
     // Score-proximity edges
     #[serde(default = "default_proximity_edge_opacity")]
@@ -162,6 +165,7 @@ impl Preset {
             max_temporal_edges: settings.max_temporal_edges,
             directed_stiffness: settings.directed_stiffness,
             recency_centering: settings.recency_centering,
+            momentum: settings.momentum,
             // Score-proximity edges
             proximity_edge_opacity: settings.proximity_edge_opacity,
             proximity_stiffness: settings.proximity_stiffness,
@@ -202,6 +206,7 @@ impl Preset {
         settings.max_temporal_edges = self.max_temporal_edges;
         settings.directed_stiffness = self.directed_stiffness;
         settings.recency_centering = self.recency_centering;
+        settings.momentum = self.momentum;
         settings.proximity_edge_opacity = self.proximity_edge_opacity;
         settings.proximity_stiffness = self.proximity_stiffness;
         settings.proximity_delta = self.proximity_delta;
@@ -274,6 +279,8 @@ pub struct Settings {
     pub directed_stiffness: f32,
     #[serde(default)]
     pub recency_centering: f32,
+    #[serde(default)]
+    pub momentum: f32,
 
     // Score-proximity edges
     #[serde(default = "default_proximity_edge_opacity")]
@@ -413,6 +420,7 @@ impl Default for Settings {
             // Layout shaping
             directed_stiffness: 1.0,
             recency_centering: 0.0,
+            momentum: 0.0,
 
             // Score-proximity edges
             proximity_edge_opacity: 0.3,

@@ -616,6 +616,37 @@ impl ApiClient {
         Ok(result)
     }
 
+    /// Generate embeddings for specific message IDs only
+    pub fn generate_embeddings_visible(&self, message_ids: &[String]) -> Result<EmbeddingGenResult, String> {
+        let url = format!("{}/embeddings/generate-visible", self.base_url);
+
+        let ids: Vec<i64> = message_ids.iter()
+            .filter_map(|id| id.parse::<i64>().ok())
+            .collect();
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "message_ids": ids,
+                "batch_size": 100,
+                "max_messages": 50000,
+            }))
+            .timeout(Duration::from_secs(300))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        let result: EmbeddingGenResult = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(result)
+    }
+
     /// Fetch proximity edges and scores from the API
     pub fn fetch_proximity_edges(
         &self,

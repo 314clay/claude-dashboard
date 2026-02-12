@@ -4,6 +4,7 @@ Routes through the shared LLM module for provider-agnostic API access.
 """
 import json
 import os
+from datetime import datetime, timezone
 from functools import lru_cache
 from .queries import get_connection, get_session_messages, get_session_messages_before, _normalize_path
 from . import llm
@@ -268,10 +269,7 @@ def get_or_create_summary(session_id: str, force_refresh: bool = False) -> dict 
         return None
 
     # Save to database
-    now = json.dumps(None)  # placeholder
     model_name = llm.get_provider() or "unknown"
-    now_iso = datetime.now(timezone.utc).isoformat() if True else None
-    from datetime import datetime, timezone
 
     cur.execute("""
         INSERT INTO session_summaries
@@ -323,7 +321,7 @@ def get_sessions_with_summaries(hours: float = 24, limit: int = 50) -> list[dict
     conn = get_connection()
     cur = conn.cursor()
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
     since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
     cur.execute("""

@@ -483,6 +483,22 @@ def embedding_generate(
     return generate_embeddings(batch_size, max_messages)
 
 
+class GenerateVisibleRequest(BaseModel):
+    message_ids: list[int]
+    batch_size: int = 100
+    max_messages: int = 50000
+
+
+@app.post("/embeddings/generate-visible")
+def embedding_generate_visible(body: GenerateVisibleRequest):
+    """Generate embeddings only for specific message IDs.
+
+    Body: { message_ids: [1, 2, 3], batch_size: 100, max_messages: 50000 }
+    Returns: { generated, model, dimensions, errors }
+    """
+    return generate_embeddings(body.batch_size, body.max_messages, message_ids=body.message_ids)
+
+
 @app.post("/embeddings/search")
 def embedding_search(body: SimilaritySearchRequest):
     """Search messages by semantic similarity.

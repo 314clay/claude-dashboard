@@ -126,6 +126,32 @@ def get_unembedded_message_ids(limit: int = 1000) -> list[dict]:
     return messages
 
 
+def get_unembedded_from_ids(message_ids: list[int], limit: int = 50000) -> list[dict]:
+    """Get unembedded messages from a specific set of IDs."""
+    _ensure_table()
+    conn = get_connection()
+    cur = conn.cursor()
+
+    placeholders = ",".join("?" for _ in message_ids)
+    cur.execute(f"""
+        SELECT m.id, m.content
+        FROM messages m
+        WHERE m.id IN ({placeholders})
+        AND NOT EXISTS (
+            SELECT 1 FROM message_embeddings me
+            WHERE me.message_id = m.id
+        )
+        AND m.content IS NOT NULL
+        AND length(m.content) > 0
+        LIMIT ?
+    """, (*message_ids, limit))
+
+    messages = [dict(row) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return messages
+
+
 def save_embeddings(
     embeddings: list[tuple[int, list[float]]],
     model: str,
@@ -369,12 +395,15 @@ def compute_proximity_edges(
 def generate_embeddings(
     batch_size: int = 100,
     max_messages: int = 1000,
+    message_ids: list[int] | None = None,
 ) -> dict:
     """Generate embeddings for unembedded messages.
 
     Args:
         batch_size: Messages per API call.
         max_messages: Maximum messages to process.
+        message_ids: Optional list of specific message IDs to embed.
+            Only unembedded messages in this list will be processed.
 
     Returns:
         dict with generated count, model, dimensions, errors
@@ -388,7 +417,10 @@ def generate_embeddings(
             "error": "No embedding provider available. Set OPENAI_API_KEY or GOOGLE_API_KEY.",
         }
 
-    messages = get_unembedded_message_ids(limit=max_messages)
+    if message_ids is not None:
+        messages = get_unembedded_from_ids(message_ids, limit=max_messages)
+    else:
+        messages = get_unembedded_message_ids(limit=max_messages)
     if not messages:
         return {
             "generated": 0,

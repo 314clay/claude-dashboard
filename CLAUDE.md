@@ -11,6 +11,14 @@ This is a native Rust rewrite of the Claude Activity Dashboard. The original Str
 
 **Tradeoff**: Python API for data layer (reuses existing queries) rather than rewriting in Rust with sqlx.
 
+## Git Remotes
+
+This repo pushes to two GitHub repos:
+- **`origin`** → `314clay/dashboard-native` (private, full dev history)
+- **`public`** → `314clay/claude-dashboard` (public)
+
+Push to both after changes: `git push origin main && git push public main`
+
 ## Key Files
 
 | File | Purpose | Lines |

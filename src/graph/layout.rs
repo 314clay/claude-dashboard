@@ -46,6 +46,8 @@ pub struct ForceLayout {
     pub directed_stiffness: f32,
     /// How much recency boosts centering force (0.0 = uniform, higher = newer nodes hug center)
     pub recency_centering: f32,
+    /// Momentum coefficient (0.0 = no carry-over, 1.0 = full inertia)
+    pub momentum: f32,
 }
 
 impl Default for ForceLayout {
@@ -64,6 +66,7 @@ impl Default for ForceLayout {
             size_physics_weight: 0.0,
             directed_stiffness: 1.0,
             recency_centering: 0.0,
+            momentum: 0.0,
         }
     }
 }
@@ -253,7 +256,8 @@ impl ForceLayout {
             if let Some(vel) = state.velocities.get_mut(id) {
                 let mass = node_masses.get(id).copied().unwrap_or(1.0);
                 let acceleration = forces[i] / mass;
-                *vel = (*vel + acceleration) * self.damping;
+                *vel = *vel * self.momentum + acceleration * (1.0 - self.momentum);
+                *vel *= self.damping;
 
                 // Clamp velocity
                 if vel.length() > self.max_velocity {
