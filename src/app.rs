@@ -12,6 +12,30 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Instant, SystemTime};
 
+/// Fixed 8-color palette for proximity query edges
+const QUERY_COLORS: [Color32; 8] = [
+    Color32::from_rgb(6, 182, 212),    // Cyan (original)
+    Color32::from_rgb(249, 115, 22),   // Orange
+    Color32::from_rgb(168, 85, 247),   // Purple
+    Color32::from_rgb(34, 197, 94),    // Green
+    Color32::from_rgb(239, 68, 68),    // Red
+    Color32::from_rgb(234, 179, 8),    // Yellow
+    Color32::from_rgb(236, 72, 153),   // Pink
+    Color32::from_rgb(59, 130, 246),   // Blue
+];
+
+/// A single proximity (semantic edge) query with its own color, scores, and edges
+struct ProximityQuery {
+    query: String,
+    color: Color32,
+    scores: HashMap<String, f32>,
+    edges: Vec<GraphEdge>,
+    edge_count: usize,
+    active: bool,
+    loading: bool,
+    rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
+}
+
 /// Time range options for filtering
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TimeRange {
@@ -177,6 +201,9 @@ pub struct DashboardApp {
     selected_projects: HashSet<String>,
     available_projects: Vec<String>,
 
+    // Debug tooltip
+    debug_tooltip: bool,
+
     // Viewport state
     pan_offset: Vec2,
     zoom: f32,
@@ -254,15 +281,12 @@ pub struct DashboardApp {
     expanded_filter_ids: HashSet<i32>,
 
     // Score-proximity edges (unified similarity search + clustering)
-    proximity_query: String,
-    proximity_scores: HashMap<String, f32>,  // message_id -> score
-    proximity_active: bool,
-    proximity_loading: bool,
+    proximity_queries: Vec<ProximityQuery>,
+    proximity_input: String,
+    proximity_heat_map_index: Option<usize>,  // None = max across all queries
     proximity_edge_opacity: f32,
-    proximity_edge_count: usize,
     proximity_edge_count_filtered: usize,
     proximity_stiffness: f32,
-    proximity_rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
     embedding_stats: Option<EmbeddingStats>,
     embedding_gen_loading: bool,
     embedding_gen_receiver: Option<Receiver<Result<EmbeddingGenResult, String>>>,
@@ -393,6 +417,7 @@ impl DashboardApp {
             project_filter_enabled: false,
             selected_projects: HashSet::new(),
             available_projects: Vec::new(),
+            debug_tooltip: false,
             pan_offset: Vec2::ZERO,
             zoom: 1.0,
             dragging: false,
@@ -478,15 +503,12 @@ impl DashboardApp {
             expanded_filter_ids: HashSet::new(),
 
             // Score-proximity edges
-            proximity_query: String::new(),
-            proximity_scores: HashMap::new(),
-            proximity_active: false,
-            proximity_loading: false,
+            proximity_queries: Vec::new(),
+            proximity_input: String::new(),
+            proximity_heat_map_index: None,
             proximity_edge_opacity: 0.3,
-            proximity_edge_count: 0,
             proximity_edge_count_filtered: 0,
             proximity_stiffness: 1.0,
-            proximity_rx: None,
             embedding_stats: None,
             embedding_gen_loading: false,
             embedding_gen_receiver: None,
@@ -618,6 +640,11 @@ impl DashboardApp {
         self.layout.similarity_strength = self.settings.proximity_strength;
         self.graph.max_proximity_edges = self.settings.max_proximity_edges;
         self.graph.max_neighbors_per_node = self.settings.max_neighbors_per_node;
+        self.beads_panel_open = self.settings.beads_panel_open;
+        self.mail_panel_open = self.settings.mail_panel_open;
+        self.histogram_panel_enabled = self.settings.histogram_panel_enabled;
+        self.histogram_split_ratio = self.settings.histogram_split_ratio;
+        self.sidebar_tab = self.settings.sidebar_tab;
     }
 
     /// Save settings if dirty and enough time has passed (debounce)
@@ -864,6 +891,7 @@ impl DashboardApp {
                                 is_similarity: false,
                                 is_temporal: false,
                                 similarity: None,
+                                query_index: None,
                             });
                         }
                     }
@@ -1011,38 +1039,38 @@ impl DashboardApp {
         false
     }
 
-    // /// Debug: Check if node is after the current playhead position
-    // fn is_after_playhead(&self, node: &crate::graph::types::GraphNode) -> bool {
-    //     if !self.timeline_enabled {
-    //         return false;
-    //     }
-    //     let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
-    //     if let Some(node_time) = node.timestamp_secs() {
-    //         node_time > scrubber_time
-    //     } else {
-    //         false
-    //     }
-    // }
+    /// Debug: Check if node is after the current playhead position
+    fn is_after_playhead(&self, node: &crate::graph::types::GraphNode) -> bool {
+        if !self.timeline_enabled {
+            return false;
+        }
+        let scrubber_time = self.graph.timeline.time_at_position(self.graph.timeline.position);
+        if let Some(node_time) = node.timestamp_secs() {
+            node_time > scrubber_time
+        } else {
+            false
+        }
+    }
 
-    // /// Debug: Check if node is in same session as selected node
-    // fn is_same_session_as_selected(&self, node: &crate::graph::types::GraphNode) -> bool {
-    //     if let Some(ref selected_id) = self.graph.selected_node {
-    //         if let Some(selected_node) = self.graph.get_node(selected_id) {
-    //             return node.session_id == selected_node.session_id;
-    //         }
-    //     }
-    //     false
-    // }
+    /// Debug: Check if node is in same session as selected node
+    fn is_same_session_as_selected(&self, node: &crate::graph::types::GraphNode) -> bool {
+        if let Some(ref selected_id) = self.graph.selected_node {
+            if let Some(selected_node) = self.graph.get_node(selected_id) {
+                return node.session_id == selected_node.session_id;
+            }
+        }
+        false
+    }
 
-    // /// Debug: Check if node is in same project as selected node
-    // fn is_same_project_as_selected(&self, node: &crate::graph::types::GraphNode) -> bool {
-    //     if let Some(ref selected_id) = self.graph.selected_node {
-    //         if let Some(selected_node) = self.graph.get_node(selected_id) {
-    //             return node.project == selected_node.project;
-    //         }
-    //     }
-    //     false
-    // }
+    /// Debug: Check if node is in same project as selected node
+    fn is_same_project_as_selected(&self, node: &crate::graph::types::GraphNode) -> bool {
+        if let Some(ref selected_id) = self.graph.selected_node {
+            if let Some(selected_node) = self.graph.get_node(selected_id) {
+                return node.project == selected_node.project;
+            }
+        }
+        false
+    }
 
     /// Compute which nodes should participate in physics simulation
     /// Returns None if no filtering is active (simulate all nodes)
@@ -1050,7 +1078,7 @@ impl DashboardApp {
     fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
         // If no filters active, return None (simulate all)
         let semantic_filter_active = self.has_active_semantic_filters();
-        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.proximity_active && !self.hide_tool_uses {
+        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.any_proximity_active() && !self.hide_tool_uses {
             return None;
         }
 
@@ -1340,14 +1368,81 @@ impl DashboardApp {
         self.categorization_progress_rx = Some(progress_rx);
     }
 
-    /// Trigger proximity fetch (edges + scores in one call, runs in background)
-    fn trigger_proximity_fetch(&mut self) {
-        let query = self.proximity_query.trim().to_string();
-        if query.is_empty() {
-            return;
-        }
+    /// Check if any proximity query is active (has results)
+    fn any_proximity_active(&self) -> bool {
+        self.proximity_queries.iter().any(|q| q.active)
+    }
 
-        self.proximity_loading = true;
+    /// Check if any proximity query is currently loading
+    fn any_proximity_loading(&self) -> bool {
+        self.proximity_queries.iter().any(|q| q.loading)
+    }
+
+    /// Total edge count across all proximity queries
+    fn total_proximity_edge_count(&self) -> usize {
+        self.proximity_queries.iter().map(|q| q.edge_count).sum()
+    }
+
+    /// Add a new proximity query, dedup, assign color, and trigger fetch
+    fn add_proximity_query(&mut self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() { return; }
+        // Dedup check
+        if self.proximity_queries.iter().any(|q| q.query == text) { return; }
+
+        let color = QUERY_COLORS[self.proximity_queries.len() % QUERY_COLORS.len()];
+        let idx = self.proximity_queries.len();
+        self.proximity_queries.push(ProximityQuery {
+            query: text,
+            color,
+            scores: HashMap::new(),
+            edges: Vec::new(),
+            edge_count: 0,
+            active: false,
+            loading: false,
+            rx: None,
+        });
+        self.graph.score_proximity_enabled = true;
+        self.trigger_proximity_fetch_for(idx);
+    }
+
+    /// Remove a proximity query by index, rebuild edges
+    fn remove_proximity_query(&mut self, index: usize) {
+        if index >= self.proximity_queries.len() { return; }
+        self.proximity_queries.remove(index);
+        // Fix heat map index
+        if let Some(hmi) = self.proximity_heat_map_index {
+            if hmi == index {
+                self.proximity_heat_map_index = None;
+            } else if hmi > index {
+                self.proximity_heat_map_index = Some(hmi - 1);
+            }
+        }
+        self.rebuild_all_proximity_edges();
+        if self.proximity_queries.is_empty() {
+            self.graph.score_proximity_enabled = false;
+        }
+    }
+
+    /// Combine all per-query edge vecs into graph.data.edges
+    fn rebuild_all_proximity_edges(&mut self) {
+        let mut all_edges = Vec::new();
+        for (idx, q) in self.proximity_queries.iter().enumerate() {
+            for edge in &q.edges {
+                let mut e = edge.clone();
+                e.query_index = Some(idx);
+                all_edges.push(e);
+            }
+        }
+        self.graph.set_proximity_edges(all_edges);
+    }
+
+    /// Trigger proximity fetch for a specific query index
+    fn trigger_proximity_fetch_for(&mut self, index: usize) {
+        let query = self.proximity_queries[index].query.trim().to_string();
+        if query.is_empty() { return; }
+
+        self.proximity_queries[index].loading = true;
 
         let delta = self.graph.score_proximity_delta;
         let max_edges = self.graph.max_proximity_edges;
@@ -1359,7 +1454,7 @@ impl DashboardApp {
             match api.fetch_proximity_edges(&query, delta, max_edges, max_neighbors) {
                 Ok(response) => {
                     let edges: Vec<GraphEdge> = response.edges.into_iter().map(|e| {
-                        GraphEdge::similarity(e.source, e.target, e.strength)
+                        GraphEdge::similarity(e.source, e.target, e.strength, None)
                     }).collect();
                     let _ = tx.send(Ok((edges, response.scores)));
                 }
@@ -1369,16 +1464,24 @@ impl DashboardApp {
             }
         });
 
-        self.proximity_rx = Some(rx);
+        self.proximity_queries[index].rx = Some(rx);
     }
 
-    /// Clear proximity edges and overlay
+    /// Re-fetch all active queries (e.g., after delta/max change)
+    fn refetch_all_proximity_queries(&mut self) {
+        for i in 0..self.proximity_queries.len() {
+            if self.proximity_queries[i].active || !self.proximity_queries[i].query.is_empty() {
+                self.trigger_proximity_fetch_for(i);
+            }
+        }
+    }
+
+    /// Clear all proximity queries, edges, and overlay
     fn clear_proximity(&mut self) {
-        self.proximity_active = false;
-        self.proximity_scores.clear();
-        self.proximity_query.clear();
-        self.proximity_edge_count = 0;
+        self.proximity_queries.clear();
+        self.proximity_input.clear();
         self.proximity_edge_count_filtered = 0;
+        self.proximity_heat_map_index = None;
         self.graph.set_proximity_edges(Vec::new());
         self.graph.score_proximity_enabled = false;
     }
@@ -2292,6 +2395,10 @@ impl DashboardApp {
                         self.graph.randomize_hue_offset();
                     }
                 });
+
+                ui.add_space(5.0);
+                ui.checkbox(&mut self.debug_tooltip, "Debug tooltip")
+                    .on_hover_text("Show node classification and rendering debug info in tooltip");
             });
 
         // Node Sizing section
@@ -2555,7 +2662,7 @@ impl DashboardApp {
                 }
             });
 
-        // Score-Proximity Edges section
+        // Score-Proximity Edges section (multi-query)
         egui::CollapsingHeader::new("Score-Proximity Edges")
             .default_open(false)
             .show(ui, |ui| {
@@ -2567,48 +2674,131 @@ impl DashboardApp {
                     self.clear_proximity();
                 }
 
-                // Search input + button
+                // Search input + Add button
+                let mut add_query: Option<String> = None;
                 ui.horizontal(|ui| {
                     let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.proximity_query)
+                        egui::TextEdit::singleline(&mut self.proximity_input)
                             .hint_text("Search concept...")
                             .desired_width(130.0)
                     );
 
-                    let can_search = !self.proximity_query.trim().is_empty()
-                        && !self.proximity_loading;
+                    let can_add = !self.proximity_input.trim().is_empty()
+                        && !self.proximity_queries.iter().any(|q| q.query == self.proximity_input.trim());
 
-                    if ui.add_enabled(can_search, egui::Button::new("Search")).clicked()
+                    if ui.add_enabled(can_add, egui::Button::new("+Add")).clicked()
                         || (response.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            && can_search)
+                            && can_add)
                     {
-                        self.graph.score_proximity_enabled = true;
-                        self.trigger_proximity_fetch();
+                        add_query = Some(self.proximity_input.clone());
+                        self.proximity_input.clear();
                     }
                 });
 
-                // Quick preset buttons
+                // Quick preset buttons (toggle: add if absent, remove if present)
+                let mut preset_add: Option<String> = None;
+                let mut preset_remove: Option<usize> = None;
                 ui.horizontal_wrapped(|ui| {
                     let presets = ["frustrated", "decisions", "errors", "confused", "breakthrough"];
                     for preset in presets {
-                        if ui.small_button(preset).clicked() {
-                            self.proximity_query = preset.to_string();
-                            self.graph.score_proximity_enabled = true;
-                            self.trigger_proximity_fetch();
+                        let existing_idx = self.proximity_queries.iter().position(|q| q.query == preset);
+                        let is_active = existing_idx.is_some();
+                        let button = egui::Button::new(
+                            if is_active {
+                                egui::RichText::new(preset).underline()
+                            } else {
+                                egui::RichText::new(preset)
+                            }
+                        );
+                        if ui.add(button).clicked() {
+                            if let Some(idx) = existing_idx {
+                                preset_remove = Some(idx);
+                            } else {
+                                preset_add = Some(preset.to_string());
+                            }
                         }
                     }
                 });
 
+                // Apply deferred add/remove (avoid borrow conflicts)
+                if let Some(text) = add_query {
+                    self.add_proximity_query(text);
+                }
+                if let Some(text) = preset_add {
+                    self.add_proximity_query(text);
+                }
+                if let Some(idx) = preset_remove {
+                    self.remove_proximity_query(idx);
+                }
+
                 // Loading indicator
-                if self.proximity_loading {
+                if self.any_proximity_loading() {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Loading...");
                     });
                 }
 
+                // Active queries as colored chip rows
+                if !self.proximity_queries.is_empty() {
+                    let mut remove_idx: Option<usize> = None;
+                    for (i, q) in self.proximity_queries.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            // Color dot
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(8.0, 8.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(rect.center(), 4.0, q.color);
+
+                            // Query label + edge count
+                            let label = if q.loading {
+                                format!("\"{}\" ...", q.query)
+                            } else {
+                                format!("\"{}\" ({} edges)", q.query, q.edge_count)
+                            };
+                            ui.label(egui::RichText::new(label).small());
+
+                            // Remove button
+                            if ui.small_button("x").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(idx) = remove_idx {
+                        self.remove_proximity_query(idx);
+                    }
+                }
+
                 if self.graph.score_proximity_enabled {
+                    ui.separator();
+
+                    // Heat map dropdown (which query colors the overlay)
+                    if self.proximity_queries.len() > 1 {
+                        let heat_label = match self.proximity_heat_map_index {
+                            None => "All (max)".to_string(),
+                            Some(idx) => self.proximity_queries.get(idx)
+                                .map(|q| q.query.clone())
+                                .unwrap_or_else(|| "???".to_string()),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("Heat map:");
+                            egui::ComboBox::from_id_salt("proximity_heat_map")
+                                .selected_text(heat_label)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(self.proximity_heat_map_index.is_none(), "All (max)").clicked() {
+                                        self.proximity_heat_map_index = None;
+                                    }
+                                    for (i, q) in self.proximity_queries.iter().enumerate() {
+                                        if ui.selectable_label(self.proximity_heat_map_index == Some(i), &q.query).clicked() {
+                                            self.proximity_heat_map_index = Some(i);
+                                        }
+                                    }
+                                });
+                        });
+                    }
+
                     // Strength slider (physics force multiplier)
                     ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
                         .logarithmic(true)
@@ -2693,35 +2883,39 @@ impl DashboardApp {
                     });
                     let max_n_changed = self.graph.max_neighbors_per_node != prev_neighbors;
 
-                    // Show edge count and scored nodes (only count nodes in current graph)
+                    // Show total edge count and scored nodes
                     let display_count = if self.graph.max_neighbors_per_node > 0 {
                         self.proximity_edge_count_filtered
                     } else {
-                        self.proximity_edge_count
+                        self.total_proximity_edge_count()
                     };
-                    ui.label(format!("Edges: {}", display_count));
-                    if self.proximity_active {
+                    ui.label(format!("Total edges: {}", display_count));
+                    if self.any_proximity_active() {
+                        let all_scores: HashSet<&String> = self.proximity_queries.iter()
+                            .filter(|q| q.active)
+                            .flat_map(|q| q.scores.keys())
+                            .collect();
                         let matched = self.graph.data.nodes.iter()
-                            .filter(|n| self.proximity_scores.contains_key(&n.id))
+                            .filter(|n| all_scores.contains(&n.id))
                             .count();
                         ui.label(format!("Scored nodes: {} / {}", matched, self.graph.data.nodes.len()));
                     }
 
-                    // Rebuild / Clear buttons
+                    // Rebuild All / Clear All buttons
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.proximity_loading && !self.proximity_query.trim().is_empty(),
-                            egui::Button::new("Rebuild")).clicked()
+                        if ui.add_enabled(!self.any_proximity_loading() && !self.proximity_queries.is_empty(),
+                            egui::Button::new("Rebuild All")).clicked()
                         {
-                            self.trigger_proximity_fetch();
+                            self.refetch_all_proximity_queries();
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui.button("Clear All").clicked() {
                             self.clear_proximity();
                         }
                     });
 
                     // Auto-refetch when delta, max_edges, or max_neighbors change
-                    if (delta_changed || max_changed || max_n_changed) && !self.proximity_loading && !self.proximity_query.trim().is_empty() {
-                        self.trigger_proximity_fetch();
+                    if (delta_changed || max_changed || max_n_changed) && !self.any_proximity_loading() && !self.proximity_queries.is_empty() {
+                        self.refetch_all_proximity_queries();
                     }
                 }
             });
@@ -3481,7 +3675,16 @@ impl DashboardApp {
             };
 
             // Use greyscale and reduced opacity for timeline-dimmed edges
-            let mut color = self.graph.edge_color(edge).gamma_multiply(base_opacity);
+            // For similarity edges, use query-specific color if available
+            let base_color = if edge.is_similarity {
+                edge.query_index
+                    .and_then(|qi| self.proximity_queries.get(qi))
+                    .map(|pq| pq.color)
+                    .unwrap_or_else(|| self.graph.edge_color(edge))
+            } else {
+                self.graph.edge_color(edge)
+            };
+            let mut color = base_color.gamma_multiply(base_opacity);
             if is_timeline_dimmed {
                 color = crate::graph::types::to_greyscale(color).gamma_multiply(0.4);
             }
@@ -3841,12 +4044,20 @@ impl DashboardApp {
                 };
 
                 // Apply proximity heat-map overlay when active
-                let color = if self.proximity_active {
-                    match self.proximity_scores.get(&node.id) {
-                        Some(&score) => {
-                            // Heat map: dim low scores, bright high scores
+                let color = if self.any_proximity_active() {
+                    // Get score: either from specific query or max across all
+                    let score = match self.proximity_heat_map_index {
+                        Some(hmi) => self.proximity_queries.get(hmi)
+                            .and_then(|q| q.scores.get(&node.id).copied()),
+                        None => self.proximity_queries.iter()
+                            .filter(|q| q.active)
+                            .filter_map(|q| q.scores.get(&node.id).copied())
+                            .reduce(f32::max),
+                    };
+                    match score {
+                        Some(s) => {
                             let grey = crate::graph::types::to_greyscale(color);
-                            crate::graph::types::lerp_color(grey.gamma_multiply(0.3), color, score)
+                            crate::graph::types::lerp_color(grey.gamma_multiply(0.3), color, s)
                         }
                         None => crate::graph::types::to_greyscale(color).gamma_multiply(0.15),
                     }
@@ -3956,54 +4167,124 @@ impl DashboardApp {
                     let screen_pos = transform(pos);
                     let tooltip_pos = screen_pos + Vec2::new(self.node_size * self.zoom + 10.0, 0.0);
 
-                    // Content preview — word-wrap to ~50 chars, max 4 lines
                     let mut lines: Vec<String> = Vec::new();
-                    let preview = &node.content_preview;
-                    let max_line_len = 50;
-                    let max_preview_lines = 4;
-                    let mut char_iter = preview.chars().peekable();
-                    let mut preview_lines = 0;
-                    while char_iter.peek().is_some() && preview_lines < max_preview_lines {
-                        let chunk: String = char_iter.by_ref().take(max_line_len).collect();
-                        lines.push(chunk.trim_end().to_string());
-                        preview_lines += 1;
-                    }
-                    // Append ellipsis to last content line if truncated
-                    if char_iter.peek().is_some() {
-                        if let Some(last) = lines.last_mut() {
-                            last.push_str("...");
-                        }
-                    }
 
-                    lines.push(String::new());
+                    if self.debug_tooltip {
+                        // Debug tooltip: node classification and rendering info
+                        lines.push("DEBUG NODE CLASSIFICATION".to_string());
+                        lines.push(String::new());
 
-                    // Project
-                    lines.push(format!("Project: {}", node.project));
+                        // Session ID
+                        lines.push(format!("Session: {}", node.session_id));
 
-                    // Timestamp — compact "YYYY-MM-DD HH:MM"
-                    if let Some(ref ts) = node.timestamp {
-                        let display_ts = if ts.len() >= 16 {
-                            ts[..16].replace('T', " ")
+                        // Node properties
+                        let mut properties = Vec::new();
+                        if self.is_after_playhead(node) {
+                            properties.push("after playhead");
                         } else {
-                            ts.clone()
-                        };
-                        lines.push(format!("Time: {}", display_ts));
-                    }
+                            properties.push("before/at playhead");
+                        }
+                        if self.is_same_session_as_selected(node) {
+                            properties.push("same session as selected");
+                        } else {
+                            properties.push("different session");
+                        }
+                        if self.is_same_project_as_selected(node) {
+                            properties.push("same project as selected");
+                        } else {
+                            properties.push("different project");
+                        }
+                        lines.push(format!("Properties: {}", properties.join(", ")));
 
-                    // Tokens — compact "1.2k in / 3.4k out"
-                    let in_tok = node.input_tokens.unwrap_or(0);
-                    let out_tok = node.output_tokens.unwrap_or(0);
-                    if in_tok > 0 || out_tok > 0 {
-                        let fmt_tok = |t: i32| -> String {
-                            if t >= 1000 { format!("{:.1}k", t as f64 / 1000.0) }
-                            else { format!("{}", t) }
-                        };
-                        lines.push(format!("Tokens: {} in / {} out", fmt_tok(in_tok), fmt_tok(out_tok)));
-                    }
+                        // Display logic
+                        let mut display_props = Vec::new();
+                        let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_node_visible(&node.id);
+                        let is_same_project_future = self.is_same_project_future_node(node);
 
-                    // Tools used
-                    if node.has_tool_usage {
-                        lines.push("Tools used".to_string());
+                        // Hollow vs filled
+                        if is_same_project_future {
+                            display_props.push("HOLLOW");
+                        } else {
+                            display_props.push("filled");
+                        }
+                        // Physics
+                        if is_same_project_future {
+                            display_props.push("physics enabled");
+                        } else if is_timeline_dimmed {
+                            display_props.push("no physics");
+                        } else {
+                            display_props.push("physics enabled");
+                        }
+                        // Color/saturation
+                        if is_same_project_future {
+                            display_props.push("greyscale");
+                        } else if is_timeline_dimmed {
+                            display_props.push("greyscale");
+                            display_props.push("40% opacity");
+                        } else {
+                            let is_future = self.is_after_playhead(node);
+                            if is_future {
+                                display_props.push("desaturated (70%)");
+                            } else {
+                                display_props.push("full color");
+                            }
+                        }
+                        // Size
+                        if is_timeline_dimmed && !is_same_project_future {
+                            display_props.push("0.5x size");
+                        } else {
+                            display_props.push("variable size");
+                        }
+                        lines.push(format!("Display: {}", display_props.join(", ")));
+                    } else {
+                        // Normal tooltip: content preview + metadata
+                        // Content preview — word-wrap to ~50 chars, max 4 lines
+                        let preview = &node.content_preview;
+                        let max_line_len = 50;
+                        let max_preview_lines = 4;
+                        let mut char_iter = preview.chars().peekable();
+                        let mut preview_lines = 0;
+                        while char_iter.peek().is_some() && preview_lines < max_preview_lines {
+                            let chunk: String = char_iter.by_ref().take(max_line_len).collect();
+                            lines.push(chunk.trim_end().to_string());
+                            preview_lines += 1;
+                        }
+                        if char_iter.peek().is_some() {
+                            if let Some(last) = lines.last_mut() {
+                                last.push_str("...");
+                            }
+                        }
+
+                        lines.push(String::new());
+
+                        // Project
+                        lines.push(format!("Project: {}", node.project));
+
+                        // Timestamp — compact "YYYY-MM-DD HH:MM"
+                        if let Some(ref ts) = node.timestamp {
+                            let display_ts = if ts.len() >= 16 {
+                                ts[..16].replace('T', " ")
+                            } else {
+                                ts.clone()
+                            };
+                            lines.push(format!("Time: {}", display_ts));
+                        }
+
+                        // Tokens — compact "1.2k in / 3.4k out"
+                        let in_tok = node.input_tokens.unwrap_or(0);
+                        let out_tok = node.output_tokens.unwrap_or(0);
+                        if in_tok > 0 || out_tok > 0 {
+                            let fmt_tok = |t: i32| -> String {
+                                if t >= 1000 { format!("{:.1}k", t as f64 / 1000.0) }
+                                else { format!("{}", t) }
+                            };
+                            lines.push(format!("Tokens: {} in / {} out", fmt_tok(in_tok), fmt_tok(out_tok)));
+                        }
+
+                        // Tools used
+                        if node.has_tool_usage {
+                            lines.push("Tools used".to_string());
+                        }
                     }
 
                     let tooltip_text = lines.join("\n");
@@ -5059,32 +5340,40 @@ impl eframe::App for DashboardApp {
             }
         }
 
-        // Check for proximity edges + scores result from background thread
-        if let Some(ref rx) = self.proximity_rx {
+        // Check for proximity edges + scores results from background threads (per-query)
+        let mut any_proximity_completed = false;
+        for i in 0..self.proximity_queries.len() {
+            if self.proximity_queries[i].rx.is_none() { continue; }
+            // Take the rx to avoid borrow conflicts
+            let rx = self.proximity_queries[i].rx.take().unwrap();
             match rx.try_recv() {
                 Ok(Ok((edges, scores))) => {
                     let count = edges.len();
-                    self.graph.set_proximity_edges(edges);
-                    self.proximity_scores = scores;
-                    self.proximity_edge_count = count;
-                    self.proximity_active = true;
-                    self.proximity_loading = false;
-                    self.proximity_rx = None;
-                    eprintln!("Loaded {} proximity edges, {} scored nodes", count, self.proximity_scores.len());
+                    eprintln!("Query '{}': loaded {} edges, {} scored nodes",
+                        self.proximity_queries[i].query, count, scores.len());
+                    self.proximity_queries[i].edges = edges;
+                    self.proximity_queries[i].scores = scores;
+                    self.proximity_queries[i].edge_count = count;
+                    self.proximity_queries[i].active = true;
+                    self.proximity_queries[i].loading = false;
+                    any_proximity_completed = true;
                 }
                 Ok(Err(e)) => {
-                    eprintln!("Proximity fetch failed: {}", e);
-                    self.proximity_loading = false;
-                    self.proximity_rx = None;
+                    eprintln!("Proximity fetch failed for '{}': {}", self.proximity_queries[i].query, e);
+                    self.proximity_queries[i].loading = false;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Put rx back, still waiting
+                    self.proximity_queries[i].rx = Some(rx);
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.proximity_loading = false;
-                    self.proximity_rx = None;
+                    self.proximity_queries[i].loading = false;
                 }
             }
+        }
+        if any_proximity_completed {
+            self.rebuild_all_proximity_edges();
         }
 
         // Check for embedding generation result from background thread

@@ -158,6 +158,9 @@ pub struct GraphEdge {
     pub is_temporal: bool,
     /// Strength multiplier for this edge (used by temporal and similarity edges)
     pub similarity: Option<f32>,
+    /// Which proximity query produced this edge (for multi-query coloring)
+    #[serde(default)]
+    pub query_index: Option<usize>,
 }
 
 impl GraphEdge {
@@ -173,11 +176,12 @@ impl GraphEdge {
             is_similarity: false,
             is_temporal: true,
             similarity: Some(strength),
+            query_index: None,
         }
     }
 
     /// Create a similarity edge between two nodes
-    pub fn similarity(source: String, target: String, strength: f32) -> Self {
+    pub fn similarity(source: String, target: String, strength: f32, query_index: Option<usize>) -> Self {
         Self {
             source,
             target,
@@ -188,6 +192,7 @@ impl GraphEdge {
             is_similarity: true,
             is_temporal: false,
             similarity: Some(strength),
+            query_index,
         }
     }
 }

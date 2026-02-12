@@ -12,6 +12,7 @@ fn session_edge(source: &str, target: &str) -> GraphEdge {
         is_similarity: false,
         is_temporal: false,
         similarity: None,
+        query_index: None,
     }
 }
 

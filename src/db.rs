@@ -273,6 +273,7 @@ impl DbClient {
                         is_similarity: false,
                         is_temporal: false,
                         similarity: None,
+                        query_index: None,
                     });
                 }
 

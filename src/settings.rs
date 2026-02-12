@@ -123,6 +123,22 @@ pub struct Preset {
     #[serde(default = "default_max_neighbors_per_node")]
     pub max_neighbors_per_node: usize,
 
+    // Timeline
+    #[serde(default = "default_hover_scrubs_timeline")]
+    pub hover_scrubs_timeline: bool,
+
+    // Panel visibility
+    #[serde(default)]
+    pub beads_panel_open: bool,
+    #[serde(default)]
+    pub mail_panel_open: bool,
+    #[serde(default)]
+    pub histogram_panel_enabled: bool,
+    #[serde(default = "default_histogram_split_ratio")]
+    pub histogram_split_ratio: f32,
+    #[serde(default)]
+    pub sidebar_tab: SidebarTab,
+
     // Color Snapshot
     #[serde(default)]
     pub hue_offset: f32,
@@ -173,6 +189,14 @@ impl Preset {
             proximity_strength: settings.proximity_strength,
             max_proximity_edges: settings.max_proximity_edges,
             max_neighbors_per_node: settings.max_neighbors_per_node,
+            // Timeline
+            hover_scrubs_timeline: settings.hover_scrubs_timeline,
+            // Panel visibility
+            beads_panel_open: settings.beads_panel_open,
+            mail_panel_open: settings.mail_panel_open,
+            histogram_panel_enabled: settings.histogram_panel_enabled,
+            histogram_split_ratio: settings.histogram_split_ratio,
+            sidebar_tab: settings.sidebar_tab,
             // Color snapshot
             hue_offset: graph.hue_offset,
             project_colors: graph.project_colors.clone(),
@@ -213,6 +237,14 @@ impl Preset {
         settings.proximity_strength = self.proximity_strength;
         settings.max_proximity_edges = self.max_proximity_edges;
         settings.max_neighbors_per_node = self.max_neighbors_per_node;
+        // Timeline
+        settings.hover_scrubs_timeline = self.hover_scrubs_timeline;
+        // Panel visibility
+        settings.beads_panel_open = self.beads_panel_open;
+        settings.mail_panel_open = self.mail_panel_open;
+        settings.histogram_panel_enabled = self.histogram_panel_enabled;
+        settings.histogram_split_ratio = self.histogram_split_ratio;
+        settings.sidebar_tab = self.sidebar_tab;
 
         // Restore colors (merge: saved colors take precedence over current)
         graph.hue_offset = self.hue_offset;
