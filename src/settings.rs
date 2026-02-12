@@ -328,6 +328,10 @@ pub struct Settings {
     #[serde(default = "default_max_neighbors_per_node")]
     pub max_neighbors_per_node: usize,
 
+    // Score-proximity quick tags
+    #[serde(default = "default_proximity_quick_tags")]
+    pub proximity_quick_tags: Vec<String>,
+
     // Saved presets
     #[serde(default)]
     pub presets: Vec<Preset>,
@@ -408,6 +412,13 @@ fn default_proximity_strength() -> f32 { 0.5 }
 fn default_max_proximity_edges() -> usize { 100_000 }
 fn default_max_neighbors_per_node() -> usize { 0 }
 
+fn default_proximity_quick_tags() -> Vec<String> {
+    vec![
+        "frustrated".into(), "decisions".into(), "errors".into(),
+        "confused".into(), "breakthrough".into(),
+    ]
+}
+
 fn default_histogram_panel_enabled() -> bool { false }
 fn default_histogram_split_ratio() -> f32 { 0.65 }
 
@@ -461,6 +472,9 @@ impl Default for Settings {
             proximity_strength: 0.5,
             max_proximity_edges: 100_000,
             max_neighbors_per_node: 0,
+
+            // Score-proximity quick tags
+            proximity_quick_tags: default_proximity_quick_tags(),
 
             // Presets
             presets: Vec::new(),

@@ -36,6 +36,15 @@ struct ProximityQuery {
     rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
 }
 
+/// Which edge popup is currently open (gear icon popups)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EdgePopup {
+    Physics,
+    LayoutShaping,
+    TemporalClustering,
+    ScoreProximity,
+}
+
 /// Time range options for filtering
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TimeRange {
@@ -325,6 +334,8 @@ pub struct DashboardApp {
     // Layout shaping (directed stiffness + recency centering)
     layout_shaping_enabled: bool,
 
+    // Edge popup state (gear icon popups)
+    edge_popup_open: Option<EdgePopup>,
 
     // Session ingest (re-import from ~/.claude/)
     ingest_loading: bool,
@@ -529,6 +540,9 @@ impl DashboardApp {
 
             // Layout shaping
             layout_shaping_enabled: false,
+
+            // Edge popup state
+            edge_popup_open: None,
 
             // Session ingest
             ingest_loading: false,
@@ -2529,151 +2543,142 @@ impl DashboardApp {
 
         ui.add_space(5.0);
 
-        // Physics section
-        egui::CollapsingHeader::new("Physics")
-            .default_open(true)
-            .show(ui, |ui| {
-                if ui.checkbox(&mut self.graph.physics_enabled, "Physics enabled").changed() {
+        // --- Compact edge row helper ---
+        // Each row: [toggle] Label    status_text [gear]
+
+        // Physics row
+        {
+            let physics_visible = self.compute_physics_visible_nodes();
+            let settled = self.layout.is_settled(&self.graph, physics_visible.as_ref());
+            let status = if !self.graph.physics_enabled {
+                "off".to_string()
+            } else if settled {
+                "settled".to_string()
+            } else {
+                "running".to_string()
+            };
+
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut self.graph.physics_enabled, "Physics").changed() {
                     self.mark_settings_dirty();
                 }
-                ui.add_space(5.0);
-                if ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
-                    self.mark_settings_dirty();
-                }
-                if ui.add(egui::Slider::new(&mut self.layout.momentum, 0.0..=0.95).fixed_decimals(2).text("Momentum")).changed() {
-                    self.mark_settings_dirty();
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_open = self.edge_popup_open == Some(EdgePopup::Physics);
+                    let gear = if is_open {
+                        egui::RichText::new("\u{2699}").strong()
+                    } else {
+                        egui::RichText::new("\u{2699}")
+                    };
+                    if ui.add(egui::Button::new(gear).frame(false)).clicked() {
+                        self.edge_popup_open = if is_open { None } else { Some(EdgePopup::Physics) };
+                    }
+                    ui.label(egui::RichText::new(status).weak().small());
+                });
             });
+        }
 
-        // Layout Shaping section (directed stiffness + recency centering)
-        egui::CollapsingHeader::new("Layout Shaping")
-            .default_open(false)
-            .show(ui, |ui| {
+        // Layout Shaping row
+        {
+            let status = if !self.layout_shaping_enabled {
+                "off".to_string()
+            } else {
+                format!("stiffness: {:.1}", self.layout.directed_stiffness)
+            };
+
+            ui.horizontal(|ui| {
                 let was_enabled = self.layout_shaping_enabled;
-                ui.checkbox(&mut self.layout_shaping_enabled, "Enable layout shaping");
-
-                if self.layout_shaping_enabled != was_enabled {
+                if ui.checkbox(&mut self.layout_shaping_enabled, "Layout Shaping").changed() {
                     if !self.layout_shaping_enabled {
-                        // Reset to defaults when disabled
                         self.layout.directed_stiffness = 1.0;
                         self.layout.recency_centering = 0.0;
                     }
                     self.mark_settings_dirty();
                 }
+                // Restore if just reading (checkbox already handles mutation)
+                let _ = was_enabled;
 
-                if self.layout_shaping_enabled {
-                    ui.add_space(5.0);
-
-                    if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
-                        .logarithmic(true)
-                        .text("Edge Stiffness")
-                        .fixed_decimals(2)).changed() {
-                        self.mark_settings_dirty();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_open = self.edge_popup_open == Some(EdgePopup::LayoutShaping);
+                    let gear = if is_open {
+                        egui::RichText::new("\u{2699}").strong()
+                    } else {
+                        egui::RichText::new("\u{2699}")
+                    };
+                    if ui.add(egui::Button::new(gear).frame(false)).clicked() {
+                        self.edge_popup_open = if is_open { None } else { Some(EdgePopup::LayoutShaping) };
                     }
-                    ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
-
-                    ui.add_space(5.0);
-
-                    if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
-                        .text("Recency→Center")
-                        .fixed_decimals(1)).changed() {
-                        self.mark_settings_dirty();
-                    }
-                    ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
-                }
+                    ui.label(egui::RichText::new(status).weak().small());
+                });
             });
+        }
 
-        // Temporal Clustering section
-        egui::CollapsingHeader::new("Temporal Clustering")
-            .default_open(false)
-            .show(ui, |ui| {
+        // Temporal Clustering row
+        {
+            let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
+            let status = if !self.graph.temporal_attraction_enabled {
+                "off".to_string()
+            } else {
+                format!("{} edges", temporal_count)
+            };
+
+            ui.horizontal(|ui| {
                 let temporal_enabled = self.graph.temporal_attraction_enabled;
                 let mut new_temporal_enabled = temporal_enabled;
-                ui.checkbox(&mut new_temporal_enabled, "Enable temporal edges");
-                if new_temporal_enabled != temporal_enabled {
+                if ui.checkbox(&mut new_temporal_enabled, "Temporal Clustering").changed() {
                     self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
                     self.mark_settings_dirty();
                 }
 
-                if self.graph.temporal_attraction_enabled {
-                    if ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
-                        .logarithmic(true)
-                        .text("Strength")).changed() {
-                        self.mark_settings_dirty();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_open = self.edge_popup_open == Some(EdgePopup::TemporalClustering);
+                    let gear = if is_open {
+                        egui::RichText::new("\u{2699}").strong()
+                    } else {
+                        egui::RichText::new("\u{2699}")
+                    };
+                    if ui.add(egui::Button::new(gear).frame(false)).clicked() {
+                        self.edge_popup_open = if is_open { None } else { Some(EdgePopup::TemporalClustering) };
                     }
-
-                    // Temporal window slider (in minutes for UX, stored as seconds)
-                    let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
-                    let prev_window_mins = window_mins;
-                    ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
-                        .text("Window (min)")
-                        .fixed_decimals(0));
-                    if (window_mins - prev_window_mins).abs() > 0.1 {
-                        self.graph.set_temporal_window(window_mins as f64 * 60.0);
-                        self.mark_settings_dirty();
-                    }
-
-                    // Temporal edge opacity slider
-                    if ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
-                        .text("Edge opacity")
-                        .fixed_decimals(2)).changed() {
-                        self.mark_settings_dirty();
-                    }
-
-                    // Max temporal edges dropdown
-                    let edge_limits = [
-                        (10_000, "10k"),
-                        (50_000, "50k"),
-                        (100_000, "100k"),
-                        (250_000, "250k"),
-                        (500_000, "500k"),
-                        (1_000_000, "1M"),
-                    ];
-                    let current_limit = self.graph.max_temporal_edges;
-                    let current_label = edge_limits.iter()
-                        .find(|(v, _)| *v == current_limit)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Custom");
-
-                    ui.horizontal(|ui| {
-                        ui.label("Max edges:");
-                        egui::ComboBox::from_id_salt("max_temporal_edges")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in edge_limits {
-                                    if ui.selectable_label(current_limit == value, label).clicked() {
-                                        self.graph.set_max_temporal_edges(value);
-                                        self.settings.max_temporal_edges = value;
-                                        self.mark_settings_dirty();
-                                    }
-                                }
-                            });
-                    });
-
-                    // Show temporal edge count
-                    let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
-                    ui.label(format!("Temporal edges: {}", temporal_count));
-                }
+                    ui.label(egui::RichText::new(status).weak().small());
+                });
             });
+        }
 
-        // Score-Proximity Edges section (multi-query)
-        egui::CollapsingHeader::new("Score-Proximity Edges")
-            .default_open(false)
-            .show(ui, |ui| {
-                // Enable checkbox
+        // Score-Proximity section (inline search + query management)
+        ui.add_space(3.0);
+        ui.separator();
+        {
+            let status = if !self.graph.score_proximity_enabled {
+                "off".to_string()
+            } else {
+                let count = self.total_proximity_edge_count();
+                format!("{} edges", count)
+            };
+
+            // Header row: toggle + label + status + gear
+            ui.horizontal(|ui| {
                 let was_enabled = self.graph.score_proximity_enabled;
-                ui.checkbox(&mut self.graph.score_proximity_enabled, "Enable");
-
+                ui.checkbox(&mut self.graph.score_proximity_enabled, "Score-Proximity");
                 if self.graph.score_proximity_enabled != was_enabled && !self.graph.score_proximity_enabled {
                     self.clear_proximity();
                 }
 
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_open = self.edge_popup_open == Some(EdgePopup::ScoreProximity);
+                    let gear = if is_open {
+                        egui::RichText::new("\u{2699}").strong()
+                    } else {
+                        egui::RichText::new("\u{2699}")
+                    };
+                    if ui.add(egui::Button::new(gear).frame(false)).clicked() {
+                        self.edge_popup_open = if is_open { None } else { Some(EdgePopup::ScoreProximity) };
+                    }
+                    ui.label(egui::RichText::new(status).weak().small());
+                });
+            });
+
+            // Inline controls: search, tags, queries (always visible when enabled)
+            if self.graph.score_proximity_enabled {
                 // Search input + Add button
                 let mut add_query: Option<String> = None;
                 ui.horizontal(|ui| {
@@ -2686,42 +2691,59 @@ impl DashboardApp {
                     let can_add = !self.proximity_input.trim().is_empty()
                         && !self.proximity_queries.iter().any(|q| q.query == self.proximity_input.trim());
 
-                    if ui.add_enabled(can_add, egui::Button::new("+Add")).clicked()
+                    if ui.add_enabled(can_add, egui::Button::new("Search")).clicked()
                         || (response.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter))
                             && can_add)
                     {
-                        add_query = Some(self.proximity_input.clone());
+                        let term = self.proximity_input.trim().to_string();
+                        add_query = Some(term.clone());
+                        if !self.settings.proximity_quick_tags.iter().any(|t| t == &term) {
+                            self.settings.proximity_quick_tags.push(term);
+                            self.mark_settings_dirty();
+                        }
                         self.proximity_input.clear();
                     }
                 });
 
-                // Quick preset buttons (toggle: add if absent, remove if present)
+                // Quick preset buttons
                 let mut preset_add: Option<String> = None;
                 let mut preset_remove: Option<usize> = None;
+                let mut tag_remove: Option<usize> = None;
+                let tags = self.settings.proximity_quick_tags.clone();
                 ui.horizontal_wrapped(|ui| {
-                    let presets = ["frustrated", "decisions", "errors", "confused", "breakthrough"];
-                    for preset in presets {
-                        let existing_idx = self.proximity_queries.iter().position(|q| q.query == preset);
+                    for (tag_idx, tag) in tags.iter().enumerate() {
+                        let existing_idx = self.proximity_queries.iter().position(|q| &q.query == tag);
                         let is_active = existing_idx.is_some();
                         let button = egui::Button::new(
                             if is_active {
-                                egui::RichText::new(preset).underline()
+                                egui::RichText::new(tag.as_str()).underline()
                             } else {
-                                egui::RichText::new(preset)
+                                egui::RichText::new(tag.as_str())
                             }
                         );
-                        if ui.add(button).clicked() {
+                        let response = ui.add(button);
+                        if response.clicked() {
                             if let Some(idx) = existing_idx {
                                 preset_remove = Some(idx);
                             } else {
-                                preset_add = Some(preset.to_string());
+                                preset_add = Some(tag.clone());
                             }
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Remove tag").clicked() {
+                                tag_remove = Some(tag_idx);
+                                ui.close_menu();
+                            }
+                        });
                     }
                 });
+                if let Some(idx) = tag_remove {
+                    self.settings.proximity_quick_tags.remove(idx);
+                    self.mark_settings_dirty();
+                }
 
-                // Apply deferred add/remove (avoid borrow conflicts)
+                // Apply deferred add/remove
                 if let Some(text) = add_query {
                     self.add_proximity_query(text);
                 }
@@ -2745,14 +2767,12 @@ impl DashboardApp {
                     let mut remove_idx: Option<usize> = None;
                     for (i, q) in self.proximity_queries.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            // Color dot
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(8.0, 8.0),
                                 egui::Sense::hover(),
                             );
                             ui.painter().circle_filled(rect.center(), 4.0, q.color);
 
-                            // Query label + edge count
                             let label = if q.loading {
                                 format!("\"{}\" ...", q.query)
                             } else {
@@ -2760,7 +2780,6 @@ impl DashboardApp {
                             };
                             ui.label(egui::RichText::new(label).small());
 
-                            // Remove button
                             if ui.small_button("x").clicked() {
                                 remove_idx = Some(i);
                             }
@@ -2770,155 +2789,318 @@ impl DashboardApp {
                         self.remove_proximity_query(idx);
                     }
                 }
+            }
+        }
+    }
 
-                if self.graph.score_proximity_enabled {
-                    ui.separator();
+    // --- Edge popup body methods (rendered in floating windows) ---
 
-                    // Heat map dropdown (which query colors the overlay)
-                    if self.proximity_queries.len() > 1 {
-                        let heat_label = match self.proximity_heat_map_index {
-                            None => "All (max)".to_string(),
-                            Some(idx) => self.proximity_queries.get(idx)
-                                .map(|q| q.query.clone())
-                                .unwrap_or_else(|| "???".to_string()),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label("Heat map:");
-                            egui::ComboBox::from_id_salt("proximity_heat_map")
-                                .selected_text(heat_label)
-                                .show_ui(ui, |ui| {
-                                    if ui.selectable_label(self.proximity_heat_map_index.is_none(), "All (max)").clicked() {
-                                        self.proximity_heat_map_index = None;
-                                    }
-                                    for (i, q) in self.proximity_queries.iter().enumerate() {
-                                        if ui.selectable_label(self.proximity_heat_map_index == Some(i), &q.query).clicked() {
-                                            self.proximity_heat_map_index = Some(i);
-                                        }
-                                    }
-                                });
-                        });
-                    }
+    fn render_physics_popup(&mut self, ui: &mut egui::Ui) {
+        if ui.add(egui::Slider::new(&mut self.layout.repulsion, 10.0..=100000.0).logarithmic(true).text("Repulsion")).changed() {
+            self.mark_settings_dirty();
+        }
+        if ui.add(egui::Slider::new(&mut self.layout.attraction, 0.0001..=10.0).logarithmic(true).text("Attraction")).changed() {
+            self.mark_settings_dirty();
+        }
+        if ui.add(egui::Slider::new(&mut self.layout.centering, 0.00001..=0.1).logarithmic(true).text("Centering")).changed() {
+            self.mark_settings_dirty();
+        }
+        if ui.add(egui::Slider::new(&mut self.layout.momentum, 0.0..=0.95).fixed_decimals(2).text("Momentum")).changed() {
+            self.mark_settings_dirty();
+        }
+    }
 
-                    // Strength slider (physics force multiplier)
-                    ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
-                        .logarithmic(true)
-                        .text("Strength"));
+    fn render_layout_shaping_popup(&mut self, ui: &mut egui::Ui) {
+        if self.layout_shaping_enabled {
+            if ui.add(egui::Slider::new(&mut self.layout.directed_stiffness, 0.1..=20.0)
+                .logarithmic(true)
+                .text("Edge Stiffness")
+                .fixed_decimals(2)).changed() {
+                self.mark_settings_dirty();
+            }
+            ui.label(egui::RichText::new("Higher = tighter session chains").small().weak());
 
-                    // Delta slider
-                    let prev_delta = self.graph.score_proximity_delta;
-                    ui.add(egui::Slider::new(&mut self.graph.score_proximity_delta, 0.01..=0.5)
-                        .text("Delta (window)")
-                        .fixed_decimals(2));
-                    let delta_changed = (self.graph.score_proximity_delta - prev_delta).abs() > 0.001;
+            ui.add_space(5.0);
 
-                    // Edge opacity slider
-                    ui.add(egui::Slider::new(&mut self.proximity_edge_opacity, 0.0..=1.0)
-                        .text("Edge opacity")
-                        .fixed_decimals(2));
+            if ui.add(egui::Slider::new(&mut self.layout.recency_centering, 0.0..=50.0)
+                .text("Recency\u{2192}Center")
+                .fixed_decimals(1)).changed() {
+                self.mark_settings_dirty();
+            }
+            ui.label(egui::RichText::new("Higher = newer nodes pulled to center").small().weak());
+        } else {
+            ui.label(egui::RichText::new("Enable Layout Shaping to configure.").weak());
+        }
+    }
 
-                    // Stiffness slider
-                    ui.add(egui::Slider::new(&mut self.proximity_stiffness, 0.1..=10.0)
-                        .logarithmic(true)
-                        .text("Stiffness"));
+    fn render_temporal_popup(&mut self, ui: &mut egui::Ui) {
+        if !self.graph.temporal_attraction_enabled {
+            ui.label(egui::RichText::new("Enable Temporal Clustering to configure.").weak());
+            return;
+        }
 
-                    // Max edges dropdown
-                    let edge_limits = [
-                        (10_000_usize, "10k"),
-                        (50_000, "50k"),
-                        (100_000, "100k"),
-                        (250_000, "250k"),
-                        (500_000, "500k"),
-                        (1_000_000, "1M"),
-                    ];
-                    let current_limit = self.graph.max_proximity_edges;
-                    let current_label = edge_limits.iter()
-                        .find(|(v, _)| *v == current_limit)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Custom");
-                    let prev_max = self.graph.max_proximity_edges;
+        if ui.add(egui::Slider::new(&mut self.layout.temporal_strength, 0.001..=2.0)
+            .logarithmic(true)
+            .text("Strength")).changed() {
+            self.mark_settings_dirty();
+        }
 
-                    ui.horizontal(|ui| {
-                        ui.label("Max edges:");
-                        egui::ComboBox::from_id_salt("max_proximity_edges")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in edge_limits {
-                                    if ui.selectable_label(current_limit == value, label).clicked() {
-                                        self.graph.max_proximity_edges = value;
-                                    }
-                                }
-                            });
-                    });
-                    let max_changed = self.graph.max_proximity_edges != prev_max;
+        // Temporal window slider (in minutes for UX, stored as seconds)
+        let mut window_mins = (self.graph.temporal_window_secs / 60.0) as f32;
+        let prev_window_mins = window_mins;
+        ui.add(egui::Slider::new(&mut window_mins, 1.0..=60.0)
+            .text("Window (min)")
+            .fixed_decimals(0));
+        if (window_mins - prev_window_mins).abs() > 0.1 {
+            self.graph.set_temporal_window(window_mins as f64 * 60.0);
+            self.mark_settings_dirty();
+        }
 
-                    // Max neighbors per node dropdown
-                    let neighbor_limits: [(usize, &str); 8] = [
-                        (0, "Unlimited"),
-                        (1, "1"),
-                        (2, "2"),
-                        (3, "3"),
-                        (5, "5"),
-                        (8, "8"),
-                        (12, "12"),
-                        (20, "20"),
-                    ];
-                    let current_neighbors = self.graph.max_neighbors_per_node;
-                    let current_n_label = neighbor_limits.iter()
-                        .find(|(v, _)| *v == current_neighbors)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("Custom");
-                    let prev_neighbors = self.graph.max_neighbors_per_node;
+        // Temporal edge opacity slider
+        if ui.add(egui::Slider::new(&mut self.temporal_edge_opacity, 0.0..=1.0)
+            .text("Edge opacity")
+            .fixed_decimals(2)).changed() {
+            self.mark_settings_dirty();
+        }
 
-                    ui.horizontal(|ui| {
-                        ui.label("Max neighbors:");
-                        egui::ComboBox::from_id_salt("max_neighbors_per_node")
-                            .selected_text(current_n_label)
-                            .show_ui(ui, |ui| {
-                                for (value, label) in neighbor_limits {
-                                    if ui.selectable_label(current_neighbors == value, label).clicked() {
-                                        self.graph.max_neighbors_per_node = value;
-                                    }
-                                }
-                            });
-                    });
-                    let max_n_changed = self.graph.max_neighbors_per_node != prev_neighbors;
+        // Max temporal edges dropdown
+        let edge_limits = [
+            (10_000, "10k"),
+            (50_000, "50k"),
+            (100_000, "100k"),
+            (250_000, "250k"),
+            (500_000, "500k"),
+            (1_000_000, "1M"),
+        ];
+        let current_limit = self.graph.max_temporal_edges;
+        let current_label = edge_limits.iter()
+            .find(|(v, _)| *v == current_limit)
+            .map(|(_, l)| *l)
+            .unwrap_or("Custom");
 
-                    // Show total edge count and scored nodes
-                    let display_count = if self.graph.max_neighbors_per_node > 0 {
-                        self.proximity_edge_count_filtered
-                    } else {
-                        self.total_proximity_edge_count()
-                    };
-                    ui.label(format!("Total edges: {}", display_count));
-                    if self.any_proximity_active() {
-                        let all_scores: HashSet<&String> = self.proximity_queries.iter()
-                            .filter(|q| q.active)
-                            .flat_map(|q| q.scores.keys())
-                            .collect();
-                        let matched = self.graph.data.nodes.iter()
-                            .filter(|n| all_scores.contains(&n.id))
-                            .count();
-                        ui.label(format!("Scored nodes: {} / {}", matched, self.graph.data.nodes.len()));
-                    }
-
-                    // Rebuild All / Clear All buttons
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.any_proximity_loading() && !self.proximity_queries.is_empty(),
-                            egui::Button::new("Rebuild All")).clicked()
-                        {
-                            self.refetch_all_proximity_queries();
+        ui.horizontal(|ui| {
+            ui.label("Max edges:");
+            egui::ComboBox::from_id_salt("max_temporal_edges")
+                .selected_text(current_label)
+                .show_ui(ui, |ui| {
+                    for (value, label) in edge_limits {
+                        if ui.selectable_label(current_limit == value, label).clicked() {
+                            self.graph.set_max_temporal_edges(value);
+                            self.settings.max_temporal_edges = value;
+                            self.mark_settings_dirty();
                         }
-                        if ui.button("Clear All").clicked() {
-                            self.clear_proximity();
+                    }
+                });
+        });
+
+        // Show temporal edge count
+        let temporal_count = self.graph.data.edges.iter().filter(|e| e.is_temporal).count();
+        ui.label(format!("Temporal edges: {}", temporal_count));
+    }
+
+    fn render_proximity_popup(&mut self, ui: &mut egui::Ui) {
+        if !self.graph.score_proximity_enabled {
+            ui.label(egui::RichText::new("Enable Score-Proximity to configure.").weak());
+            return;
+        }
+
+        // Heat map dropdown (which query colors the overlay)
+        if self.proximity_queries.len() > 1 {
+            let heat_label = match self.proximity_heat_map_index {
+                None => "All (max)".to_string(),
+                Some(idx) => self.proximity_queries.get(idx)
+                    .map(|q| q.query.clone())
+                    .unwrap_or_else(|| "???".to_string()),
+            };
+            ui.horizontal(|ui| {
+                ui.label("Heat map:");
+                egui::ComboBox::from_id_salt("proximity_heat_map")
+                    .selected_text(heat_label)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.proximity_heat_map_index.is_none(), "All (max)").clicked() {
+                            self.proximity_heat_map_index = None;
+                        }
+                        for (i, q) in self.proximity_queries.iter().enumerate() {
+                            if ui.selectable_label(self.proximity_heat_map_index == Some(i), &q.query).clicked() {
+                                self.proximity_heat_map_index = Some(i);
+                            }
                         }
                     });
-
-                    // Auto-refetch when delta, max_edges, or max_neighbors change
-                    if (delta_changed || max_changed || max_n_changed) && !self.any_proximity_loading() && !self.proximity_queries.is_empty() {
-                        self.refetch_all_proximity_queries();
-                    }
-                }
             });
+        }
+
+        // Strength slider (physics force multiplier)
+        ui.add(egui::Slider::new(&mut self.layout.similarity_strength, 0.001..=2.0)
+            .logarithmic(true)
+            .text("Strength"));
+
+        // Delta slider
+        let prev_delta = self.graph.score_proximity_delta;
+        ui.add(egui::Slider::new(&mut self.graph.score_proximity_delta, 0.01..=0.5)
+            .text("Delta (window)")
+            .fixed_decimals(2));
+        let delta_changed = (self.graph.score_proximity_delta - prev_delta).abs() > 0.001;
+
+        // Edge opacity slider
+        ui.add(egui::Slider::new(&mut self.proximity_edge_opacity, 0.0..=1.0)
+            .text("Edge opacity")
+            .fixed_decimals(2));
+
+        // Stiffness slider
+        ui.add(egui::Slider::new(&mut self.proximity_stiffness, 0.1..=10.0)
+            .logarithmic(true)
+            .text("Stiffness"));
+
+        // Max edges dropdown
+        let edge_limits = [
+            (10_000_usize, "10k"),
+            (50_000, "50k"),
+            (100_000, "100k"),
+            (250_000, "250k"),
+            (500_000, "500k"),
+            (1_000_000, "1M"),
+        ];
+        let current_limit = self.graph.max_proximity_edges;
+        let current_label = edge_limits.iter()
+            .find(|(v, _)| *v == current_limit)
+            .map(|(_, l)| *l)
+            .unwrap_or("Custom");
+        let prev_max = self.graph.max_proximity_edges;
+
+        ui.horizontal(|ui| {
+            ui.label("Max edges:");
+            egui::ComboBox::from_id_salt("max_proximity_edges")
+                .selected_text(current_label)
+                .show_ui(ui, |ui| {
+                    for (value, label) in edge_limits {
+                        if ui.selectable_label(current_limit == value, label).clicked() {
+                            self.graph.max_proximity_edges = value;
+                        }
+                    }
+                });
+        });
+        let max_changed = self.graph.max_proximity_edges != prev_max;
+
+        // Max neighbors per node dropdown
+        let neighbor_limits: [(usize, &str); 8] = [
+            (0, "Unlimited"),
+            (1, "1"),
+            (2, "2"),
+            (3, "3"),
+            (5, "5"),
+            (8, "8"),
+            (12, "12"),
+            (20, "20"),
+        ];
+        let current_neighbors = self.graph.max_neighbors_per_node;
+        let current_n_label = neighbor_limits.iter()
+            .find(|(v, _)| *v == current_neighbors)
+            .map(|(_, l)| *l)
+            .unwrap_or("Custom");
+        let prev_neighbors = self.graph.max_neighbors_per_node;
+
+        ui.horizontal(|ui| {
+            ui.label("Max neighbors:");
+            egui::ComboBox::from_id_salt("max_neighbors_per_node")
+                .selected_text(current_n_label)
+                .show_ui(ui, |ui| {
+                    for (value, label) in neighbor_limits {
+                        if ui.selectable_label(current_neighbors == value, label).clicked() {
+                            self.graph.max_neighbors_per_node = value;
+                        }
+                    }
+                });
+        });
+        let max_n_changed = self.graph.max_neighbors_per_node != prev_neighbors;
+
+        ui.separator();
+
+        // Show total edge count and scored nodes
+        let display_count = if self.graph.max_neighbors_per_node > 0 {
+            self.proximity_edge_count_filtered
+        } else {
+            self.total_proximity_edge_count()
+        };
+        ui.label(format!("Total edges: {}", display_count));
+        if self.any_proximity_active() {
+            let all_scores: HashSet<&String> = self.proximity_queries.iter()
+                .filter(|q| q.active)
+                .flat_map(|q| q.scores.keys())
+                .collect();
+            let matched = self.graph.data.nodes.iter()
+                .filter(|n| all_scores.contains(&n.id))
+                .count();
+            ui.label(format!("Scored nodes: {} / {}", matched, self.graph.data.nodes.len()));
+        }
+
+        // Rebuild All / Clear All buttons
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.any_proximity_loading() && !self.proximity_queries.is_empty(),
+                egui::Button::new("Rebuild All")).clicked()
+            {
+                self.refetch_all_proximity_queries();
+            }
+            if ui.button("Clear All").clicked() {
+                self.clear_proximity();
+            }
+        });
+
+        // Auto-refetch when delta, max_edges, or max_neighbors change
+        if (delta_changed || max_changed || max_n_changed) && !self.any_proximity_loading() && !self.proximity_queries.is_empty() {
+            self.refetch_all_proximity_queries();
+        }
+    }
+
+    /// Render floating popup windows for edge settings (called from update() at ctx level)
+    fn render_edge_popups(&mut self, ctx: &egui::Context) {
+        let popup = match self.edge_popup_open {
+            Some(p) => p,
+            None => return,
+        };
+
+        let (title, popup_variant) = match popup {
+            EdgePopup::Physics => ("Physics Settings", EdgePopup::Physics),
+            EdgePopup::LayoutShaping => ("Layout Shaping", EdgePopup::LayoutShaping),
+            EdgePopup::TemporalClustering => ("Temporal Clustering", EdgePopup::TemporalClustering),
+            EdgePopup::ScoreProximity => ("Score-Proximity Edges", EdgePopup::ScoreProximity),
+        };
+
+        let mut open = true;
+
+        // Default position: just right of sidebar
+        let default_x = 240.0;
+        let default_y = 100.0;
+
+        let window = egui::Window::new(title)
+            .open(&mut open)
+            .default_pos([default_x, default_y])
+            .resizable(false)
+            .collapsible(false);
+
+        // Score-Proximity gets a scroll area due to its length
+        if matches!(popup_variant, EdgePopup::ScoreProximity) {
+            window.default_size([320.0, 500.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.render_proximity_popup(ui);
+                    });
+                });
+        } else {
+            window.auto_sized()
+                .show(ctx, |ui| {
+                    match popup_variant {
+                        EdgePopup::Physics => self.render_physics_popup(ui),
+                        EdgePopup::LayoutShaping => self.render_layout_shaping_popup(ui),
+                        EdgePopup::TemporalClustering => self.render_temporal_popup(ui),
+                        EdgePopup::ScoreProximity => unreachable!(),
+                    }
+                });
+        }
+
+        if !open {
+            self.edge_popup_open = None;
+        }
     }
 
     fn render_sidebar_filters(&mut self, ui: &mut egui::Ui) {
@@ -5432,6 +5614,7 @@ impl eframe::App for DashboardApp {
 
         // Floating summary window (rendered before panels so it floats on top)
         self.render_summary_window(ctx);
+        self.render_edge_popups(ctx);
 
         // Sidebar
         egui::SidePanel::left("sidebar")
