@@ -281,47 +281,49 @@ impl DbClient {
             }
 
             // Fetch semantic filter matches for all message IDs
+            // Batched to stay under SQLite's 999 bind parameter limit
             if !nodes.is_empty() {
                 let message_ids: Vec<i32> = nodes.iter()
                     .filter_map(|n| n.id.parse::<i32>().ok())
                     .collect();
 
                 if !message_ids.is_empty() {
-                    // SQLite doesn't support ANY($1) with arrays.
-                    // Build a dynamic IN clause with positional params.
-                    let placeholders: Vec<String> = (1..=message_ids.len())
-                        .map(|i| format!("?{}", i))
-                        .collect();
-                    let in_clause = placeholders.join(", ");
-                    let sql = format!(
-                        r#"
-                        SELECT
-                            r.message_id,
-                            r.filter_id
-                        FROM semantic_filter_results r
-                        JOIN semantic_filters f ON r.filter_id = f.id
-                        WHERE r.message_id IN ({})
-                          AND r.matches = 1
-                          AND f.is_active = 1
-                        "#,
-                        in_clause
-                    );
-
-                    let mut query = sqlx::query_as::<_, FilterMatchRow>(&sql);
-                    for id in &message_ids {
-                        query = query.bind(id);
-                    }
-
-                    let filter_matches: Vec<FilterMatchRow> = query
-                        .fetch_all(&self.pool)
-                        .await
-                        .unwrap_or_default();
-
-                    // Build message_id -> filter_ids mapping
                     let mut matches_map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
-                    for row in filter_matches {
-                        if let Ok(msg_id) = i32::try_from(row.message_id) {
-                            matches_map.entry(msg_id).or_default().push(row.filter_id);
+                    const BATCH_SIZE: usize = 900;
+
+                    for batch in message_ids.chunks(BATCH_SIZE) {
+                        let placeholders: Vec<String> = (1..=batch.len())
+                            .map(|i| format!("?{}", i))
+                            .collect();
+                        let in_clause = placeholders.join(", ");
+                        let sql = format!(
+                            r#"
+                            SELECT
+                                r.message_id,
+                                r.filter_id
+                            FROM semantic_filter_results r
+                            JOIN semantic_filters f ON r.filter_id = f.id
+                            WHERE r.message_id IN ({})
+                              AND r.matches = 1
+                              AND f.is_active = 1
+                            "#,
+                            in_clause
+                        );
+
+                        let mut query = sqlx::query_as::<_, FilterMatchRow>(&sql);
+                        for id in batch {
+                            query = query.bind(id);
+                        }
+
+                        let filter_matches: Vec<FilterMatchRow> = query
+                            .fetch_all(&self.pool)
+                            .await
+                            .unwrap_or_default();
+
+                        for row in filter_matches {
+                            if let Ok(msg_id) = i32::try_from(row.message_id) {
+                                matches_map.entry(msg_id).or_default().push(row.filter_id);
+                            }
                         }
                     }
 
@@ -336,33 +338,37 @@ impl DbClient {
                 }
             }
 
-            // Identify messages with tool usages
+            // Identify messages with tool usages (batched for SQLite limit)
             if !nodes.is_empty() {
                 let message_ids: Vec<i32> = nodes.iter()
                     .filter_map(|n| n.id.parse::<i32>().ok())
                     .collect();
 
                 if !message_ids.is_empty() {
-                    let placeholders: Vec<String> = (1..=message_ids.len())
-                        .map(|i| format!("?{}", i))
-                        .collect();
-                    let in_clause = placeholders.join(", ");
-                    let sql = format!(
-                        "SELECT DISTINCT message_id FROM tool_usages WHERE message_id IN ({})",
-                        in_clause
-                    );
+                    let mut tool_msg_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
-                    let mut query = sqlx::query_scalar::<_, i32>(&sql);
-                    for id in &message_ids {
-                        query = query.bind(id);
+                    for batch in message_ids.chunks(900) {
+                        let placeholders: Vec<String> = (1..=batch.len())
+                            .map(|i| format!("?{}", i))
+                            .collect();
+                        let in_clause = placeholders.join(", ");
+                        let sql = format!(
+                            "SELECT DISTINCT message_id FROM tool_usages WHERE message_id IN ({})",
+                            in_clause
+                        );
+
+                        let mut query = sqlx::query_scalar::<_, i32>(&sql);
+                        for id in batch {
+                            query = query.bind(id);
+                        }
+
+                        let batch_results: Vec<i32> = query
+                            .fetch_all(&self.pool)
+                            .await
+                            .unwrap_or_default();
+
+                        tool_msg_ids.extend(batch_results);
                     }
-
-                    let tool_msg_ids: std::collections::HashSet<i32> = query
-                        .fetch_all(&self.pool)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect();
 
                     for node in &mut nodes {
                         if let Ok(msg_id) = node.id.parse::<i32>() {
