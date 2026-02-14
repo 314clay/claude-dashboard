@@ -52,6 +52,18 @@ def _run_migrations():
         cur.execute("ALTER TABLE semantic_filters ADD COLUMN filter_type TEXT NOT NULL DEFAULT 'semantic'")
         conn.commit()
 
+    # Create llm_cache table if it doesn't exist
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS llm_cache (
+            prompt_hash   TEXT PRIMARY KEY,
+            model         TEXT,
+            response      TEXT NOT NULL,
+            tokens_used   INTEGER,
+            created_at    TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
     cur.close()
     conn.close()
 

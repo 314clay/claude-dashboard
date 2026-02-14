@@ -47,79 +47,57 @@ enum EdgePopup {
 }
 
 /// Time range options for filtering
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TimeRange {
-    Hour1,
-    Hour6,
-    Hour24,
-    Day3,
-    Week1,
-    Week2,
-    Month1,
-    Month3,
+/// Format hours into a human-readable time range label
+fn format_hours_label(hours: f32) -> String {
+    if hours < 2.0 {
+        format!("{:.0} hour", hours)
+    } else if hours < 48.0 {
+        format!("{:.0} hours", hours)
+    } else if hours < 336.0 {
+        let days = hours / 24.0;
+        if days == days.round() {
+            format!("{:.0} days", days)
+        } else {
+            format!("{:.1} days", days)
+        }
+    } else if hours < 1440.0 {
+        let weeks = hours / 168.0;
+        if weeks == weeks.round() {
+            format!("{:.0} weeks", weeks)
+        } else {
+            format!("{:.1} weeks", weeks)
+        }
+    } else {
+        let months = hours / 720.0;
+        if months == months.round() {
+            format!("{:.0} months", months)
+        } else {
+            format!("{:.1} months", months)
+        }
+    }
 }
 
-impl TimeRange {
-    fn hours(&self) -> f32 {
-        match self {
-            TimeRange::Hour1 => 1.0,
-            TimeRange::Hour6 => 6.0,
-            TimeRange::Hour24 => 24.0,
-            TimeRange::Day3 => 72.0,
-            TimeRange::Week1 => 168.0,
-            TimeRange::Week2 => 336.0,
-            TimeRange::Month1 => 720.0,
-            TimeRange::Month3 => 2160.0,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            TimeRange::Hour1 => "Past hour",
-            TimeRange::Hour6 => "Past 6 hours",
-            TimeRange::Hour24 => "Past 24 hours",
-            TimeRange::Day3 => "Past 3 days",
-            TimeRange::Week1 => "Past week",
-            TimeRange::Week2 => "Past 2 weeks",
-            TimeRange::Month1 => "Past month",
-            TimeRange::Month3 => "Past 3 months",
-        }
-    }
-
-    fn from_hours(hours: f32) -> Self {
-        if hours <= 1.0 {
-            TimeRange::Hour1
-        } else if hours <= 6.0 {
-            TimeRange::Hour6
-        } else if hours <= 24.0 {
-            TimeRange::Hour24
-        } else if hours <= 72.0 {
-            TimeRange::Day3
-        } else if hours <= 168.0 {
-            TimeRange::Week1
-        } else if hours <= 336.0 {
-            TimeRange::Week2
-        } else if hours <= 720.0 {
-            TimeRange::Month1
-        } else {
-            TimeRange::Month3
-        }
-    }
-
-    /// Get the bin duration in seconds for histogram view
-    /// Aims for ~12-30 bins depending on range
-    fn bin_duration_secs(&self) -> f64 {
-        match self {
-            TimeRange::Hour1 => 5.0 * 60.0,       // 5 min bins (12 bins)
-            TimeRange::Hour6 => 30.0 * 60.0,      // 30 min bins (12 bins)
-            TimeRange::Hour24 => 60.0 * 60.0,     // 1 hr bins (24 bins)
-            TimeRange::Day3 => 3.0 * 60.0 * 60.0, // 3 hr bins (24 bins)
-            TimeRange::Week1 => 6.0 * 60.0 * 60.0,   // 6 hr bins (28 bins)
-            TimeRange::Week2 => 12.0 * 60.0 * 60.0,  // 12 hr bins (28 bins)
-            TimeRange::Month1 => 24.0 * 60.0 * 60.0, // 1 day bins (30 bins)
-            TimeRange::Month3 => 7.0 * 24.0 * 60.0 * 60.0, // 1 week bins (~13 bins)
-        }
-    }
+/// Get histogram bin duration in seconds for a given time range in hours.
+/// Snaps to the nearest "nice" interval, targeting ~20 bins.
+fn bin_duration_for_hours(hours: f32) -> f64 {
+    let total_secs = hours as f64 * 3600.0;
+    let raw_bin = total_secs / 20.0;
+    let nice: &[f64] = &[
+        60.0,             // 1 min
+        5.0 * 60.0,      // 5 min
+        15.0 * 60.0,     // 15 min
+        30.0 * 60.0,     // 30 min
+        3600.0,           // 1 hr
+        3.0 * 3600.0,    // 3 hr
+        6.0 * 3600.0,    // 6 hr
+        12.0 * 3600.0,   // 12 hr
+        24.0 * 3600.0,   // 1 day
+        7.0 * 24.0 * 3600.0, // 1 week
+    ];
+    nice.iter()
+        .copied()
+        .min_by(|a, b| (a - raw_bin).abs().partial_cmp(&(b - raw_bin).abs()).unwrap())
+        .unwrap_or(raw_bin)
 }
 
 /// Importance scoring statistics
@@ -175,7 +153,8 @@ pub struct DashboardApp {
 
     // UI state
     sidebar_tab: SidebarTab,
-    time_range: TimeRange,
+    time_range_hours: f32,       // currently loaded time range
+    slider_hours: f32,           // pending slider value (before confirm)
     node_size: f32,
     show_arrows: bool,
     loading: bool,
@@ -422,7 +401,8 @@ impl DashboardApp {
             graph,
             layout,
             sidebar_tab: settings.sidebar_tab,
-            time_range: TimeRange::from_hours(settings.time_range_hours),
+            time_range_hours: settings.time_range_hours,
+            slider_hours: settings.time_range_hours,
             node_size: settings.node_size,
             show_arrows: settings.show_arrows,
             loading: false,
@@ -614,7 +594,7 @@ impl DashboardApp {
 
     /// Copy current UI state to settings struct
     fn sync_settings_from_ui(&mut self) {
-        self.settings.time_range_hours = self.time_range.hours();
+        self.settings.time_range_hours = self.time_range_hours;
         self.settings.node_size = self.node_size;
         self.settings.show_arrows = self.show_arrows;
         self.settings.timeline_enabled = self.timeline_enabled;
@@ -717,7 +697,7 @@ impl DashboardApp {
 
         self.loading = true;
 
-        match db.fetch_graph(self.time_range.hours(), None) {
+        match db.fetch_graph(self.time_range_hours, None) {
             Ok(data) => {
                 // Initialize with centered bounds
                 let bounds = egui::Rect::from_center_size(
@@ -1051,57 +1031,70 @@ impl DashboardApp {
         // Build adjacency list once for BFS (always include temporal for semantic filters)
         let adj = self.build_adjacency_list(true);
 
-        // Start with all nodes, then apply filters
-        let all_node_ids: HashSet<String> = self.graph.data.nodes.iter()
-            .map(|n| n.id.clone())
-            .collect();
-
-        let mut visible = all_node_ids.clone();
+        // Collect include filters (union/OR) and exclude filters separately.
+        // Multiple includes mean "match ANY include filter" (union), not all.
+        let mut include_union: HashSet<String> = HashSet::new();
+        let mut has_includes = false;
 
         for (filter_id, mode) in &self.semantic_filter_modes {
             match mode {
-                SemanticFilterMode::Off => continue,
-
-                SemanticFilterMode::Exclude => {
-                    // Remove nodes that match this filter
+                SemanticFilterMode::Include => {
+                    has_includes = true;
                     for node in &self.graph.data.nodes {
                         if node.semantic_filter_matches.contains(filter_id) {
-                            visible.remove(&node.id);
+                            include_union.insert(node.id.clone());
                         }
                     }
                 }
-
-                SemanticFilterMode::Include => {
-                    // Only keep nodes that match this filter
-                    let matching: HashSet<String> = self.graph.data.nodes.iter()
-                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
-                        .map(|n| n.id.clone())
-                        .collect();
-                    visible = visible.intersection(&matching).cloned().collect();
-                }
-
                 SemanticFilterMode::IncludePlus1 => {
-                    // Keep matching nodes + their direct neighbors
+                    has_includes = true;
                     let matching: HashSet<String> = self.graph.data.nodes.iter()
                         .filter(|n| n.semantic_filter_matches.contains(filter_id))
                         .map(|n| n.id.clone())
                         .collect();
                     let expanded = self.expand_to_neighbors(&matching, 1, &adj);
-                    visible = visible.intersection(&expanded).cloned().collect();
+                    include_union.extend(expanded);
                 }
-
                 SemanticFilterMode::IncludePlus2 => {
-                    // Keep matching nodes + neighbors up to depth 2
+                    has_includes = true;
                     let matching: HashSet<String> = self.graph.data.nodes.iter()
                         .filter(|n| n.semantic_filter_matches.contains(filter_id))
                         .map(|n| n.id.clone())
                         .collect();
                     let expanded = self.expand_to_neighbors(&matching, 2, &adj);
-                    visible = visible.intersection(&expanded).cloned().collect();
+                    include_union.extend(expanded);
+                }
+                _ => {}
+            }
+        }
+
+        // Debug: log filter state
+        eprintln!("[semantic-filter] has_includes={}, include_union.len={}, total_nodes={}, modes: {:?}",
+            has_includes, include_union.len(), self.graph.data.nodes.len(),
+            self.semantic_filter_modes.iter().map(|(id, m)| (*id, *m)).collect::<Vec<_>>());
+        // Debug: check how many nodes have any semantic_filter_matches at all
+        let nodes_with_matches = self.graph.data.nodes.iter().filter(|n| !n.semantic_filter_matches.is_empty()).count();
+        eprintln!("[semantic-filter] nodes with any filter matches: {}", nodes_with_matches);
+
+        // Start with include union (or all nodes if no includes)
+        let mut visible = if has_includes {
+            include_union
+        } else {
+            self.graph.data.nodes.iter().map(|n| n.id.clone()).collect()
+        };
+
+        // Then apply exclude filters (remove matching nodes)
+        for (filter_id, mode) in &self.semantic_filter_modes {
+            if *mode == SemanticFilterMode::Exclude {
+                for node in &self.graph.data.nodes {
+                    if node.semantic_filter_matches.contains(filter_id) {
+                        visible.remove(&node.id);
+                    }
                 }
             }
         }
 
+        eprintln!("[semantic-filter] final visible: {}", visible.len());
         Some(visible)
     }
 
@@ -1110,26 +1103,28 @@ impl DashboardApp {
     fn node_passes_semantic_filters(&self, node: &crate::graph::types::GraphNode) -> bool {
         // For simple Include/Exclude, do quick per-node check
         // For +1/+2 modes, we need the pre-computed set (caller should use compute_semantic_filter_visible_set)
+
+        // Check excludes first — any exclude match hides the node
         for (filter_id, mode) in &self.semantic_filter_modes {
-            match mode {
-                SemanticFilterMode::Off => continue,
-                SemanticFilterMode::Include => {
-                    if !node.semantic_filter_matches.contains(filter_id) {
-                        return false;
-                    }
-                }
-                SemanticFilterMode::Exclude => {
-                    if node.semantic_filter_matches.contains(filter_id) {
-                        return false;
-                    }
-                }
-                // For +1/+2, this method is not accurate - use compute_semantic_filter_visible_set instead
-                SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2 => {
-                    // Fall through - will be handled by the pre-computed set
-                    continue;
-                }
+            if *mode == SemanticFilterMode::Exclude && node.semantic_filter_matches.contains(filter_id) {
+                return false;
             }
         }
+
+        // Check includes — node must match ANY active include filter (OR logic)
+        let has_includes = self.semantic_filter_modes.iter()
+            .any(|(_, mode)| *mode == SemanticFilterMode::Include);
+
+        if has_includes {
+            let matches_any = self.semantic_filter_modes.iter()
+                .any(|(filter_id, mode)| {
+                    *mode == SemanticFilterMode::Include && node.semantic_filter_matches.contains(filter_id)
+                });
+            if !matches_any {
+                return false;
+            }
+        }
+
         true
     }
 
@@ -1403,6 +1398,8 @@ impl DashboardApp {
             Ok(filter) => {
                 self.semantic_filters.push(filter);
                 self.semantic_filter_cache = None;
+                // Reload graph so nodes pick up new semantic_filter_matches
+                self.load_graph();
             }
             Err(e) => {
                 eprintln!("Failed to create rule filter: {}", e);
@@ -2296,28 +2293,21 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Data Selection")
             .default_open(true)
             .show(ui, |ui| {
-                let prev_range = self.time_range;
-                egui::ComboBox::from_id_salt("time_range")
-                    .selected_text(self.time_range.label())
-                    .show_ui(ui, |ui| {
-                        for range in [
-                            TimeRange::Hour1,
-                            TimeRange::Hour6,
-                            TimeRange::Hour24,
-                            TimeRange::Day3,
-                            TimeRange::Week1,
-                            TimeRange::Week2,
-                            TimeRange::Month1,
-                            TimeRange::Month3,
-                        ] {
-                            ui.selectable_value(&mut self.time_range, range, range.label());
-                        }
-                    });
-
-                if self.time_range != prev_range {
-                    self.load_graph();
-                    self.mark_settings_dirty();
-                }
+                ui.label(format!("Range: {}", format_hours_label(self.slider_hours)));
+                ui.add(
+                    egui::Slider::new(&mut self.slider_hours, 1.0..=2160.0)
+                        .logarithmic(true)
+                        .clamping(egui::SliderClamping::Always)
+                        .show_value(false),
+                );
+                let changed = (self.slider_hours - self.time_range_hours).abs() > 0.5;
+                ui.add_enabled_ui(changed, |ui| {
+                    if ui.button("Load").clicked() {
+                        self.time_range_hours = self.slider_hours;
+                        self.load_graph();
+                        self.mark_settings_dirty();
+                    }
+                });
 
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
@@ -4675,14 +4665,9 @@ impl DashboardApp {
                         // Project
                         lines.push(format!("Project: {}", node.project));
 
-                        // Timestamp — compact "YYYY-MM-DD HH:MM"
-                        if let Some(ref ts) = node.timestamp {
-                            let display_ts = if ts.len() >= 16 {
-                                ts[..16].replace('T', " ")
-                            } else {
-                                ts.clone()
-                            };
-                            lines.push(format!("Time: {}", display_ts));
+                        // Timestamp — relative "3 hours ago", "Yesterday at 2:30 PM", etc.
+                        if let Some(secs) = node.timestamp_secs() {
+                            lines.push(format!("Time: {}", self.graph.timeline.format_time(secs)));
                         }
 
                         // Tokens — compact "1.2k in / 3.4k out"
@@ -5202,7 +5187,7 @@ impl DashboardApp {
             let count = ((visible_range_secs / bin_dur as f64).ceil() as usize).max(1);
             (start_dt, bin_dur, count)
         } else {
-            let bin_dur = self.time_range.bin_duration_secs() as i64;
+            let bin_dur = bin_duration_for_hours(self.time_range_hours) as i64;
             let data_start = parsed_nodes.first().unwrap().0;
             let data_end = parsed_nodes.last().unwrap().0;
             let range_secs = (data_end - data_start).num_seconds();
@@ -5310,7 +5295,7 @@ impl DashboardApp {
         let min_time = self.graph.timeline.min_time;
         let max_time = self.graph.timeline.max_time;
         let histogram_mode = self.timeline_histogram_mode;
-        let bin_duration = self.time_range.bin_duration_secs();
+        let bin_duration = bin_duration_for_hours(self.time_range_hours);
 
         // Helper to calculate position from time
         let position_at_time = |t: f64| -> f32 {
@@ -5562,6 +5547,10 @@ impl eframe::App for DashboardApp {
 
         // Rebuild effective visible set when any filter changed
         if self.effective_visible_dirty {
+            eprintln!("[rebuild] effective_visible_dirty=true, cache={}, has_active={}, modes={:?}",
+                if self.semantic_filter_cache.is_some() { "Some" } else { "None" },
+                self.has_active_semantic_filters(),
+                self.semantic_filter_modes.iter().map(|(id, m)| (*id, *m)).collect::<Vec<_>>());
             self.rebuild_effective_visible_set();
             self.temporal_edges_dirty = true; // visible set changed → edges need rebuild
         }

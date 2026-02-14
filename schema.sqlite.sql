@@ -178,6 +178,19 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
 );
 
 -- ============================================================
+-- LLM CACHE TABLE
+-- Caches LLM text-generation responses by prompt hash.
+-- Prevents re-running identical LLM calls after app restart.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS llm_cache (
+    prompt_hash   TEXT PRIMARY KEY,   -- SHA-256 of serialized messages + model + max_tokens
+    model         TEXT,
+    response      TEXT NOT NULL,
+    tokens_used   INTEGER,            -- optional, for tracking savings
+    created_at    TEXT DEFAULT (datetime('now'))
+);
+
+-- ============================================================
 -- DAILY USAGE TABLE
 -- Per-day, per-model token usage from stats-cache.json.
 -- ============================================================
