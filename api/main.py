@@ -41,8 +41,10 @@ from db.semantic_filters import (
 )
 from db.semantic_filter_scorer import (
     categorize_messages,
+    categorize_messages_visible,
     get_filter_stats,
 )
+from db.rule_filter_scorer import score_rule_filter
 from db.embeddings import (
     get_embedding_stats,
     generate_embeddings,
@@ -78,6 +80,7 @@ app.add_middleware(
 class SemanticFilterCreate(BaseModel):
     name: str
     query_text: str
+    filter_type: str = 'semantic'
 
 
 class RescoreRequest(BaseModel):
@@ -90,6 +93,10 @@ class NeighborhoodSummaryRequest(BaseModel):
 
 class SimilaritySearchRequest(BaseModel):
     query_text: str
+
+
+class CategorizeVisibleRequest(BaseModel):
+    message_ids: list[int]
 
 
 class ProximityEdgesRequest(BaseModel):
@@ -396,11 +403,19 @@ def list_semantic_filters():
 def create_semantic_filter(body: SemanticFilterCreate):
     """Create a new semantic filter.
 
-    Body: { name, query_text }
-    Returns the created filter.
+    Body: { name, query_text, filter_type? }
+    Returns the created filter. Rule filters are auto-scored immediately.
     """
     try:
-        filter_data = create_filter(body.name, body.query_text)
+        filter_data = create_filter(body.name, body.query_text, body.filter_type)
+
+        # Auto-score rule filters immediately
+        if body.filter_type == 'rule':
+            result = score_rule_filter(filter_data['id'], body.query_text)
+            # Update the returned filter with fresh counts
+            filter_data['total_scored'] = result['scored']
+            filter_data['matches'] = result['matches']
+
         return {"success": True, "filter": filter_data}
     except Exception as e:
         # Likely unique constraint violation on name
@@ -437,17 +452,40 @@ def categorize_filter_messages(
     filter_id: int,
     batch_size: int = Query(default=50, description="Messages per LLM call (50-100 recommended)"),
     max_messages: int = Query(default=5000, description="Maximum messages to process"),
+    max_concurrent: int = Query(default=4, ge=1, le=8, description="Max parallel LLM calls (1-8)"),
 ):
     """Trigger categorization for a semantic filter.
 
-    Scores unscored messages against all active filters in batches.
-    Uses Gemini to determine which messages match the filter criteria.
+    For rule-based filters, scores instantly without LLM.
+    For semantic filters, scores unscored messages in parallel batches via LLM.
 
-    This may take several seconds depending on the number of unscored messages.
+    Returns: { filter_id, scored, matches, ... }
+    """
+    # Check if this is a rule filter
+    status = get_filter_status(filter_id)
+    if status and status.get('filter_type') == 'rule':
+        return score_rule_filter(filter_id, status['query_text'])
 
+    return categorize_messages(filter_id, batch_size, max_messages, max_concurrent)
+
+
+@app.post("/semantic-filters/{filter_id}/categorize-visible")
+def categorize_filter_messages_visible(
+    filter_id: int,
+    body: CategorizeVisibleRequest,
+    batch_size: int = Query(default=50, description="Messages per LLM call (50-100 recommended)"),
+    max_concurrent: int = Query(default=4, ge=1, le=8, description="Max parallel LLM calls (1-8)"),
+):
+    """Trigger categorization for a semantic filter on specific message IDs only.
+
+    Scores only the provided messages (skipping already-scored ones) against all
+    active filters in parallel batches. Useful for scoring only currently visible
+    graph nodes.
+
+    Body: { message_ids: [1, 2, 3, ...] }
     Returns: { filter_id, scored, matches, batches_processed, errors }
     """
-    return categorize_messages(filter_id, batch_size, max_messages)
+    return categorize_messages_visible(filter_id, body.message_ids, batch_size, max_concurrent)
 
 
 @app.get("/semantic-filters/stats")

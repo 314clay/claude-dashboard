@@ -40,8 +40,25 @@ def _ensure_db():
         conn.close()
 
 
+def _run_migrations():
+    """Run idempotent schema migrations for columns added after initial release."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Check if filter_type column exists on semantic_filters
+    cur.execute("PRAGMA table_info(semantic_filters)")
+    columns = [row[1] for row in cur.fetchall()]
+    if 'filter_type' not in columns:
+        cur.execute("ALTER TABLE semantic_filters ADD COLUMN filter_type TEXT NOT NULL DEFAULT 'semantic'")
+        conn.commit()
+
+    cur.close()
+    conn.close()
+
+
 # Initialize on import
 _ensure_db()
+_run_migrations()
 
 
 def get_connection() -> sqlite3.Connection:

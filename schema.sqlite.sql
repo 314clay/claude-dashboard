@@ -125,11 +125,12 @@ CREATE TABLE IF NOT EXISTS session_summaries (
 -- User-defined natural-language filters for graph visualization.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS semantic_filters (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT    NOT NULL,
-    query_text TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    is_active  INTEGER NOT NULL DEFAULT 1,   -- 0/1 boolean
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    query_text  TEXT    NOT NULL,
+    filter_type TEXT    NOT NULL DEFAULT 'semantic',  -- 'semantic' or 'rule'
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    is_active   INTEGER NOT NULL DEFAULT 1,   -- 0/1 boolean
 
     UNIQUE (name)
 );

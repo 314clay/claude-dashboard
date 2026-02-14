@@ -2,9 +2,10 @@
 
 use crate::api::{ApiClient, EmbeddingGenResult, EmbeddingStats, FilterStatusResponse, IngestResult, RescoreEvent, RescoreProgress, RescoreResult};
 use crate::db::DbClient;
-use crate::graph::types::{ColorMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
+use crate::graph::types::{ColorMode, FilterMode, GraphEdge, NeighborhoodSummaryData, PartialSummaryData, SemanticFilter, SemanticFilterMode, SessionSummaryData};
 use crate::graph::{ForceLayout, GraphState};
 use crate::mail::{MailNetworkState, render_mail_network};
+use crate::project_tree::{self, CheckState, ProjectTreeNode};
 use crate::settings::{Preset, Settings, SidebarTab, SizingPreset};
 use crate::theme;
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
@@ -194,7 +195,7 @@ pub struct DashboardApp {
 
     // Importance filtering
     importance_threshold: f32,
-    importance_filter_enabled: bool,
+    importance_filter: FilterMode,
     importance_stats: Option<ImportanceStats>,
     rescore_loading: bool,
     rescore_receiver: Option<Receiver<RescoreEvent>>,
@@ -202,13 +203,16 @@ pub struct DashboardApp {
     rescore_progress: Option<RescoreProgress>,
 
     // Tool usage filtering
-    hide_tool_uses: bool,
-    tool_use_bypass_edges: Vec<crate::graph::types::GraphEdge>,
+    tool_use_filter: FilterMode,
+    bypass_edges: Vec<crate::graph::types::GraphEdge>,
 
     // Project filtering
-    project_filter_enabled: bool,
+    project_filter: FilterMode,
     selected_projects: HashSet<String>,
     available_projects: Vec<String>,
+    project_tree: Option<ProjectTreeNode>,
+    /// Tracks which tree nodes are expanded in the UI (by full_path).
+    project_tree_expanded: HashSet<String>,
 
     // Debug tooltip
     debug_tooltip: bool,
@@ -258,6 +262,13 @@ pub struct DashboardApp {
     // Floating summary window state
     summary_window_open: bool,
     summary_window_dragged: bool,
+
+    // Floating neighborhood window state
+    neighborhood_window_open: bool,
+    neighborhood_window_dragged: bool,
+
+    // Resume session clipboard feedback
+    resume_copied_at: Option<Instant>,
 
     // Double-click detection
     last_click_time: Instant,
@@ -341,6 +352,14 @@ pub struct DashboardApp {
     ingest_loading: bool,
     ingest_receiver: Option<Receiver<Result<IngestResult, String>>>,
     ingest_result: Option<IngestResult>,
+
+    // Effective visible set: unified set of nodes passing ALL filters
+    // Rebuilt when any filter changes (dirty flag), used for edge rendering,
+    // hover detection, physics, counters, and temporal edge rebuilds.
+    effective_visible_nodes: HashSet<String>,
+    effective_visible_count: usize,
+    effective_visible_dirty: bool,
+    temporal_edges_dirty: bool,
 }
 
 impl DashboardApp {
@@ -417,16 +436,18 @@ impl DashboardApp {
             max_node_multiplier: settings.max_node_multiplier,
             temporal_edge_opacity: settings.temporal_edge_opacity,
             importance_threshold: settings.importance_threshold,
-            importance_filter_enabled: settings.importance_filter_enabled,
+            importance_filter: settings.importance_filter,
             importance_stats: None,
             rescore_loading: false,
             rescore_receiver: None,
             rescore_result: None,
             rescore_progress: None,
-            hide_tool_uses: false,
-            tool_use_bypass_edges: Vec::new(),
-            project_filter_enabled: false,
+            tool_use_filter: settings.tool_use_filter,
+            bypass_edges: Vec::new(),
+            project_filter: settings.project_filter,
             selected_projects: HashSet::new(),
+            project_tree: None,
+            project_tree_expanded: HashSet::new(),
             available_projects: Vec::new(),
             debug_tooltip: false,
             pan_offset: Vec2::ZERO,
@@ -469,6 +490,13 @@ impl DashboardApp {
             // Floating summary window state
             summary_window_open: false,
             summary_window_dragged: false,
+
+            // Floating neighborhood window state
+            neighborhood_window_open: false,
+            neighborhood_window_dragged: false,
+
+            // Resume session clipboard feedback
+            resume_copied_at: None,
 
             // Double-click detection
             last_click_time: Instant::now(),
@@ -548,6 +576,12 @@ impl DashboardApp {
             ingest_loading: false,
             ingest_receiver: None,
             ingest_result: None,
+
+            // Effective visible set
+            effective_visible_nodes: HashSet::new(),
+            effective_visible_count: 0,
+            effective_visible_dirty: true,
+            temporal_edges_dirty: false,
         };
 
         // Load initial data if connected
@@ -587,7 +621,9 @@ impl DashboardApp {
         self.settings.hover_scrubs_timeline = self.hover_scrubs_timeline;
         self.settings.color_mode = self.graph.color_mode;
         self.settings.importance_threshold = self.importance_threshold;
-        self.settings.importance_filter_enabled = self.importance_filter_enabled;
+        self.settings.importance_filter = self.importance_filter;
+        self.settings.tool_use_filter = self.tool_use_filter;
+        self.settings.project_filter = self.project_filter;
         self.settings.sizing_preset = self.sizing_preset;
         self.settings.w_importance = self.w_importance;
         self.settings.w_tokens = self.w_tokens;
@@ -629,7 +665,9 @@ impl DashboardApp {
         self.graph.color_mode = self.settings.color_mode;
         self.graph.timeline.speed = self.settings.timeline_speed;
         self.importance_threshold = self.settings.importance_threshold;
-        self.importance_filter_enabled = self.settings.importance_filter_enabled;
+        self.importance_filter = self.settings.importance_filter;
+        self.tool_use_filter = self.settings.tool_use_filter;
+        self.project_filter = self.settings.project_filter;
         self.sizing_preset = self.settings.sizing_preset;
         self.w_importance = self.settings.w_importance;
         self.w_tokens = self.settings.w_tokens;
@@ -688,12 +726,8 @@ impl DashboardApp {
                 );
                 self.graph.load(data, bounds);
                 self.loading = false;
-                self.semantic_filter_cache = None;  // Invalidate cache
-
-                // Recompute bypass edges if tool-use hiding is on
-                if self.hide_tool_uses {
-                    self.tool_use_bypass_edges = self.compute_tool_use_bypass_edges();
-                }
+                self.semantic_filter_cache = None;
+                self.effective_visible_dirty = true;  // Invalidate cache
 
                 // Extract available projects from nodes
                 let projects: HashSet<String> = self.graph.data.nodes.iter()
@@ -705,6 +739,9 @@ impl DashboardApp {
                 self.available_projects = sorted_projects;
                 // Select all projects by default
                 self.selected_projects = self.available_projects.iter().cloned().collect();
+                // Build hierarchical tree for project filter UI
+                self.project_tree = Some(ProjectTreeNode::build(&self.available_projects));
+                self.project_tree_expanded.clear();
 
                 // Populate session metadata cache for histogram sorting
                 self.session_metadata_cache.clear();
@@ -739,6 +776,11 @@ impl DashboardApp {
                 self.db_error = Some(e);
                 self.loading = false;
             }
+        }
+
+        // Recompute bypass edges after data load (outside match to avoid borrow conflict)
+        if !self.loading {
+            self.recompute_bypass_edges();
         }
     }
 
@@ -857,16 +899,53 @@ impl DashboardApp {
         closest_node.cloned()
     }
 
-    /// Compute bypass edges for hiding tool-use nodes.
-    /// For each session chain A → T1 → T2 → ... → B where T* are tool-use nodes,
-    /// creates a direct edge A → B.
-    fn compute_tool_use_bypass_edges(&self) -> Vec<crate::graph::types::GraphEdge> {
-        let tool_use_ids: HashSet<&str> = self.graph.data.nodes.iter()
-            .filter(|n| n.has_tool_usage)
-            .map(|n| n.id.as_str())
-            .collect();
+    /// Collect node IDs into inactive and filtered sets based on active filters.
+    /// First-match-wins order: tool_use → importance → project.
+    fn collect_filter_sets(&self) -> (HashSet<String>, HashSet<String>) {
+        let mut inactive = HashSet::new();
+        let mut filtered = HashSet::new();
 
-        if tool_use_ids.is_empty() {
+        for node in &self.graph.data.nodes {
+            // Tool use filter
+            if self.tool_use_filter.is_active() && node.has_tool_usage {
+                match self.tool_use_filter {
+                    FilterMode::Inactive => { inactive.insert(node.id.clone()); }
+                    FilterMode::Filtered => { filtered.insert(node.id.clone()); }
+                    FilterMode::Off => {}
+                }
+                continue;
+            }
+            // Importance filter
+            if self.importance_filter.is_active() {
+                if let Some(score) = node.importance_score {
+                    if score < self.importance_threshold {
+                        match self.importance_filter {
+                            FilterMode::Inactive => { inactive.insert(node.id.clone()); }
+                            FilterMode::Filtered => { filtered.insert(node.id.clone()); }
+                            FilterMode::Off => {}
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Project filter
+            if self.project_filter.is_active() && !self.selected_projects.contains(&node.project) {
+                match self.project_filter {
+                    FilterMode::Inactive => { inactive.insert(node.id.clone()); }
+                    FilterMode::Filtered => { filtered.insert(node.id.clone()); }
+                    FilterMode::Off => {}
+                }
+            }
+        }
+
+        (inactive, filtered)
+    }
+
+    /// Compute bypass edges that bridge over inactive nodes.
+    /// Walks session chains (non-temporal, non-similarity edges),
+    /// bridges over inactive_ids, stops at filtered_ids.
+    fn compute_bypass_edges(&self, inactive: &HashSet<String>, filtered: &HashSet<String>) -> Vec<GraphEdge> {
+        if inactive.is_empty() {
             return Vec::new();
         }
 
@@ -878,19 +957,21 @@ impl DashboardApp {
             }
         }
 
-        // For each non-tool-use node, walk forward through tool-use nodes to find the next visible node
         let mut bypass = Vec::new();
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
 
         for node in &self.graph.data.nodes {
-            if tool_use_ids.contains(node.id.as_str()) {
-                continue; // Skip tool-use nodes as sources
+            if inactive.contains(&node.id) || filtered.contains(&node.id) {
+                continue; // Skip hidden nodes as sources
             }
 
             // Walk the chain from this node
             let mut cursor = node.id.as_str();
             while let Some(&successor) = next.get(cursor) {
-                if !tool_use_ids.contains(successor) {
+                if filtered.contains(successor) {
+                    break; // Stop at truly removed nodes
+                }
+                if !inactive.contains(successor) {
                     // Successor is visible — if we skipped any nodes, create bypass edge
                     if cursor != node.id.as_str() {
                         let pair = (node.id.clone(), successor.to_string());
@@ -916,6 +997,31 @@ impl DashboardApp {
         }
 
         bypass
+    }
+
+    /// Convenience: collect filter sets and recompute bypass edges
+    fn recompute_bypass_edges(&mut self) {
+        let (inactive, filtered) = self.collect_filter_sets();
+        self.bypass_edges = self.compute_bypass_edges(&inactive, &filtered);
+    }
+
+    /// Returns true if a node is hidden by any active filter (tool_use, importance, project).
+    /// Does NOT check timeline or semantic filters (those are handled separately).
+    fn is_node_hidden(&self, node: &crate::graph::types::GraphNode) -> bool {
+        if self.tool_use_filter.is_active() && node.has_tool_usage {
+            return true;
+        }
+        if self.importance_filter.is_active() {
+            if let Some(score) = node.importance_score {
+                if score < self.importance_threshold {
+                    return true;
+                }
+            }
+        }
+        if self.project_filter.is_active() && !self.selected_projects.contains(&node.project) {
+            return true;
+        }
+        false
     }
 
     /// Check if any semantic filters are active (not Off)
@@ -1086,57 +1192,16 @@ impl DashboardApp {
         false
     }
 
-    /// Compute which nodes should participate in physics simulation
-    /// Returns None if no filtering is active (simulate all nodes)
-    /// Returns Some(HashSet) with visible node IDs when filtering is active
+    /// Compute which nodes should participate in physics simulation.
+    /// Uses the effective visible set + adds same-project future nodes.
+    /// Returns None if no filtering is active (simulate all nodes).
     fn compute_physics_visible_nodes(&self) -> Option<HashSet<String>> {
-        // If no filters active, return None (simulate all)
-        let semantic_filter_active = self.has_active_semantic_filters();
-        if !self.timeline_enabled && !self.importance_filter_enabled && !self.project_filter_enabled && !semantic_filter_active && !self.any_proximity_active() && !self.hide_tool_uses {
+        if !self.any_filter_active() && !self.any_proximity_active() {
             return None;
         }
 
-        // Use cached semantic filter visible set (computed once per frame in update())
-        let semantic_visible = self.semantic_filter_cache.clone();
-
-        let mut visible = HashSet::new();
-        for node in &self.graph.data.nodes {
-            // Timeline filter
-            if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
-                continue;
-            }
-            // Importance filter
-            if self.importance_filter_enabled {
-                if let Some(score) = node.importance_score {
-                    if score < self.importance_threshold {
-                        continue;
-                    }
-                }
-            }
-            // Project filter
-            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                continue;
-            }
-            // Session filter (histogram drill-down)
-            if let Some(ref sf) = self.histogram_session_filter {
-                if node.session_id != *sf { continue; }
-            }
-            // Semantic filter - use pre-computed set for +1/+2, otherwise per-node check
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&node.id) {
-                    continue;
-                }
-            }
-            // Hide tool uses
-            if self.hide_tool_uses && node.has_tool_usage {
-                continue;
-            }
-            // Proximity filter: when active, all scored nodes participate in physics
-            // (no threshold-based hiding — proximity colors by heat map instead)
-            visible.insert(node.id.clone());
-        }
-
-        // Add same-project future nodes to physics simulation
+        // Clone effective visible set and add same-project future nodes
+        let mut visible = self.effective_visible_nodes.clone();
         for node in &self.graph.data.nodes {
             if self.is_same_project_future_node(node) {
                 visible.insert(node.id.clone());
@@ -1273,11 +1338,11 @@ impl DashboardApp {
         self.neighborhood_summary_center_node = Some(node_id);
         self.neighborhood_summary_count = count;
 
-        // Open summary window
-        if !self.summary_window_dragged {
-            self.summary_window_dragged = false;
+        // Open neighborhood window
+        if !self.neighborhood_window_dragged {
+            self.neighborhood_window_dragged = false;
         }
-        self.summary_window_open = true;
+        self.neighborhood_window_open = true;
 
         // Create channel and spawn background thread
         let (tx, rx) = mpsc::channel();
@@ -1312,7 +1377,7 @@ impl DashboardApp {
         }
     }
 
-    /// Create a new semantic filter
+    /// Create a new semantic filter (LLM-scored)
     fn create_semantic_filter(&mut self) {
         let name = self.new_filter_input.trim().to_string();
         if name.is_empty() {
@@ -1320,13 +1385,27 @@ impl DashboardApp {
         }
 
         let api = ApiClient::new();
-        match api.create_semantic_filter(&name) {
+        match api.create_semantic_filter(&name, &name, "semantic") {
             Ok(filter) => {
                 self.semantic_filters.push(filter);
                 self.new_filter_input.clear();
             }
             Err(e) => {
                 eprintln!("Failed to create semantic filter: {}", e);
+            }
+        }
+    }
+
+    /// Create a rule-based filter (auto-scored, no LLM)
+    fn create_rule_filter(&mut self, name: &str, query_text: &str) {
+        let api = ApiClient::new();
+        match api.create_semantic_filter(name, query_text, "rule") {
+            Ok(filter) => {
+                self.semantic_filters.push(filter);
+                self.semantic_filter_cache = None;
+            }
+            Err(e) => {
+                eprintln!("Failed to create rule filter: {}", e);
             }
         }
     }
@@ -1385,6 +1464,83 @@ impl DashboardApp {
     /// Check if any proximity query is active (has results)
     fn any_proximity_active(&self) -> bool {
         self.proximity_queries.iter().any(|q| q.active)
+    }
+
+    /// Get a reference to the effective visible set for passing to graph methods.
+    /// Returns Some(&HashSet) when any filter is active, None otherwise.
+    fn effective_visible_set(&self) -> Option<&HashSet<String>> {
+        if self.any_filter_active() {
+            Some(&self.effective_visible_nodes)
+        } else {
+            None
+        }
+    }
+
+    /// Check if any filter is active that would reduce the visible set
+    fn any_filter_active(&self) -> bool {
+        self.timeline_enabled
+            || self.importance_filter.is_active()
+            || self.project_filter.is_active()
+            || self.has_active_semantic_filters()
+            || self.tool_use_filter.is_active()
+            || self.histogram_session_filter.is_some()
+    }
+
+    /// Check if a single node passes ALL active filters.
+    /// Used by rebuild_effective_visible_set() to build the unified set.
+    fn is_node_effectively_visible(&self, node: &crate::graph::types::GraphNode, semantic_visible: &Option<HashSet<String>>) -> bool {
+        // Timeline filter
+        if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
+            return false;
+        }
+        // Importance filter
+        if self.importance_filter.is_active() {
+            if let Some(score) = node.importance_score {
+                if score < self.importance_threshold {
+                    return false;
+                }
+            }
+        }
+        // Project filter
+        if self.project_filter.is_active() && !self.selected_projects.contains(&node.project) {
+            return false;
+        }
+        // Session filter (histogram drill-down)
+        if let Some(ref sf) = self.histogram_session_filter {
+            if node.session_id != *sf {
+                return false;
+            }
+        }
+        // Semantic filter
+        if let Some(ref sem_visible) = semantic_visible {
+            if !sem_visible.contains(&node.id) {
+                return false;
+            }
+        }
+        // Tool use filter
+        if self.tool_use_filter.is_active() && node.has_tool_usage {
+            return false;
+        }
+        true
+    }
+
+    /// Rebuild the effective visible set by iterating all nodes once.
+    /// Should be called when effective_visible_dirty is true.
+    fn rebuild_effective_visible_set(&mut self) {
+        // Ensure semantic filter cache is fresh
+        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
+            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        }
+        let semantic_visible = self.semantic_filter_cache.clone();
+
+        self.effective_visible_nodes.clear();
+        for node in &self.graph.data.nodes {
+            if self.is_node_effectively_visible(node, &semantic_visible) {
+                self.effective_visible_nodes.insert(node.id.clone());
+            }
+        }
+        self.effective_visible_count = self.effective_visible_nodes.len();
+        self.effective_visible_dirty = false;
     }
 
     /// Check if any proximity query is currently loading
@@ -1549,32 +1705,7 @@ impl DashboardApp {
 
     /// Get IDs of all currently visible (non-filtered) nodes
     fn get_visible_node_ids(&self) -> Vec<String> {
-        let semantic_visible = self.semantic_filter_cache.clone();
-
-        self.graph.data.nodes.iter().filter(|node| {
-            if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
-                return false;
-            }
-            if self.importance_filter_enabled {
-                if let Some(score) = node.importance_score {
-                    if score < self.importance_threshold {
-                        return false;
-                    }
-                }
-            }
-            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                return false;
-            }
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&node.id) {
-                    return false;
-                }
-            }
-            if self.hide_tool_uses && node.has_tool_usage {
-                return false;
-            }
-            true
-        }).map(|n| n.id.clone()).collect()
+        self.effective_visible_nodes.iter().cloned().collect()
     }
 
     /// Start rescoring importance for visible nodes (runs in background with progress)
@@ -1643,45 +1774,15 @@ impl DashboardApp {
     /// Get unique session IDs from currently visible nodes
     fn get_visible_session_ids(&self) -> Vec<String> {
         let mut session_ids: HashSet<String> = HashSet::new();
-
-        // Use cached semantic filter visible set
-        let semantic_visible = self.semantic_filter_cache.clone();
-
         for node in &self.graph.data.nodes {
-            // Check timeline filter
-            if self.timeline_enabled && !self.graph.is_node_visible(&node.id) {
-                continue;
+            if self.effective_visible_nodes.contains(&node.id) {
+                session_ids.insert(node.session_id.clone());
             }
-            // Check importance filter
-            if self.importance_filter_enabled {
-                if let Some(score) = node.importance_score {
-                    if score < self.importance_threshold {
-                        continue;
-                    }
-                }
-            }
-            // Check project filter
-            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                continue;
-            }
-            // Session filter (histogram drill-down)
-            if let Some(ref sf) = self.histogram_session_filter {
-                if node.session_id != *sf { continue; }
-            }
-            // Check semantic filters
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&node.id) {
-                    continue;
-                }
-            }
-
-            session_ids.insert(node.session_id.clone());
         }
-
         session_ids.into_iter().collect()
     }
 
-    /// Render the floating summary window
+    /// Render the floating summary window (Point-in-Time + Session Summary, triggered by double-click)
     fn render_summary_window(&mut self, ctx: &egui::Context) {
         if !self.summary_window_open {
             return;
@@ -1700,6 +1801,53 @@ impl DashboardApp {
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
+                // Resume session button bar
+                if let Some(ref session_id) = self.summary_session_id.clone() {
+                    let project = self.summary_node_id.as_ref()
+                        .and_then(|nid| self.graph.get_node(nid))
+                        .map(|n| n.project.clone())
+                        .unwrap_or_default();
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Session: {}…", &session_id[..8.min(session_id.len())]))
+                            .small()
+                            .color(egui::Color32::GRAY));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let recently_copied = self.resume_copied_at
+                                .map(|t| t.elapsed().as_millis() < 1500)
+                                .unwrap_or(false);
+
+                            let btn_text = if recently_copied { "Copied!" } else { "Resume" };
+                            let btn = ui.button(btn_text);
+
+                            if recently_copied {
+                                ctx.request_repaint();
+                            }
+
+                            if btn.clicked() {
+                                // Expand ~/ to full home path
+                                let full_path = if project.starts_with("~/") {
+                                    if let Some(home) = dirs::home_dir() {
+                                        format!("{}{}", home.display(), &project[1..])
+                                    } else {
+                                        project.clone()
+                                    }
+                                } else {
+                                    project.clone()
+                                };
+
+                                let cmd = format!("cd {} && claude --resume {}", full_path, session_id);
+                                ui.output_mut(|o| o.copied_text = cmd);
+                                self.resume_copied_at = Some(Instant::now());
+                            }
+
+                            btn.on_hover_text("Copy zsh command to resume this Claude Code session");
+                        });
+                    });
+                    ui.separator();
+                }
+
                 // Point-in-Time Summary section
                 egui::CollapsingHeader::new("Point-in-Time Summary")
                     .default_open(true)
@@ -1887,75 +2035,14 @@ impl DashboardApp {
                         }
                     });
 
-                ui.separator();
-
-                // Neighborhood Summary section
-                egui::CollapsingHeader::new("Neighborhood Summary")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        // Depth slider
-                        ui.horizontal(|ui| {
-                            ui.label("Depth:");
-                            ui.add(egui::Slider::new(&mut self.neighborhood_depth, 1..=5).text("edges"));
-                        });
-
-                        // Temporal edge toggle
-                        ui.checkbox(&mut self.neighborhood_include_temporal, "Include temporal edges");
-
-                        ui.add_space(5.0);
-
-                        if self.neighborhood_summary_loading {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Summarizing {} nodes...", self.neighborhood_summary_count));
-                            });
-                            ui.add_space(8.0);
-                            theme::skeleton_lines(ui, 3, ui.available_width() * 0.9);
-                        } else if let Some(ref error) = self.neighborhood_summary_error.clone() {
-                            ui.colored_label(theme::state::ERROR, format!("Error: {}", error));
-                        } else if let Some(ref data) = self.neighborhood_summary_data.clone() {
-                            // Node/session counts
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{} nodes across {} sessions",
-                                    data.node_count, data.session_count));
-                            });
-                            ui.add_space(5.0);
-
-                            // Summary
-                            ui.label(egui::RichText::new("Summary").strong());
-                            egui::ScrollArea::vertical()
-                                .max_height(100.0)
-                                .id_salt("window_neighborhood_summary_scroll")
-                                .show(ui, |ui| {
-                                    ui.label(&data.summary);
-                                });
-                            ui.add_space(5.0);
-
-                            // Themes
-                            if !data.themes.is_empty() {
-                                ui.label(egui::RichText::new("Themes").strong().color(Color32::from_rgb(100, 149, 237)));
-                                ui.label(&data.themes);
-                            }
-                        } else {
-                            ui.colored_label(
-                                egui::Color32::GRAY,
-                                "Ctrl+Click a node to summarize\nit and its neighbors.",
-                            );
-                        }
-                    });
-
                 ui.add_space(10.0);
                 ui.separator();
 
-                // Clear button
+                // Clear button - only clears summary window state
                 if ui.button("Clear & Close").clicked() {
                     self.summary_data = None;
                     self.summary_node_id = None;
                     self.session_summary_data = None;
-                    self.neighborhood_summary_data = None;
-                    self.neighborhood_summary_error = None;
-                    self.neighborhood_summary_center_node = None;
-                    self.neighborhood_summary_count = 0;
                     self.summary_window_open = false;
                     self.summary_window_dragged = false;
                 }
@@ -1969,6 +2056,101 @@ impl DashboardApp {
             let dist = (pos - default_pos).length();
             if dist > 10.0 {
                 self.summary_window_dragged = true;
+            }
+        }
+    }
+
+    /// Render the floating neighborhood window (Neighborhood Summary, triggered by Ctrl+Click)
+    fn render_neighborhood_window(&mut self, ctx: &egui::Context) {
+        if !self.neighborhood_window_open {
+            return;
+        }
+
+        // Calculate default position (offset from summary window position)
+        let screen_rect = ctx.screen_rect();
+        let default_pos = egui::pos2(screen_rect.right() - 420.0, 580.0);
+
+        let mut open = self.neighborhood_window_open;
+
+        let window_response = egui::Window::new("Neighborhood")
+            .open(&mut open)
+            .default_pos(default_pos)
+            .default_size([400.0, 350.0])
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                // Depth slider
+                ui.horizontal(|ui| {
+                    ui.label("Depth:");
+                    ui.add(egui::Slider::new(&mut self.neighborhood_depth, 1..=5).text("edges"));
+                });
+
+                // Temporal edge toggle
+                ui.checkbox(&mut self.neighborhood_include_temporal, "Include temporal edges");
+
+                ui.add_space(5.0);
+
+                if self.neighborhood_summary_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Summarizing {} nodes...", self.neighborhood_summary_count));
+                    });
+                    ui.add_space(8.0);
+                    theme::skeleton_lines(ui, 3, ui.available_width() * 0.9);
+                } else if let Some(ref error) = self.neighborhood_summary_error.clone() {
+                    ui.colored_label(theme::state::ERROR, format!("Error: {}", error));
+                } else if let Some(ref data) = self.neighborhood_summary_data.clone() {
+                    // Node/session counts
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} nodes across {} sessions",
+                            data.node_count, data.session_count));
+                    });
+                    ui.add_space(5.0);
+
+                    // Summary
+                    ui.label(egui::RichText::new("Summary").strong());
+                    egui::ScrollArea::vertical()
+                        .max_height(100.0)
+                        .id_salt("window_neighborhood_summary_scroll")
+                        .show(ui, |ui| {
+                            ui.label(&data.summary);
+                        });
+                    ui.add_space(5.0);
+
+                    // Themes
+                    if !data.themes.is_empty() {
+                        ui.label(egui::RichText::new("Themes").strong().color(Color32::from_rgb(100, 149, 237)));
+                        ui.label(&data.themes);
+                    }
+                } else {
+                    ui.colored_label(
+                        egui::Color32::GRAY,
+                        "Ctrl+Click a node to summarize\nit and its neighbors.",
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+
+                // Clear button - only clears neighborhood window state
+                if ui.button("Clear & Close").clicked() {
+                    self.neighborhood_summary_data = None;
+                    self.neighborhood_summary_error = None;
+                    self.neighborhood_summary_center_node = None;
+                    self.neighborhood_summary_count = 0;
+                    self.neighborhood_window_open = false;
+                    self.neighborhood_window_dragged = false;
+                }
+            });
+
+        self.neighborhood_window_open = open;
+
+        // Detect if window was dragged from default position
+        if let Some(inner) = window_response {
+            let pos = inner.response.rect.left_top();
+            let dist = (pos - default_pos).length();
+            if dist > 10.0 {
+                self.neighborhood_window_dragged = true;
             }
         }
     }
@@ -2356,9 +2538,9 @@ impl DashboardApp {
 
         // Info section
         ui.label("Info");
-        let visible_count = self.graph.timeline.visible_nodes.len();
+        let visible_count = self.effective_visible_count;
         let total_count = self.graph.data.nodes.len();
-        if self.timeline_enabled && visible_count < total_count {
+        if self.any_filter_active() && visible_count < total_count {
             ui.label(format!("Nodes: {} / {}", visible_count, total_count));
         } else {
             ui.label(format!("Nodes: {}", total_count));
@@ -2625,7 +2807,8 @@ impl DashboardApp {
                 let temporal_enabled = self.graph.temporal_attraction_enabled;
                 let mut new_temporal_enabled = temporal_enabled;
                 if ui.checkbox(&mut new_temporal_enabled, "Temporal Clustering").changed() {
-                    self.graph.set_temporal_attraction_enabled(new_temporal_enabled);
+                    self.graph.temporal_attraction_enabled = new_temporal_enabled;
+                    self.temporal_edges_dirty = true;
                     self.mark_settings_dirty();
                 }
 
@@ -2852,7 +3035,8 @@ impl DashboardApp {
             .text("Window (min)")
             .fixed_decimals(0));
         if (window_mins - prev_window_mins).abs() > 0.1 {
-            self.graph.set_temporal_window(window_mins as f64 * 60.0);
+            self.graph.temporal_window_secs = window_mins as f64 * 60.0;
+            self.temporal_edges_dirty = true;
             self.mark_settings_dirty();
         }
 
@@ -2885,7 +3069,8 @@ impl DashboardApp {
                 .show_ui(ui, |ui| {
                     for (value, label) in edge_limits {
                         if ui.selectable_label(current_limit == value, label).clicked() {
-                            self.graph.set_max_temporal_edges(value);
+                            self.graph.max_temporal_edges = value;
+                            self.temporal_edges_dirty = true;
                             self.settings.max_temporal_edges = value;
                             self.mark_settings_dirty();
                         }
@@ -3109,6 +3294,7 @@ impl DashboardApp {
             .default_open(true)
             .show(ui, |ui| {
                 if ui.checkbox(&mut self.timeline_enabled, "Timeline scrubber").changed() {
+                    self.effective_visible_dirty = true;
                     self.mark_settings_dirty();
                 }
                 if self.timeline_enabled {
@@ -3125,13 +3311,26 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Importance")
             .default_open(true)
             .show(ui, |ui| {
-                if ui.checkbox(&mut self.importance_filter_enabled, "Filter by importance").changed() {
-                    self.mark_settings_dirty();
-                }
-                if self.importance_filter_enabled {
+                ui.horizontal(|ui| {
+                    let mut mode_changed = false;
+                    for &mode in &[FilterMode::Off, FilterMode::Inactive, FilterMode::Filtered] {
+                        if ui.selectable_label(self.importance_filter == mode, mode.label()).clicked() {
+                            self.importance_filter = mode;
+                            mode_changed = true;
+                        }
+                    }
+                    if mode_changed {
+                        self.recompute_bypass_edges();
+                        self.semantic_filter_cache = None;
+                        self.effective_visible_dirty = true;
+                        self.mark_settings_dirty();
+                    }
+                });
+                if self.importance_filter.is_active() {
                     if ui.add(egui::Slider::new(&mut self.importance_threshold, 0.0..=1.0)
                         .text("Min importance")
                         .fixed_decimals(2)).changed() {
+                        self.effective_visible_dirty = true;
                         self.mark_settings_dirty();
                     }
                     // Show count
@@ -3192,39 +3391,47 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Project")
             .default_open(true)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.project_filter_enabled, "Filter by project");
-                if self.project_filter_enabled && !self.available_projects.is_empty() {
-                    // Cache available_projects to avoid borrow issues
-                    let available = self.available_projects.clone();
-                    ui.indent("project_filter_list", |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                for project in &available {
-                                    let mut selected = self.selected_projects.contains(project);
-                                    if ui.checkbox(&mut selected, project).changed() {
-                                        if selected {
-                                            self.selected_projects.insert(project.clone());
-                                        } else {
-                                            self.selected_projects.remove(project);
-                                        }
-                                    }
+                ui.horizontal(|ui| {
+                    let mut mode_changed = false;
+                    for &mode in &[FilterMode::Off, FilterMode::Inactive, FilterMode::Filtered] {
+                        if ui.selectable_label(self.project_filter == mode, mode.label()).clicked() {
+                            self.project_filter = mode;
+                            mode_changed = true;
+                        }
+                    }
+                    if mode_changed {
+                        self.recompute_bypass_edges();
+                        self.semantic_filter_cache = None;
+                        self.effective_visible_dirty = true;
+                        self.mark_settings_dirty();
+                    }
+                });
+                if self.project_filter.is_active() && !self.available_projects.is_empty() {
+                    if let Some(tree) = self.project_tree.clone() {
+                        ui.indent("project_filter_tree", |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("All").clicked() {
+                                    self.selected_projects = self.available_projects.iter().cloned().collect();
+                                    self.effective_visible_dirty = true;
+                                }
+                                if ui.small_button("None").clicked() {
+                                    self.selected_projects.clear();
+                                    self.effective_visible_dirty = true;
                                 }
                             });
-                        ui.horizontal(|ui| {
-                            if ui.small_button("All").clicked() {
-                                self.selected_projects = available.iter().cloned().collect();
-                            }
-                            if ui.small_button("None").clicked() {
-                                self.selected_projects.clear();
-                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    for child in &tree.children {
+                                        self.render_project_tree_node(ui, child);
+                                    }
+                                });
+                            let visible = self.graph.data.nodes.iter()
+                                .filter(|n| self.selected_projects.contains(&n.project))
+                                .count();
+                            ui.label(format!("{} / {} nodes", visible, self.graph.data.nodes.len()));
                         });
-                        // Show count
-                        let visible = self.graph.data.nodes.iter()
-                            .filter(|n| self.selected_projects.contains(&n.project))
-                            .count();
-                        ui.label(format!("Showing: {} / {} nodes", visible, self.graph.data.nodes.len()));
-                    });
+                    }
                 }
             });
 
@@ -3232,15 +3439,22 @@ impl DashboardApp {
         egui::CollapsingHeader::new("Tool Uses")
             .default_open(true)
             .show(ui, |ui| {
-                if ui.checkbox(&mut self.hide_tool_uses, "Hide tool uses").changed() {
-                    if self.hide_tool_uses {
-                        self.tool_use_bypass_edges = self.compute_tool_use_bypass_edges();
-                    } else {
-                        self.tool_use_bypass_edges.clear();
+                ui.horizontal(|ui| {
+                    let mut mode_changed = false;
+                    for &mode in &[FilterMode::Off, FilterMode::Inactive, FilterMode::Filtered] {
+                        if ui.selectable_label(self.tool_use_filter == mode, mode.label()).clicked() {
+                            self.tool_use_filter = mode;
+                            mode_changed = true;
+                        }
                     }
-                    self.semantic_filter_cache = None;
-                }
-                if self.hide_tool_uses {
+                    if mode_changed {
+                        self.recompute_bypass_edges();
+                        self.semantic_filter_cache = None;
+                        self.effective_visible_dirty = true;
+                        self.mark_settings_dirty();
+                    }
+                });
+                if self.tool_use_filter.is_active() {
                     let tool_count = self.graph.data.nodes.iter().filter(|n| n.has_tool_usage).count();
                     let total = self.graph.data.nodes.len();
                     ui.label(format!("Hiding: {} / {} nodes", tool_count, total));
@@ -3320,6 +3534,7 @@ impl DashboardApp {
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Off);
                                 self.semantic_filter_cache = None;
+                                self.effective_visible_dirty = true;
                             }
 
                             // Exclude button (-)
@@ -3330,6 +3545,7 @@ impl DashboardApp {
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
                                 self.semantic_filter_cache = None;
+                                self.effective_visible_dirty = true;
                             }
 
                             // Include button (+)
@@ -3340,6 +3556,7 @@ impl DashboardApp {
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
                                 self.semantic_filter_cache = None;
+                                self.effective_visible_dirty = true;
                             }
 
                             // Include +1 button (show matching + direct neighbors)
@@ -3350,6 +3567,7 @@ impl DashboardApp {
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus1);
                                 self.semantic_filter_cache = None;
+                                self.effective_visible_dirty = true;
                             }
 
                             // Include +2 button (show matching + neighbors up to depth 2)
@@ -3360,6 +3578,12 @@ impl DashboardApp {
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus2);
                                 self.semantic_filter_cache = None;
+                                self.effective_visible_dirty = true;
+                            }
+
+                            // Type badge for rule filters
+                            if filter.is_rule() {
+                                ui.label(egui::RichText::new("[R]").small().color(egui::Color32::from_rgb(100, 200, 100)));
                             }
 
                             // Clickable filter name to toggle detail panel
@@ -3444,8 +3668,10 @@ impl DashboardApp {
 
                                     ui.add_space(2.0);
 
-                                    // Rescore button + progress
-                                    if is_categorizing {
+                                    // Rescore button + progress (hidden for rule filters)
+                                    if filter.is_rule() {
+                                        ui.label(egui::RichText::new("Rule (auto-scored)").weak().italics());
+                                    } else if is_categorizing {
                                         if let Some((scored, total)) = self.categorization_progress {
                                             let fraction = if total > 0 { scored as f32 / total as f32 } else { 0.0 };
                                             ui.horizontal(|ui| {
@@ -3492,6 +3718,77 @@ impl DashboardApp {
                         self.create_semantic_filter();
                     }
                 });
+
+                // Preset rule filter buttons (tree layout)
+                {
+                    let existing_queries: std::collections::HashSet<String> = self.semantic_filters.iter()
+                        .map(|f| f.query_text.clone())
+                        .collect();
+
+                    // Helper closure to render a preset button
+                    let mut preset_btn = |ui: &mut egui::Ui, label: &str, query: &str, this: &mut Self| {
+                        let already_exists = existing_queries.contains(query);
+                        ui.add_enabled_ui(!already_exists, |ui| {
+                            let btn = ui.small_button(label);
+                            if already_exists {
+                                btn.on_hover_text(format!("'{}' already exists", query));
+                            } else if btn.on_hover_text(format!("Create rule: {}", query)).clicked() {
+                                this.create_rule_filter(label, query);
+                            }
+                        });
+                    };
+
+                    // Top-level presets
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Presets:").weak().small());
+                        preset_btn(ui, "User", "role:user", self);
+                        preset_btn(ui, "Assistant", "role:assistant", self);
+                        preset_btn(ui, "Has Tools", "has_tools", self);
+                        preset_btn(ui, "Long", "long", self);
+                        preset_btn(ui, "Short", "short", self);
+                    });
+
+                    // Collapsible tool presets tree
+                    egui::CollapsingHeader::new(egui::RichText::new("By Tool").weak().small())
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.style_mut().spacing.item_spacing.y = 2.0;
+
+                            let tool_groups: &[(&str, &[(&str, &str)])] = &[
+                                ("Core", &[
+                                    ("Bash", "tool:Bash"),
+                                    ("Read", "tool:Read"),
+                                    ("Edit", "tool:Edit"),
+                                    ("Write", "tool:Write"),
+                                    ("Glob", "tool:Glob"),
+                                    ("Grep", "tool:Grep"),
+                                ]),
+                                ("Web", &[
+                                    ("WebSearch", "tool:WebSearch"),
+                                    ("WebFetch", "tool:WebFetch"),
+                                ]),
+                                ("Agent", &[
+                                    ("Task", "tool:Task"),
+                                    ("TodoWrite", "tool:TodoWrite"),
+                                    ("Skill", "tool:Skill"),
+                                ]),
+                                ("Planning", &[
+                                    ("EnterPlan", "tool:EnterPlanMode"),
+                                    ("ExitPlan", "tool:ExitPlanMode"),
+                                    ("AskUser", "tool:AskUserQuestion"),
+                                ]),
+                            ];
+
+                            for (group_name, tools) in tool_groups {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(format!("{}:", group_name)).weak().small());
+                                    for (label, query) in *tools {
+                                        preset_btn(ui, label, query, self);
+                                    }
+                                });
+                            }
+                        });
+                }
 
                 // Show active filter count and effect
                 let active_filters: Vec<_> = self.semantic_filter_modes.iter()
@@ -3598,6 +3895,61 @@ impl DashboardApp {
                 });
         } else {
             ui.label("No nodes loaded");
+        }
+    }
+
+    /// Recursively render one node in the project tree with tri-state checkboxes.
+    fn render_project_tree_node(&mut self, ui: &mut egui::Ui, node: &ProjectTreeNode) {
+        let state = node.check_state(&self.selected_projects);
+        let has_children = !node.children.is_empty();
+
+        if has_children {
+            // Interior node: collapsible with tri-state checkbox
+            let is_expanded = self.project_tree_expanded.contains(&node.full_path);
+            ui.horizontal(|ui| {
+                // Expand/collapse arrow
+                let arrow = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
+                if ui.small_button(arrow).clicked() {
+                    if is_expanded {
+                        self.project_tree_expanded.remove(&node.full_path);
+                    } else {
+                        self.project_tree_expanded.insert(node.full_path.clone());
+                    }
+                }
+                // Tri-state checkbox
+                if let Some(select_all) = project_tree::tri_state_checkbox(ui, state) {
+                    let leaves = node.leaf_paths();
+                    if select_all {
+                        for p in leaves { self.selected_projects.insert(p); }
+                    } else {
+                        for p in &leaves { self.selected_projects.remove(p); }
+                    }
+                    self.effective_visible_dirty = true;
+                }
+                ui.label(&node.name);
+            });
+            if is_expanded {
+                ui.indent(&node.full_path, |ui| {
+                    for child in &node.children {
+                        self.render_project_tree_node(ui, child);
+                    }
+                });
+            }
+        } else {
+            // Leaf node: simple checkbox
+            ui.horizontal(|ui| {
+                // Small indent to align with children of interior nodes
+                ui.add_space(ui.spacing().indent);
+                let mut selected = state == CheckState::Checked;
+                if ui.checkbox(&mut selected, &node.name).changed() {
+                    if selected {
+                        self.selected_projects.insert(node.full_path.clone());
+                    } else {
+                        self.selected_projects.remove(&node.full_path);
+                    }
+                    self.effective_visible_dirty = true;
+                }
+            });
         }
     }
 
@@ -3761,12 +4113,14 @@ impl DashboardApp {
             center + centered * zoom + pan_offset
         };
 
-        // Ensure semantic filter cache is fresh (may have been invalidated by sidebar clicks
+        // Ensure effective visible set is fresh (may have been dirtied by sidebar clicks
         // earlier in this frame, after the top-of-frame refresh in update())
-        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
-            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        if self.effective_visible_dirty {
+            self.rebuild_effective_visible_set();
+            // Note: temporal_edges_dirty will be handled in next frame's update()
         }
-        let semantic_visible = self.semantic_filter_cache.clone();
+        let evn = &self.effective_visible_nodes;
+        let any_filter = self.any_filter_active();
 
         // Draw edges first (behind nodes)
         // Per-node neighbor cap for similarity edges (client-side filtering)
@@ -3777,53 +4131,9 @@ impl DashboardApp {
             // Check if edge is dimmed (timeline-hidden) vs fully hidden (other filters)
             let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_edge_visible(edge);
 
-            // Skip edges where either endpoint is below importance threshold
-            if self.importance_filter_enabled {
-                let source_below = self.graph.get_node(&edge.source)
-                    .and_then(|n| n.importance_score)
-                    .map_or(false, |s| s < self.importance_threshold);
-                let target_below = self.graph.get_node(&edge.target)
-                    .and_then(|n| n.importance_score)
-                    .map_or(false, |s| s < self.importance_threshold);
-                if source_below || target_below {
-                    continue;
-                }
-            }
-
-            // Skip edges where either endpoint is not in selected projects
-            if self.project_filter_enabled {
-                let source_excluded = self.graph.get_node(&edge.source)
-                    .map_or(true, |n| !self.selected_projects.contains(&n.project));
-                let target_excluded = self.graph.get_node(&edge.target)
-                    .map_or(true, |n| !self.selected_projects.contains(&n.project));
-                if source_excluded || target_excluded {
-                    continue;
-                }
-            }
-
-            // Skip edges where either endpoint doesn't pass semantic filters
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&edge.source) || !sem_visible.contains(&edge.target) {
-                    continue;
-                }
-            }
-
-            // Session filter (histogram drill-down)
-            if let Some(ref sf) = self.histogram_session_filter {
-                let source_out = self.graph.get_node(&edge.source)
-                    .map_or(true, |n| n.session_id != *sf);
-                let target_out = self.graph.get_node(&edge.target)
-                    .map_or(true, |n| n.session_id != *sf);
-                if source_out || target_out {
-                    continue;
-                }
-            }
-
-            // Skip edges touching tool-use nodes (bypass edges drawn separately)
-            if self.hide_tool_uses && !edge.is_temporal && !edge.is_similarity {
-                let source_tool = self.graph.get_node(&edge.source).map_or(false, |n| n.has_tool_usage);
-                let target_tool = self.graph.get_node(&edge.target).map_or(false, |n| n.has_tool_usage);
-                if source_tool || target_tool {
+            // Skip edges where either endpoint is not effectively visible
+            if any_filter {
+                if !evn.contains(&edge.source) || !evn.contains(&edge.target) {
                     continue;
                 }
             }
@@ -3917,44 +4227,12 @@ impl DashboardApp {
             self.proximity_edge_count_filtered = total / 2; // each edge counted twice
         }
 
-        // Draw bypass edges (bridging over hidden tool-use nodes)
-        if self.hide_tool_uses {
-            for edge in &self.tool_use_bypass_edges {
-                // Skip bypass edges where either endpoint is filtered out by semantic filters
-                if let Some(ref sem_visible) = semantic_visible {
-                    if !sem_visible.contains(&edge.source) || !sem_visible.contains(&edge.target) {
-                        continue;
-                    }
-                }
-                // Skip bypass edges where either endpoint is below importance threshold
-                if self.importance_filter_enabled {
-                    let source_below = self.graph.get_node(&edge.source)
-                        .and_then(|n| n.importance_score)
-                        .map_or(false, |s| s < self.importance_threshold);
-                    let target_below = self.graph.get_node(&edge.target)
-                        .and_then(|n| n.importance_score)
-                        .map_or(false, |s| s < self.importance_threshold);
-                    if source_below || target_below {
-                        continue;
-                    }
-                }
-                // Skip bypass edges where either endpoint is not in selected projects
-                if self.project_filter_enabled {
-                    let source_excluded = self.graph.get_node(&edge.source)
-                        .map_or(true, |n| !self.selected_projects.contains(&n.project));
-                    let target_excluded = self.graph.get_node(&edge.target)
-                        .map_or(true, |n| !self.selected_projects.contains(&n.project));
-                    if source_excluded || target_excluded {
-                        continue;
-                    }
-                }
-                // Session filter (histogram drill-down)
-                if let Some(ref sf) = self.histogram_session_filter {
-                    let source_out = self.graph.get_node(&edge.source)
-                        .map_or(true, |n| n.session_id != *sf);
-                    let target_out = self.graph.get_node(&edge.target)
-                        .map_or(true, |n| n.session_id != *sf);
-                    if source_out || target_out {
+        // Draw bypass edges (bridging over hidden nodes in Inactive mode)
+        if !self.bypass_edges.is_empty() {
+            for edge in &self.bypass_edges.clone() {
+                // Skip bypass edges where either endpoint is not effectively visible
+                if any_filter {
+                    if !evn.contains(&edge.source) || !evn.contains(&edge.target) {
                         continue;
                     }
                 }
@@ -3979,30 +4257,8 @@ impl DashboardApp {
             let mut closest: Option<(String, f32)> = None; // (node_id, distance)
 
             for node in &self.graph.data.nodes {
-                // Skip nodes below importance threshold when filter is enabled
-                if self.importance_filter_enabled {
-                    if let Some(score) = node.importance_score {
-                        if score < self.importance_threshold {
-                            continue;
-                        }
-                    }
-                }
-                // Skip nodes not in selected projects when filter is enabled
-                if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                    continue;
-                }
-                // Session filter (histogram drill-down)
-                if let Some(ref sf) = self.histogram_session_filter {
-                    if node.session_id != *sf { continue; }
-                }
-                // Skip nodes that don't pass semantic filters
-                if let Some(ref sem_visible) = semantic_visible {
-                    if !sem_visible.contains(&node.id) {
-                        continue;
-                    }
-                }
-                // Skip hidden tool-use nodes
-                if self.hide_tool_uses && node.has_tool_usage {
+                // Skip nodes not in effective visible set
+                if any_filter && !evn.contains(&node.id) {
                     continue;
                 }
                 if let Some(pos) = self.graph.get_pos(&node.id) {
@@ -4033,6 +4289,7 @@ impl DashboardApp {
                         let new_pos = self.graph.timeline.position_at_time(t);
                         self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
                         self.graph.update_visible_nodes();
+                        self.effective_visible_dirty = true;
                     }
                 }
                 // Cross-session (dimmed) nodes: do nothing on hover, handled by click
@@ -4068,33 +4325,8 @@ impl DashboardApp {
             let is_timeline_dimmed = self.timeline_enabled && !self.graph.is_node_visible(&node.id);
             let is_same_project_future = self.is_same_project_future_node(node);
 
-            // Skip nodes below importance threshold when filter is enabled
-            if self.importance_filter_enabled {
-                if let Some(score) = node.importance_score {
-                    if score < self.importance_threshold {
-                        continue;
-                    }
-                }
-            }
-
-            // Skip nodes not in selected projects when filter is enabled
-            if self.project_filter_enabled && !self.selected_projects.contains(&node.project) {
-                continue;
-            }
-            // Session filter (histogram drill-down)
-            if let Some(ref sf) = self.histogram_session_filter {
-                if node.session_id != *sf { continue; }
-            }
-
-            // Skip nodes that don't pass semantic filters
-            if let Some(ref sem_visible) = semantic_visible {
-                if !sem_visible.contains(&node.id) {
-                    continue;
-                }
-            }
-
-            // Skip hidden tool-use nodes
-            if self.hide_tool_uses && node.has_tool_usage {
+            // Skip nodes not in effective visible set
+            if any_filter && !evn.contains(&node.id) {
                 continue;
             }
 
@@ -4314,6 +4546,7 @@ impl DashboardApp {
                             let new_pos = self.graph.timeline.position_at_time(t);
                             self.graph.timeline.position = new_pos.max(self.graph.timeline.start_position);
                             self.graph.update_visible_nodes();
+                            self.effective_visible_dirty = true;
                         }
                     }
                 }
@@ -4773,22 +5006,24 @@ impl DashboardApp {
                                             // Drill to session
                                             self.histogram_session_filter = Some(session.session_id.clone());
                                             self.histogram_drill_level = 2;
+                                            self.effective_visible_dirty = true;
                                         }
                                         2 => {
                                             // Clear all filters
-                                            self.project_filter_enabled = false;
+                                            self.project_filter = FilterMode::Off;
                                             self.selected_projects = self.available_projects.iter().cloned().collect();
                                             self.histogram_session_filter = None;
                                             self.histogram_last_clicked = None;
                                             self.histogram_drill_level = 0;
+                                            self.effective_visible_dirty = true;
                                         }
                                         _ => {}
                                     }
                                 } else {
                                     // Different segment (or first click)
-                                    if !self.project_filter_enabled {
+                                    if !self.project_filter.is_active() {
                                         // First filter action: select only this project
-                                        self.project_filter_enabled = true;
+                                        self.project_filter = FilterMode::Filtered;
                                         self.selected_projects.clear();
                                         self.selected_projects.insert(session.project.clone());
                                     } else {
@@ -4803,6 +5038,7 @@ impl DashboardApp {
                                     self.histogram_session_filter = None;
                                     self.histogram_last_clicked = Some(this_seg);
                                     self.histogram_drill_level = 1;
+                                    self.effective_visible_dirty = true;
                                 }
                             }
                         }
@@ -4814,12 +5050,13 @@ impl DashboardApp {
         }
 
         // Click on empty space clears all filters
-        if clicked && !click_hit_segment && (self.project_filter_enabled || self.histogram_session_filter.is_some()) {
-            self.project_filter_enabled = false;
+        if clicked && !click_hit_segment && (self.project_filter.is_active() || self.histogram_session_filter.is_some()) {
+            self.project_filter = FilterMode::Off;
             self.selected_projects = self.available_projects.iter().cloned().collect();
             self.histogram_session_filter = None;
             self.histogram_last_clicked = None;
             self.histogram_drill_level = 0;
+            self.effective_visible_dirty = true;
         }
 
         // Date labels: tick marks at regular intervals
@@ -5004,7 +5241,7 @@ impl DashboardApp {
 
         // Convert session maps into sorted SessionTokens vecs
         let session_cache = &self.session_metadata_cache;
-        let project_filter_enabled = self.project_filter_enabled;
+        let project_filter_active = self.project_filter.is_active();
         let selected_projects = &self.selected_projects;
         let session_filter = &self.histogram_session_filter;
         let stack_order = self.histogram_stack_order;
@@ -5013,7 +5250,7 @@ impl DashboardApp {
             let mut sessions: Vec<SessionTokens> = session_map
                 .into_iter()
                 .map(|(session_id, (project, total))| {
-                    let is_filtered = (project_filter_enabled && !selected_projects.contains(&project))
+                    let is_filtered = (project_filter_active && !selected_projects.contains(&project))
                         || session_filter.as_ref().is_some_and(|sf| sf != &session_id);
                     SessionTokens {
                         session_id,
@@ -5063,7 +5300,7 @@ impl DashboardApp {
         let current_speed = self.graph.timeline.speed;
         let start_pos = self.graph.timeline.start_position;
         let end_pos = self.graph.timeline.position;
-        let visible_count = self.graph.timeline.visible_nodes.len();
+        let visible_count = self.effective_visible_count;
         let total_count = self.graph.data.nodes.len();
         let start_time = self.graph.timeline.time_at_position(start_pos);
         let end_time = self.graph.timeline.time_at_position(end_pos);
@@ -5101,11 +5338,13 @@ impl DashboardApp {
                 self.graph.timeline.position = 0.0;
                 self.graph.timeline.start_position = 0.0;
                 self.graph.update_visible_nodes();
+                self.effective_visible_dirty = true;
             }
 
             if ui.button("⏭").clicked() {
                 self.graph.timeline.position = 1.0;
                 self.graph.update_visible_nodes();
+                self.effective_visible_dirty = true;
             }
 
             ui.separator();
@@ -5271,6 +5510,7 @@ impl DashboardApp {
                 }
 
                 self.graph.update_visible_nodes();
+                self.effective_visible_dirty = true;
                 self.timeline_dragging = true;
             }
         } else {
@@ -5284,6 +5524,7 @@ impl DashboardApp {
                 let snapped = self.graph.timeline.snap_to_notch(new_pos);
                 self.graph.timeline.position = snapped.max(self.graph.timeline.start_position + 0.01);
                 self.graph.update_visible_nodes();
+                self.effective_visible_dirty = true;
             }
         }
     }
@@ -5317,6 +5558,30 @@ impl eframe::App for DashboardApp {
         // Refresh semantic filter cache once per frame if needed
         if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
             self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        }
+
+        // Rebuild effective visible set when any filter changed
+        if self.effective_visible_dirty {
+            self.rebuild_effective_visible_set();
+            self.temporal_edges_dirty = true; // visible set changed → edges need rebuild
+        }
+
+        // Rebuild temporal edges when needed (visible set changed, or edge settings changed)
+        // Skip during timeline playback to avoid expensive per-frame rebuilds;
+        // edges will rebuild when playback stops or is paused.
+        if self.temporal_edges_dirty && !self.graph.timeline.playing {
+            if self.graph.temporal_attraction_enabled {
+                let vis = if self.any_filter_active() {
+                    Some(self.effective_visible_nodes.clone())
+                } else {
+                    None
+                };
+                self.graph.build_temporal_edges_filtered(vis.as_ref());
+            } else {
+                // Temporal disabled — just remove temporal edges
+                self.graph.data.edges.retain(|e| !e.is_temporal);
+            }
+            self.temporal_edges_dirty = false;
         }
 
         // Check for point-in-time summary result from background thread
@@ -5595,6 +5860,7 @@ impl eframe::App for DashboardApp {
             let advance = delta * self.graph.timeline.speed * 0.1;
             self.graph.timeline.position = (self.graph.timeline.position + advance).min(1.0);
             self.graph.update_visible_nodes();
+            self.effective_visible_dirty = true;
 
             if self.graph.timeline.position >= 1.0 {
                 self.graph.timeline.playing = false;
@@ -5612,8 +5878,9 @@ impl eframe::App for DashboardApp {
         // Dark theme
         ctx.set_visuals(egui::Visuals::dark());
 
-        // Floating summary window (rendered before panels so it floats on top)
+        // Floating summary/neighborhood windows (rendered before panels so they float on top)
         self.render_summary_window(ctx);
+        self.render_neighborhood_window(ctx);
         self.render_edge_popups(ctx);
 
         // Sidebar

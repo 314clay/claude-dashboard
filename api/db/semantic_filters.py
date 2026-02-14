@@ -17,13 +17,14 @@ def get_all_filters() -> list[dict]:
             f.id,
             f.name,
             f.query_text,
+            f.filter_type,
             f.created_at,
             f.is_active,
             COUNT(r.id) as total_scored,
             SUM(CASE WHEN r.matches = 1 THEN 1 ELSE 0 END) as matches
         FROM semantic_filters f
         LEFT JOIN semantic_filter_results r ON f.id = r.filter_id
-        GROUP BY f.id, f.name, f.query_text, f.created_at, f.is_active
+        GROUP BY f.id, f.name, f.query_text, f.filter_type, f.created_at, f.is_active
         ORDER BY f.created_at DESC
     """)
 
@@ -37,15 +38,16 @@ def get_all_filters() -> list[dict]:
     return filters
 
 
-def create_filter(name: str, query_text: str) -> dict:
+def create_filter(name: str, query_text: str, filter_type: str = 'semantic') -> dict:
     """Create a new semantic filter.
 
     Args:
         name: Unique name for the filter
         query_text: The semantic query text
+        filter_type: 'semantic' (LLM-scored) or 'rule' (deterministic)
 
     Returns:
-        dict with created filter data: { id, name, query_text, created_at, is_active }
+        dict with created filter data: { id, name, query_text, filter_type, created_at, is_active }
 
     Raises:
         Exception if name is not unique
@@ -55,16 +57,16 @@ def create_filter(name: str, query_text: str) -> dict:
 
     now = datetime.now(timezone.utc).isoformat()
     cur.execute("""
-        INSERT INTO semantic_filters (name, query_text, created_at, is_active)
-        VALUES (?, ?, ?, 1)
-    """, (name, query_text, now))
+        INSERT INTO semantic_filters (name, query_text, filter_type, created_at, is_active)
+        VALUES (?, ?, ?, ?, 1)
+    """, (name, query_text, filter_type, now))
 
     filter_id = cur.lastrowid
     conn.commit()
 
     # Fetch the created row
     cur.execute("""
-        SELECT id, name, query_text, created_at, is_active
+        SELECT id, name, query_text, filter_type, created_at, is_active
         FROM semantic_filters WHERE id = ?
     """, (filter_id,))
 
@@ -124,7 +126,7 @@ def get_filter_status(filter_id: int) -> dict | None:
 
     # Get filter info
     cur.execute("""
-        SELECT id, name, query_text, is_active
+        SELECT id, name, query_text, filter_type, is_active
         FROM semantic_filters
         WHERE id = ?
     """, (filter_id,))
@@ -162,6 +164,7 @@ def get_filter_status(filter_id: int) -> dict | None:
         'filter_id': filter_row['id'],
         'name': filter_row['name'],
         'query_text': filter_row['query_text'],
+        'filter_type': filter_row['filter_type'],
         'is_active': filter_row['is_active'],
         'total': total,
         'scored': scored,

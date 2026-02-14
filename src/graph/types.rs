@@ -15,6 +15,22 @@ pub enum SemanticFilterMode {
     IncludePlus2, // Show matching nodes + neighbors up to depth 2
 }
 
+/// 3-way filter mode: Off / Inactive (dim, bypass edges) / Filtered (fully removed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum FilterMode {
+    #[default]
+    Off,
+    Inactive,  // Nodes hidden, bypass edges maintain connectivity
+    Filtered,  // Nodes + all edges truly removed
+}
+
+impl FilterMode {
+    pub fn is_active(&self) -> bool { *self != FilterMode::Off }
+    pub fn label(&self) -> &'static str {
+        match self { Self::Off => "Off", Self::Inactive => "Dim", Self::Filtered => "Hide" }
+    }
+}
+
 /// Color mode for graph visualization
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
@@ -392,17 +408,30 @@ pub struct NeighborhoodSummaryData {
     pub error: Option<String>,
 }
 
+fn default_filter_type() -> String {
+    "semantic".to_string()
+}
+
 /// A semantic filter for categorizing messages
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticFilter {
     pub id: i32,
     pub name: String,
     pub query_text: String,
+    #[serde(default = "default_filter_type")]
+    pub filter_type: String,
     pub is_active: bool,
     #[serde(default)]
     pub total_scored: i64,
     #[serde(default)]
     pub matches: i64,
+}
+
+impl SemanticFilter {
+    /// Returns true if this is a rule-based (non-LLM) filter
+    pub fn is_rule(&self) -> bool {
+        self.filter_type == "rule"
+    }
 }
 
 /// Timeline state for scrubbing through time
@@ -822,9 +851,16 @@ impl GraphState {
     }
 
     /// Build pre-computed temporal edges between nodes close in time.
+    /// Wrapper that builds edges for all nodes (no filtering).
+    pub fn build_temporal_edges(&mut self) {
+        self.build_temporal_edges_filtered(None);
+    }
+
+    /// Build pre-computed temporal edges, optionally restricted to a visible set.
     /// Uses sliding window algorithm: O(n) instead of O(n²).
     /// Caps at max_temporal_edges to prevent memory issues.
-    pub fn build_temporal_edges(&mut self) {
+    /// When `visible` is Some, only nodes in the set participate in edge creation.
+    pub fn build_temporal_edges_filtered(&mut self, visible: Option<&HashSet<String>>) {
         // Remove any existing temporal edges first
         self.data.edges.retain(|e| !e.is_temporal);
 
@@ -832,26 +868,37 @@ impl GraphState {
             return;
         }
 
-        let node_count = self.timeline.sorted_indices.len();
         let window = self.temporal_window_secs;
         let max_edges = self.max_temporal_edges;
+
+        // Build filtered sorted list: (original_sorted_pos, node_index, timestamp)
+        // Only include nodes that are in the visible set (if provided)
+        let filtered: Vec<(usize, f64)> = self.timeline.sorted_indices.iter().enumerate()
+            .filter_map(|(i, &node_idx)| {
+                if let Some(vis) = visible {
+                    if !vis.contains(&self.data.nodes[node_idx].id) {
+                        return None;
+                    }
+                }
+                Some((node_idx, self.timeline.timestamps[i]))
+            })
+            .collect();
+
+        let node_count = filtered.len();
         let mut temporal_edges = Vec::new();
 
         // Sliding window over sorted timestamps
         for i in 0..node_count {
-            let node_i_idx = self.timeline.sorted_indices[i];
-            let ts_i = self.timeline.timestamps[i];
+            let (node_i_idx, ts_i) = filtered[i];
 
             for j in (i + 1)..node_count {
-                let ts_j = self.timeline.timestamps[j];
+                let (node_j_idx, ts_j) = filtered[j];
                 let dt = ts_j - ts_i;
 
                 // Since sorted, if we exceed window we're done with this node
                 if dt > window {
                     break;
                 }
-
-                let node_j_idx = self.timeline.sorted_indices[j];
 
                 // Strength decays linearly from 1.0 to 0.0 over the window
                 let strength = 1.0 - (dt / window) as f32;
@@ -875,10 +922,11 @@ impl GraphState {
         }
 
         eprintln!(
-            "Built {} temporal edges (window: {}s, nodes: {}, limit: {})",
+            "Built {} temporal edges (window: {}s, nodes: {}/{}, limit: {})",
             temporal_edges.len(),
             window,
             node_count,
+            self.timeline.sorted_indices.len(),
             max_edges
         );
 
@@ -886,18 +934,18 @@ impl GraphState {
     }
 
     /// Rebuild temporal edges with a new window size
-    pub fn set_temporal_window(&mut self, window_secs: f64) {
+    pub fn set_temporal_window(&mut self, window_secs: f64, visible: Option<&HashSet<String>>) {
         self.temporal_window_secs = window_secs;
         if self.temporal_attraction_enabled {
-            self.build_temporal_edges();
+            self.build_temporal_edges_filtered(visible);
         }
     }
 
     /// Toggle temporal attraction on/off
-    pub fn set_temporal_attraction_enabled(&mut self, enabled: bool) {
+    pub fn set_temporal_attraction_enabled(&mut self, enabled: bool, visible: Option<&HashSet<String>>) {
         self.temporal_attraction_enabled = enabled;
         if enabled {
-            self.build_temporal_edges();
+            self.build_temporal_edges_filtered(visible);
         } else {
             // Remove temporal edges
             self.data.edges.retain(|e| !e.is_temporal);
@@ -905,10 +953,10 @@ impl GraphState {
     }
 
     /// Set maximum temporal edges and rebuild
-    pub fn set_max_temporal_edges(&mut self, max_edges: usize) {
+    pub fn set_max_temporal_edges(&mut self, max_edges: usize, visible: Option<&HashSet<String>>) {
         self.max_temporal_edges = max_edges;
         if self.temporal_attraction_enabled {
-            self.build_temporal_edges();
+            self.build_temporal_edges_filtered(visible);
         }
     }
 
@@ -1587,5 +1635,170 @@ mod tests {
 
         // Should have valid timestamp
         assert!(mail.timestamp_secs().is_some());
+    }
+
+    /// Helper: create a GraphNode with a given id and timestamp
+    fn make_node(id: &str, timestamp: &str) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            role: Role::User,
+            content_preview: String::new(),
+            full_content: None,
+            session_id: "s1".to_string(),
+            session_short: "s1".to_string(),
+            project: "proj".to_string(),
+            timestamp: Some(timestamp.to_string()),
+            importance_score: None,
+            importance_reason: None,
+            output_tokens: None,
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            semantic_filter_matches: vec![],
+            has_tool_usage: false,
+        }
+    }
+
+    /// Helper: create a GraphState loaded with nodes and timeline built
+    fn make_graph_with_nodes(nodes: Vec<GraphNode>) -> GraphState {
+        let mut graph = GraphState::new();
+        let data = GraphData {
+            nodes,
+            edges: vec![],
+            beads: vec![],
+            mail: vec![],
+        };
+        let bounds = egui::Rect::from_center_size(
+            egui::Pos2::new(400.0, 300.0),
+            egui::Vec2::new(600.0, 400.0),
+        );
+        // Disable temporal edges during load so we control them manually
+        graph.temporal_attraction_enabled = false;
+        graph.load(data, bounds);
+        graph
+    }
+
+    #[test]
+    fn test_build_temporal_edges_unfiltered() {
+        let nodes = vec![
+            make_node("A", "2025-06-15T12:00:00+00:00"),
+            make_node("B", "2025-06-15T12:01:00+00:00"), // 60s after A
+            make_node("C", "2025-06-15T12:10:00+00:00"), // 10min after A
+        ];
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_window_secs = 120.0; // 2 minute window
+        graph.max_temporal_edges = 1000;
+
+        graph.build_temporal_edges_filtered(None);
+
+        let temporal: Vec<_> = graph.data.edges.iter().filter(|e| e.is_temporal).collect();
+        // A-B within 2min window, A-C and B-C outside 2min window
+        assert_eq!(temporal.len(), 1);
+        assert_eq!(temporal[0].source, "A");
+        assert_eq!(temporal[0].target, "B");
+    }
+
+    #[test]
+    fn test_build_temporal_edges_filtered_excludes_invisible() {
+        let nodes = vec![
+            make_node("A", "2025-06-15T12:00:00+00:00"),
+            make_node("B", "2025-06-15T12:01:00+00:00"),
+            make_node("C", "2025-06-15T12:01:30+00:00"),
+        ];
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_window_secs = 120.0;
+        graph.max_temporal_edges = 1000;
+
+        // Only A and C are visible (B is filtered out)
+        let visible: HashSet<String> = ["A", "C"].iter().map(|s| s.to_string()).collect();
+        graph.build_temporal_edges_filtered(Some(&visible));
+
+        let temporal: Vec<_> = graph.data.edges.iter().filter(|e| e.is_temporal).collect();
+        // A-C is 90s apart, within 120s window, so 1 edge
+        assert_eq!(temporal.len(), 1);
+        assert_eq!(temporal[0].source, "A");
+        assert_eq!(temporal[0].target, "C");
+    }
+
+    #[test]
+    fn test_build_temporal_edges_filtered_empty_set() {
+        let nodes = vec![
+            make_node("A", "2025-06-15T12:00:00+00:00"),
+            make_node("B", "2025-06-15T12:01:00+00:00"),
+        ];
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_window_secs = 600.0;
+        graph.max_temporal_edges = 1000;
+
+        // Empty visible set — no edges should be created
+        let visible: HashSet<String> = HashSet::new();
+        graph.build_temporal_edges_filtered(Some(&visible));
+
+        let temporal_count = graph.data.edges.iter().filter(|e| e.is_temporal).count();
+        assert_eq!(temporal_count, 0);
+    }
+
+    #[test]
+    fn test_build_temporal_edges_filtered_respects_max_edges() {
+        // Create many nodes close together to generate lots of edges
+        let nodes: Vec<GraphNode> = (0..20)
+            .map(|i| make_node(
+                &format!("N{}", i),
+                &format!("2025-06-15T12:00:{:02}+00:00", i),
+            ))
+            .collect();
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_window_secs = 60.0; // all within window
+        graph.max_temporal_edges = 5; // strict cap
+
+        graph.build_temporal_edges_filtered(None);
+
+        let temporal_count = graph.data.edges.iter().filter(|e| e.is_temporal).count();
+        assert_eq!(temporal_count, 5);
+    }
+
+    #[test]
+    fn test_build_temporal_edges_filtered_cleans_old_edges() {
+        let nodes = vec![
+            make_node("A", "2025-06-15T12:00:00+00:00"),
+            make_node("B", "2025-06-15T12:01:00+00:00"),
+        ];
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_window_secs = 120.0;
+        graph.max_temporal_edges = 1000;
+
+        // Build once
+        graph.build_temporal_edges_filtered(None);
+        assert_eq!(graph.data.edges.iter().filter(|e| e.is_temporal).count(), 1);
+
+        // Build again — should still be 1 (old temporal edges removed first)
+        graph.build_temporal_edges_filtered(None);
+        assert_eq!(graph.data.edges.iter().filter(|e| e.is_temporal).count(), 1);
+    }
+
+    #[test]
+    fn test_set_temporal_window_with_visible_set() {
+        let nodes = vec![
+            make_node("A", "2025-06-15T12:00:00+00:00"),
+            make_node("B", "2025-06-15T12:01:00+00:00"),
+            make_node("C", "2025-06-15T12:05:00+00:00"),
+        ];
+        let mut graph = make_graph_with_nodes(nodes);
+        graph.temporal_attraction_enabled = true;
+        graph.max_temporal_edges = 1000;
+
+        // Set window to 2 min, only A and C visible
+        let visible: HashSet<String> = ["A", "C"].iter().map(|s| s.to_string()).collect();
+        graph.set_temporal_window(120.0, Some(&visible));
+
+        let temporal: Vec<_> = graph.data.edges.iter().filter(|e| e.is_temporal).collect();
+        // A-C is 5 min apart, outside 2 min window → 0 edges
+        assert_eq!(temporal.len(), 0);
+
+        // Widen window to 10 min
+        graph.set_temporal_window(600.0, Some(&visible));
+        let temporal: Vec<_> = graph.data.edges.iter().filter(|e| e.is_temporal).collect();
+        // A-C is 5 min apart, within 10 min window → 1 edge
+        assert_eq!(temporal.len(), 1);
     }
 }

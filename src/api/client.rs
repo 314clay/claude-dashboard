@@ -478,7 +478,7 @@ impl ApiClient {
     }
 
     /// Create a new semantic filter
-    pub fn create_semantic_filter(&self, name: &str) -> Result<SemanticFilter, String> {
+    pub fn create_semantic_filter(&self, name: &str, query_text: &str, filter_type: &str) -> Result<SemanticFilter, String> {
         let url = format!("{}/semantic-filters", self.base_url);
 
         let resp = self
@@ -486,7 +486,8 @@ impl ApiClient {
             .post(&url)
             .json(&serde_json::json!({
                 "name": name,
-                "query_text": name
+                "query_text": query_text,
+                "filter_type": filter_type
             }))
             .timeout(Duration::from_secs(5))
             .send()
@@ -540,6 +541,29 @@ impl ApiClient {
             .client
             .post(&url)
             .timeout(Duration::from_secs(60)) // Longer timeout for AI categorization
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        Ok(())
+    }
+
+    /// Trigger categorization for only specific message IDs
+    pub fn trigger_categorization_visible(&self, filter_id: i32, message_ids: &[String]) -> Result<(), String> {
+        let url = format!("{}/semantic-filters/{}/categorize-visible", self.base_url, filter_id);
+
+        let ids: Vec<i64> = message_ids.iter()
+            .filter_map(|id| id.parse::<i64>().ok())
+            .collect();
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "message_ids": ids }))
+            .timeout(Duration::from_secs(120))
             .send()
             .map_err(|e| format!("Request failed: {}", e))?;
 
