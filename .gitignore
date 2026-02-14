@@ -12,3 +12,7 @@ manage.py
 .claude/
 .logs/
 .beads/
+
+# Generated tool artifacts
+.jacques/
+.playwright-mcp/
