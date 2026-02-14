@@ -5,6 +5,7 @@ stores them as BLOBs in SQLite, and computes cosine similarity at query time.
 """
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import numpy as np
@@ -114,8 +115,12 @@ def get_unembedded_message_ids(limit: int = 1000) -> list[dict]:
             SELECT 1 FROM message_embeddings me
             WHERE me.message_id = m.id
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM tool_usages t
+            WHERE t.message_id = m.id
+        )
         AND m.content IS NOT NULL
-        AND length(m.content) > 0
+        AND length(m.content) > 10
         ORDER BY m.timestamp DESC
         LIMIT ?
     """, (limit,))
@@ -141,8 +146,12 @@ def get_unembedded_from_ids(message_ids: list[int], limit: int = 50000) -> list[
             SELECT 1 FROM message_embeddings me
             WHERE me.message_id = m.id
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM tool_usages t
+            WHERE t.message_id = m.id
+        )
         AND m.content IS NOT NULL
-        AND length(m.content) > 0
+        AND length(m.content) > 10
         LIMIT ?
     """, (*message_ids, limit))
 
@@ -433,8 +442,12 @@ def generate_embeddings(
     errors = []
     dims = None
 
-    for i in range(0, len(messages), batch_size):
-        batch = messages[i:i + batch_size]
+    def _process_batch(batch_index: int, batch: list[dict]) -> tuple[int, int | None, str | None]:
+        """Process a single batch: embed texts and save to DB.
+
+        Returns:
+            (count, dimensions, error_string_or_None)
+        """
         texts = []
         ids = []
         for msg in batch:
@@ -447,12 +460,32 @@ def generate_embeddings(
         try:
             vectors = embed_texts(texts, batch_size=len(texts))
             if vectors:
-                dims = len(vectors[0])
+                d = len(vectors[0])
                 pairs = list(zip(ids, vectors))
-                save_embeddings(pairs, model, dims)
-                generated += len(pairs)
+                save_embeddings(pairs, model, d)
+                return len(pairs), d, None
+            return 0, None, None
         except Exception as e:
-            errors.append(f"Batch {i // batch_size}: {str(e)}")
+            return 0, None, f"Batch {batch_index}: {str(e)}"
+
+    # Build all batches
+    batches = []
+    for i in range(0, len(messages), batch_size):
+        batches.append((i // batch_size, messages[i:i + batch_size]))
+
+    # Process batches in parallel
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(_process_batch, idx, batch): idx
+            for idx, batch in batches
+        }
+        for future in as_completed(futures):
+            count, d, error = future.result()
+            generated += count
+            if d is not None:
+                dims = d
+            if error is not None:
+                errors.append(error)
 
     return {
         "generated": generated,

@@ -7,6 +7,7 @@ mod app;
 mod db;
 mod graph;
 mod mail;
+mod project_tree;
 mod settings;
 mod theme;
 

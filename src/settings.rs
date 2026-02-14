@@ -1,6 +1,6 @@
 //! Persistent settings for the dashboard app.
 
-use crate::graph::types::ColorMode;
+use crate::graph::types::{ColorMode, FilterMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -86,7 +86,14 @@ pub struct Preset {
 
     // Filtering
     pub importance_threshold: f32,
+    #[serde(default)]
     pub importance_filter_enabled: bool,
+    #[serde(default)]
+    pub importance_filter: FilterMode,
+    #[serde(default)]
+    pub tool_use_filter: FilterMode,
+    #[serde(default)]
+    pub project_filter: FilterMode,
 
     // Physics
     pub physics_enabled: bool,
@@ -168,7 +175,10 @@ impl Preset {
             w_time: settings.w_time,
             max_node_multiplier: settings.max_node_multiplier,
             importance_threshold: settings.importance_threshold,
-            importance_filter_enabled: settings.importance_filter_enabled,
+            importance_filter_enabled: false,
+            importance_filter: settings.importance_filter,
+            tool_use_filter: settings.tool_use_filter,
+            project_filter: settings.project_filter,
             physics_enabled: settings.physics_enabled,
             repulsion: settings.repulsion,
             attraction: settings.attraction,
@@ -217,7 +227,9 @@ impl Preset {
         settings.w_time = self.w_time;
         settings.max_node_multiplier = self.max_node_multiplier;
         settings.importance_threshold = self.importance_threshold;
-        settings.importance_filter_enabled = self.importance_filter_enabled;
+        settings.importance_filter = self.importance_filter;
+        settings.tool_use_filter = self.tool_use_filter;
+        settings.project_filter = self.project_filter;
         settings.physics_enabled = self.physics_enabled;
         settings.repulsion = self.repulsion;
         settings.attraction = self.attraction;
@@ -290,7 +302,14 @@ pub struct Settings {
 
     // Filtering
     pub importance_threshold: f32,
+    #[serde(default)]
     pub importance_filter_enabled: bool,
+    #[serde(default)]
+    pub importance_filter: FilterMode,
+    #[serde(default)]
+    pub tool_use_filter: FilterMode,
+    #[serde(default)]
+    pub project_filter: FilterMode,
 
     // Physics
     pub physics_enabled: bool,
@@ -447,6 +466,9 @@ impl Default for Settings {
             // Filtering
             importance_threshold: 0.0,
             importance_filter_enabled: false,
+            importance_filter: FilterMode::Off,
+            tool_use_filter: FilterMode::Off,
+            project_filter: FilterMode::Off,
 
             // Physics
             physics_enabled: true,
@@ -517,8 +539,10 @@ impl Settings {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 match serde_json::from_str(&contents) {
-                    Ok(settings) => {
+                    Ok(mut settings) => {
                         eprintln!("Loaded settings from {:?}", path);
+                        // Migrate old bool -> new FilterMode
+                        Self::migrate_filter_bools(&mut settings);
                         settings
                     }
                     Err(e) => {
@@ -531,6 +555,16 @@ impl Settings {
                 // File doesn't exist yet, that's fine
                 Self::default()
             }
+        }
+    }
+
+    /// Migrate old boolean filter fields to new FilterMode enums.
+    /// If old `importance_filter_enabled` is true and new `importance_filter` is Off,
+    /// promote to FilterMode::Filtered.
+    fn migrate_filter_bools(settings: &mut Settings) {
+        if settings.importance_filter_enabled && settings.importance_filter == FilterMode::Off {
+            settings.importance_filter = FilterMode::Filtered;
+            eprintln!("Migrated importance_filter_enabled=true -> FilterMode::Filtered");
         }
     }
 

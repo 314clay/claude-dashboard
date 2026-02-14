@@ -6,6 +6,8 @@ Each filter has a query_text that describes what content should match.
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -96,6 +98,43 @@ IMPORTANT:
             ORDER BY m.timestamp DESC
             LIMIT ?
         """, (filter_id, limit))
+
+        messages = [dict(row) for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return messages
+
+    def get_messages_by_ids(
+        self,
+        message_ids: list[int],
+        filter_id: int,
+    ) -> list[dict]:
+        """Get specific messages by ID, filtering out already-scored ones.
+
+        Args:
+            message_ids: List of message IDs to fetch
+            filter_id: The filter to check against (skip already-scored)
+
+        Returns:
+            List of message dicts: [{"id": int, "role": str, "content": str}, ...]
+        """
+        if not message_ids:
+            return []
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        placeholders = ",".join("?" * len(message_ids))
+        cur.execute(f"""
+            SELECT m.id, m.role, m.content
+            FROM messages m
+            WHERE m.id IN ({placeholders})
+            AND NOT EXISTS (
+                SELECT 1 FROM semantic_filter_results sfr
+                WHERE sfr.message_id = m.id AND sfr.filter_id = ?
+            )
+            ORDER BY m.timestamp DESC
+        """, (*message_ids, filter_id))
 
         messages = [dict(row) for row in cur.fetchall()]
         cur.close()
@@ -231,26 +270,32 @@ IMPORTANT:
         return inserted
 
 
-def categorize_messages(
+def _score_batches_parallel(
+    scorer: SemanticFilterScorer,
+    all_messages: list[dict],
+    filters: list[dict],
+    all_filter_ids: list[int],
     filter_id: int,
-    batch_size: int = 50,
-    max_messages: int = 5000
+    batch_size: int,
+    max_concurrent: int,
 ) -> dict:
-    """Main function to categorize messages for a filter.
+    """Score pre-fetched messages in parallel batches.
 
-    Gets all active filters, finds unscored messages for the specified filter,
-    batches and scores them, and saves results.
+    Splits messages into batches, scores them concurrently via a thread pool,
+    and saves results sequentially as each batch completes.
 
     Args:
-        filter_id: The filter ID to focus on (determines which messages need scoring)
-        batch_size: Messages per LLM call (50-100 recommended)
-        max_messages: Maximum total messages to process
+        scorer: SemanticFilterScorer instance
+        all_messages: Pre-fetched messages to score
+        filters: Active filter dicts for the LLM prompt
+        all_filter_ids: All filter IDs (for saving results against every filter)
+        filter_id: The primary filter ID (for counting matches)
+        batch_size: Messages per LLM call
+        max_concurrent: Max parallel LLM calls
 
     Returns:
-        dict with scored, matches, errors
+        dict with scored, matches, batches_processed, errors
     """
-    scorer = SemanticFilterScorer()
-
     results = {
         "filter_id": filter_id,
         "scored": 0,
@@ -259,48 +304,146 @@ def categorize_messages(
         "errors": []
     }
 
+    if not all_messages:
+        return results
+
+    # Split into batches
+    batches = [
+        all_messages[i:i + batch_size]
+        for i in range(0, len(all_messages), batch_size)
+    ]
+
+    # Lock for thread-safe results aggregation and sequential DB saves
+    lock = threading.Lock()
+
+    def score_one_batch(batch: list[dict]) -> dict[int, list[int]]:
+        """Score a single batch via LLM (runs in thread pool)."""
+        return scorer.score_batch(batch, filters)
+
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        future_to_index = {
+            executor.submit(score_one_batch, batch): i
+            for i, batch in enumerate(batches)
+        }
+
+        for future in as_completed(future_to_index):
+            batch_index = future_to_index[future]
+            try:
+                batch_results = future.result()
+            except Exception as e:
+                with lock:
+                    results["errors"].append(f"Batch {batch_index} raised: {e}")
+                continue
+
+            if not batch_results:
+                with lock:
+                    results["errors"].append(f"Batch {batch_index} failed to score")
+                continue
+
+            # Save results and update counters under lock (sequential saves)
+            with lock:
+                scorer.save_results(batch_results, all_filter_ids)
+
+                for msg_id, matching_filters in batch_results.items():
+                    if filter_id in matching_filters:
+                        results["matches"] += 1
+
+                results["scored"] += len(batch_results)
+                results["batches_processed"] += 1
+
+    return results
+
+
+def categorize_messages(
+    filter_id: int,
+    batch_size: int = 50,
+    max_messages: int = 5000,
+    max_concurrent: int = 4,
+) -> dict:
+    """Main function to categorize messages for a filter.
+
+    Gets all active filters, finds unscored messages for the specified filter,
+    splits them into batches, and scores them in parallel using a thread pool.
+    Results are saved sequentially as each batch completes.
+
+    Args:
+        filter_id: The filter ID to focus on (determines which messages need scoring)
+        batch_size: Messages per LLM call (50-100 recommended)
+        max_messages: Maximum total messages to process
+        max_concurrent: Maximum parallel LLM calls (clamped to 1-8)
+
+    Returns:
+        dict with scored, matches, batches_processed, errors
+    """
+    max_concurrent = max(1, min(8, max_concurrent))
+
+    scorer = SemanticFilterScorer()
+
     filters = scorer.get_active_filters()
     if not filters:
-        results["errors"].append("No active filters found")
-        return results
+        return {"filter_id": filter_id, "scored": 0, "matches": 0,
+                "batches_processed": 0, "errors": ["No active filters found"]}
 
     filter_ids = [f['id'] for f in filters]
     if filter_id not in filter_ids:
-        results["errors"].append(f"Filter {filter_id} not found or inactive")
-        return results
+        return {"filter_id": filter_id, "scored": 0, "matches": 0,
+                "batches_processed": 0,
+                "errors": [f"Filter {filter_id} not found or inactive"]}
 
-    all_filter_ids = filter_ids
-    messages_processed = 0
+    # Pre-fetch all unscored messages up front
+    all_messages = scorer.get_unscored_messages_for_filter(
+        filter_id, limit=max_messages,
+    )
 
-    while messages_processed < max_messages:
-        messages = scorer.get_unscored_messages_for_filter(
-            filter_id,
-            limit=batch_size
-        )
+    return _score_batches_parallel(
+        scorer, all_messages, filters, filter_ids,
+        filter_id, batch_size, max_concurrent,
+    )
 
-        if not messages:
-            break
 
-        batch_results = scorer.score_batch(messages, filters)
+def categorize_messages_visible(
+    filter_id: int,
+    message_ids: list[int],
+    batch_size: int = 50,
+    max_concurrent: int = 4,
+) -> dict:
+    """Categorize only specific messages (by ID) for a filter.
 
-        if not batch_results:
-            results["errors"].append(f"Batch {results['batches_processed']} failed to score")
-            break
+    Like categorize_messages but restricted to the given message IDs.
+    Already-scored messages for the filter are skipped.
+    Uses parallel batch scoring.
 
-        saved = scorer.save_results(batch_results, all_filter_ids)
+    Args:
+        filter_id: The filter ID to focus on
+        message_ids: List of message IDs to score
+        batch_size: Messages per LLM call
+        max_concurrent: Maximum parallel LLM calls (clamped to 1-8)
 
-        for msg_id, matching_filters in batch_results.items():
-            if filter_id in matching_filters:
-                results["matches"] += 1
+    Returns:
+        dict with scored, matches, batches_processed, errors
+    """
+    max_concurrent = max(1, min(8, max_concurrent))
 
-        results["scored"] += len(batch_results)
-        results["batches_processed"] += 1
-        messages_processed += len(messages)
+    scorer = SemanticFilterScorer()
 
-        if len(messages) < batch_size:
-            break
+    filters = scorer.get_active_filters()
+    if not filters:
+        return {"filter_id": filter_id, "scored": 0, "matches": 0,
+                "batches_processed": 0, "errors": ["No active filters found"]}
 
-    return results
+    filter_ids = [f['id'] for f in filters]
+    if filter_id not in filter_ids:
+        return {"filter_id": filter_id, "scored": 0, "matches": 0,
+                "batches_processed": 0,
+                "errors": [f"Filter {filter_id} not found or inactive"]}
+
+    # Get unscored messages from the provided IDs
+    unscored = scorer.get_messages_by_ids(message_ids, filter_id)
+
+    return _score_batches_parallel(
+        scorer, unscored, filters, filter_ids,
+        filter_id, batch_size, max_concurrent,
+    )
 
 
 def get_filter_stats() -> dict:
