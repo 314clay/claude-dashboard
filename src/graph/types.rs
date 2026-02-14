@@ -46,6 +46,7 @@ pub enum ColorMode {
 pub enum Role {
     User,
     Assistant,
+    Agent,
     Obsidian,
     Topic,
 }
@@ -55,6 +56,7 @@ impl Role {
         match self {
             Role::User => egui::Color32::WHITE,
             Role::Assistant => egui::Color32::from_rgb(255, 149, 0), // Orange
+            Role::Agent => egui::Color32::from_rgb(0, 191, 255),     // Deep sky blue
             Role::Obsidian => egui::Color32::from_rgb(155, 89, 182), // Purple
             Role::Topic => egui::Color32::from_rgb(34, 197, 94),     // Green
         }
@@ -64,6 +66,7 @@ impl Role {
         match self {
             Role::User => "You",
             Role::Assistant => "Claude",
+            Role::Agent => "Agent",
             Role::Obsidian => "Note",
             Role::Topic => "Topic",
         }
@@ -93,8 +96,6 @@ pub struct GraphNode {
     pub cache_read_tokens: Option<i32>,
     #[serde(default)]
     pub cache_creation_tokens: Option<i32>,
-    #[serde(default)]
-    pub semantic_filter_matches: Vec<i32>,
     #[serde(default)]
     pub has_tool_usage: bool,
 }
@@ -1654,7 +1655,6 @@ mod tests {
             input_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
-            semantic_filter_matches: vec![],
             has_tool_usage: false,
         }
     }

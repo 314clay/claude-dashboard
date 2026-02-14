@@ -1,8 +1,14 @@
 """Rule-based filter scoring — pure logic, no LLM calls.
 
 Supported query_text patterns:
-  - "role:user"      → matches messages where role == 'user'
+  - "role:user"      → matches messages where role == 'user' (human only, excludes agents)
   - "role:assistant"  → matches messages where role == 'assistant'
+  - "role:agent"     → matches messages from any agent type (polecat, witness, mayor, crew, refinery)
+  - "role:polecat"   → matches messages from polecat agents specifically
+  - "role:witness"   → matches messages from witness agents specifically
+  - "role:mayor"     → matches messages from mayor agents specifically
+  - "role:crew"      → matches messages from crew agents specifically
+  - "role:refinery"  → matches messages from refinery agents specifically
   - "has_tools"      → matches messages that have at least one tool_usages row
   - "tool:<name>"    → matches messages that used a specific tool (e.g. "tool:Bash")
   - "long"           → matches messages with content > 500 chars
@@ -10,6 +16,8 @@ Supported query_text patterns:
 """
 from datetime import datetime, timezone
 from .queries import get_connection
+
+AGENT_ROLES = {"polecat", "witness", "mayor", "crew", "refinery"}
 
 
 def _batch_query(cur, sql_template, ids, batch_size=900):
@@ -99,6 +107,10 @@ def score_rule_filter(filter_id: int, query_text: str) -> dict:
             matched = role == "user"
         elif query_lower == "role:assistant":
             matched = role == "assistant"
+        elif query_lower == "role:agent":
+            matched = role in AGENT_ROLES
+        elif query_lower.startswith("role:") and query_lower[5:] in AGENT_ROLES:
+            matched = role == query_lower[5:]
         elif query_lower == "has_tools" or query_lower.startswith("tool:"):
             matched = msg_id in tool_message_ids
         elif query_lower == "long":

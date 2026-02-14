@@ -89,7 +89,7 @@ def generate_session_summary(session_id: str) -> dict | None:
     # Build conversation text
     conversation_parts = []
     for msg in messages:
-        role = "USER" if msg['role'] == 'user' else "CLAUDE"
+        role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
         content = msg['content'] or ""
         if len(content) > 2000:
             content = content[:2000] + "..."
@@ -172,7 +172,7 @@ def generate_partial_summary(session_id: str, before_timestamp: str) -> dict | N
 
     conversation_parts = []
     for msg in messages:
-        role = "USER" if msg['role'] == 'user' else "CLAUDE"
+        role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
         content = msg['content'] or ""
         if len(content) > 2000:
             content = content[:2000] + "..."
@@ -427,7 +427,7 @@ def generate_neighborhood_summary(message_ids: list[int]) -> dict | None:
         cwd = msgs[0].get('cwd', '') if msgs else ''
         conversation_parts.append(f"--- Session {sid[:8]} ({cwd}) ---")
         for msg in msgs:
-            role = "USER" if msg['role'] == 'user' else "CLAUDE"
+            role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
             content = msg.get('content', '') or ""
             if len(content) > 2000:
                 content = content[:2000] + "..."

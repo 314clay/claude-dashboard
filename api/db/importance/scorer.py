@@ -109,7 +109,7 @@ Respond with JSON only, no markdown code blocks:
             content = msg['content'] or ""
             if len(content) > 1500:
                 content = content[:1500] + "...[truncated]"
-            role = "USER" if msg['role'] == 'user' else "CLAUDE"
+            role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
             formatted.append(f"[{msg['id']}] {role}: {content}")
 
         messages_text = "\n\n".join(formatted)

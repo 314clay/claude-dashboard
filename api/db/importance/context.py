@@ -216,7 +216,7 @@ Be concise. Focus on the key points."""
         # Build conversation text
         conversation_parts = []
         for msg in messages:
-            role = "USER" if msg['role'] == 'user' else "CLAUDE"
+            role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
             content = msg['content'] or ""
             if len(content) > 2000:
                 content = content[:2000] + "..."

@@ -39,6 +39,7 @@ from db.semantic_filters import (
     delete_filter,
     get_filter_status,
 )
+from db.filter_engine import compute_visible_set
 from db.semantic_filter_scorer import (
     categorize_messages,
     categorize_messages_visible,
@@ -97,6 +98,11 @@ class SimilaritySearchRequest(BaseModel):
 
 class CategorizeVisibleRequest(BaseModel):
     message_ids: list[int]
+
+
+class FilterComputeRequest(BaseModel):
+    filter_modes: dict[int, str]
+    hours: float = 24
 
 
 class ProximityEdgesRequest(BaseModel):
@@ -495,6 +501,19 @@ def semantic_filter_stats():
     Returns: { total_messages, filters: [{ id, name, scored_count, match_count }] }
     """
     return get_filter_stats()
+
+
+@app.post("/filter/compute-visible")
+def filter_compute_visible(body: FilterComputeRequest):
+    """Compute which message IDs are visible given semantic filter modes.
+
+    Body: { filter_modes: {filter_id: mode_string}, hours: float }
+    mode_string is one of: "off", "exclude", "include", "include_plus_1", "include_plus_2"
+
+    Returns: { visible_message_ids: list[int] | null, total_nodes: int, visible_count: int }
+    When all filters are off, visible_message_ids is null (no filtering).
+    """
+    return compute_visible_set(body.filter_modes, body.hours)
 
 
 # ==== Embedding / Similarity Search Endpoints ====

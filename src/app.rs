@@ -35,6 +35,9 @@ struct ProximityQuery {
     active: bool,
     loading: bool,
     rx: Option<Receiver<Result<(Vec<GraphEdge>, HashMap<String, f32>), String>>>,
+    // Per-query settings
+    opacity: f32,
+    visible: bool,
 }
 
 /// Which edge popup is currently open (gear icon popups)
@@ -44,6 +47,7 @@ enum EdgePopup {
     LayoutShaping,
     TemporalClustering,
     ScoreProximity,
+    ProximityQuery(usize),
 }
 
 /// Time range options for filtering
@@ -273,8 +277,10 @@ pub struct DashboardApp {
     categorization_progress: Option<(i64, i64)>, // (scored, total)
     categorization_done_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
-    // Cached semantic filter visible set (invalidate on filter change or data load)
-    semantic_filter_cache: Option<HashSet<String>>,
+    // Backend-computed semantic filter visible set (message IDs from API, None = no filtering)
+    semantic_visible_ids: Option<HashSet<i64>>,
+    semantic_filter_pending: bool,
+    semantic_filter_rx: Option<Receiver<Result<Option<Vec<i64>>, String>>>,
 
     // Expanded filter detail panels (toggled by clicking filter name)
     expanded_filter_ids: HashSet<i32>,
@@ -518,7 +524,9 @@ impl DashboardApp {
             categorization_progress_rx: None,
             categorization_progress: None,
             categorization_done_flag: None,
-            semantic_filter_cache: None,
+            semantic_visible_ids: None,
+            semantic_filter_pending: false,
+            semantic_filter_rx: None,
             expanded_filter_ids: HashSet::new(),
 
             // Score-proximity edges
@@ -706,8 +714,8 @@ impl DashboardApp {
                 );
                 self.graph.load(data, bounds);
                 self.loading = false;
-                self.semantic_filter_cache = None;
-                self.effective_visible_dirty = true;  // Invalidate cache
+                self.semantic_visible_ids = None;
+                self.effective_visible_dirty = true;
 
                 // Extract available projects from nodes
                 let projects: HashSet<String> = self.graph.data.nodes.iter()
@@ -761,6 +769,10 @@ impl DashboardApp {
         // Recompute bypass edges after data load (outside match to avoid borrow conflict)
         if !self.loading {
             self.recompute_bypass_edges();
+            // Re-request semantic filter computation if filters are active
+            if self.has_active_semantic_filters() {
+                self.request_semantic_filter_compute();
+            }
         }
     }
 
@@ -1020,118 +1032,33 @@ impl DashboardApp {
         expand_to_neighbors(seeds, depth, adj)
     }
 
-    /// Compute the set of nodes visible based on semantic filters
-    /// Returns None if no semantic filters are active
-    /// Returns Some(HashSet) with visible node IDs when filters are active
-    fn compute_semantic_filter_visible_set(&self) -> Option<HashSet<String>> {
-        if !self.has_active_semantic_filters() {
-            return None;
-        }
+    /// Fire a backend request to compute the semantic filter visible set.
+    /// The result arrives asynchronously via semantic_filter_rx.
+    fn request_semantic_filter_compute(&mut self) {
+        // Build filter_modes map: filter_id -> mode string
+        let filter_modes: HashMap<i32, String> = self.semantic_filter_modes.iter()
+            .map(|(&id, mode)| {
+                let mode_str = match mode {
+                    SemanticFilterMode::Off => "off",
+                    SemanticFilterMode::Exclude => "exclude",
+                    SemanticFilterMode::Include => "include",
+                    SemanticFilterMode::IncludePlus1 => "include_plus_1",
+                    SemanticFilterMode::IncludePlus2 => "include_plus_2",
+                };
+                (id, mode_str.to_string())
+            })
+            .collect();
 
-        // Build adjacency list once for BFS (always include temporal for semantic filters)
-        let adj = self.build_adjacency_list(true);
+        let hours = self.time_range_hours;
+        self.semantic_filter_pending = true;
 
-        // Collect include filters (union/OR) and exclude filters separately.
-        // Multiple includes mean "match ANY include filter" (union), not all.
-        let mut include_union: HashSet<String> = HashSet::new();
-        let mut has_includes = false;
-
-        for (filter_id, mode) in &self.semantic_filter_modes {
-            match mode {
-                SemanticFilterMode::Include => {
-                    has_includes = true;
-                    for node in &self.graph.data.nodes {
-                        if node.semantic_filter_matches.contains(filter_id) {
-                            include_union.insert(node.id.clone());
-                        }
-                    }
-                }
-                SemanticFilterMode::IncludePlus1 => {
-                    has_includes = true;
-                    let matching: HashSet<String> = self.graph.data.nodes.iter()
-                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
-                        .map(|n| n.id.clone())
-                        .collect();
-                    let expanded = self.expand_to_neighbors(&matching, 1, &adj);
-                    include_union.extend(expanded);
-                }
-                SemanticFilterMode::IncludePlus2 => {
-                    has_includes = true;
-                    let matching: HashSet<String> = self.graph.data.nodes.iter()
-                        .filter(|n| n.semantic_filter_matches.contains(filter_id))
-                        .map(|n| n.id.clone())
-                        .collect();
-                    let expanded = self.expand_to_neighbors(&matching, 2, &adj);
-                    include_union.extend(expanded);
-                }
-                _ => {}
-            }
-        }
-
-        // Debug: log filter state
-        eprintln!("[semantic-filter] has_includes={}, include_union.len={}, total_nodes={}, modes: {:?}",
-            has_includes, include_union.len(), self.graph.data.nodes.len(),
-            self.semantic_filter_modes.iter().map(|(id, m)| (*id, *m)).collect::<Vec<_>>());
-        // Debug: check how many nodes have any semantic_filter_matches at all
-        let nodes_with_matches = self.graph.data.nodes.iter().filter(|n| !n.semantic_filter_matches.is_empty()).count();
-        eprintln!("[semantic-filter] nodes with any filter matches: {}", nodes_with_matches);
-
-        // Start with include union (or all nodes if no includes)
-        let mut visible = if has_includes {
-            include_union
-        } else {
-            self.graph.data.nodes.iter().map(|n| n.id.clone()).collect()
-        };
-
-        // Then apply exclude filters (remove matching nodes)
-        for (filter_id, mode) in &self.semantic_filter_modes {
-            if *mode == SemanticFilterMode::Exclude {
-                for node in &self.graph.data.nodes {
-                    if node.semantic_filter_matches.contains(filter_id) {
-                        visible.remove(&node.id);
-                    }
-                }
-            }
-        }
-
-        eprintln!("[semantic-filter] final visible: {}", visible.len());
-        Some(visible)
-    }
-
-    /// Check if a node passes the semantic filter criteria
-    /// Returns true if the node should be visible, false if it should be hidden
-    fn node_passes_semantic_filters(&self, node: &crate::graph::types::GraphNode) -> bool {
-        // For simple Include/Exclude, do quick per-node check
-        // For +1/+2 modes, we need the pre-computed set (caller should use compute_semantic_filter_visible_set)
-
-        // Check excludes first — any exclude match hides the node
-        for (filter_id, mode) in &self.semantic_filter_modes {
-            if *mode == SemanticFilterMode::Exclude && node.semantic_filter_matches.contains(filter_id) {
-                return false;
-            }
-        }
-
-        // Check includes — node must match ANY active include filter (OR logic)
-        let has_includes = self.semantic_filter_modes.iter()
-            .any(|(_, mode)| *mode == SemanticFilterMode::Include);
-
-        if has_includes {
-            let matches_any = self.semantic_filter_modes.iter()
-                .any(|(filter_id, mode)| {
-                    *mode == SemanticFilterMode::Include && node.semantic_filter_matches.contains(filter_id)
-                });
-            if !matches_any {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Check if any semantic filter uses expansion modes (+1 or +2)
-    fn has_expansion_semantic_filters(&self) -> bool {
-        self.semantic_filter_modes.values()
-            .any(|mode| matches!(mode, SemanticFilterMode::IncludePlus1 | SemanticFilterMode::IncludePlus2))
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let api = ApiClient::new();
+            let result = api.compute_visible_set(&filter_modes, hours);
+            let _ = tx.send(result);
+        });
+        self.semantic_filter_rx = Some(rx);
     }
 
     /// Check if a node is a "same-project future node" (outside timeline but same project as selected/hovered)
@@ -1397,8 +1324,7 @@ impl DashboardApp {
         match api.create_semantic_filter(name, query_text, "rule") {
             Ok(filter) => {
                 self.semantic_filters.push(filter);
-                self.semantic_filter_cache = None;
-                // Reload graph so nodes pick up new semantic_filter_matches
+                self.semantic_visible_ids = None;
                 self.load_graph();
             }
             Err(e) => {
@@ -1478,14 +1404,14 @@ impl DashboardApp {
         self.timeline_enabled
             || self.importance_filter.is_active()
             || self.project_filter.is_active()
-            || self.has_active_semantic_filters()
+            || self.semantic_visible_ids.is_some()
             || self.tool_use_filter.is_active()
             || self.histogram_session_filter.is_some()
     }
 
     /// Check if a single node passes ALL active filters.
     /// Used by rebuild_effective_visible_set() to build the unified set.
-    fn is_node_effectively_visible(&self, node: &crate::graph::types::GraphNode, semantic_visible: &Option<HashSet<String>>) -> bool {
+    fn is_node_effectively_visible(&self, node: &crate::graph::types::GraphNode) -> bool {
         // Timeline filter
         if self.timeline_enabled && !self.graph.timeline.visible_nodes.contains(&node.id) {
             return false;
@@ -1508,10 +1434,12 @@ impl DashboardApp {
                 return false;
             }
         }
-        // Semantic filter
-        if let Some(ref sem_visible) = semantic_visible {
-            if !sem_visible.contains(&node.id) {
-                return false;
+        // Semantic filter (backend-computed visible set)
+        if let Some(ref visible_ids) = self.semantic_visible_ids {
+            if let Ok(msg_id) = node.id.parse::<i64>() {
+                if !visible_ids.contains(&msg_id) {
+                    return false;
+                }
             }
         }
         // Tool use filter
@@ -1524,15 +1452,9 @@ impl DashboardApp {
     /// Rebuild the effective visible set by iterating all nodes once.
     /// Should be called when effective_visible_dirty is true.
     fn rebuild_effective_visible_set(&mut self) {
-        // Ensure semantic filter cache is fresh
-        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
-            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
-        }
-        let semantic_visible = self.semantic_filter_cache.clone();
-
         self.effective_visible_nodes.clear();
         for node in &self.graph.data.nodes {
-            if self.is_node_effectively_visible(node, &semantic_visible) {
+            if self.is_node_effectively_visible(node) {
                 self.effective_visible_nodes.insert(node.id.clone());
             }
         }
@@ -1568,6 +1490,8 @@ impl DashboardApp {
             active: false,
             loading: false,
             rx: None,
+            opacity: self.proximity_edge_opacity,
+            visible: true,
         });
         self.graph.score_proximity_enabled = true;
         self.trigger_proximity_fetch_for(idx);
@@ -1583,6 +1507,14 @@ impl DashboardApp {
                 self.proximity_heat_map_index = None;
             } else if hmi > index {
                 self.proximity_heat_map_index = Some(hmi - 1);
+            }
+        }
+        // Fix per-query popup index
+        if let Some(EdgePopup::ProximityQuery(qi)) = self.edge_popup_open {
+            if qi == index {
+                self.edge_popup_open = None;
+            } else if qi > index {
+                self.edge_popup_open = Some(EdgePopup::ProximityQuery(qi - 1));
             }
         }
         self.rebuild_all_proximity_edges();
@@ -2935,30 +2867,65 @@ impl DashboardApp {
                     });
                 }
 
-                // Active queries as colored chip rows
+                // Active queries as colored chip rows with per-query gear
                 if !self.proximity_queries.is_empty() {
                     let mut remove_idx: Option<usize> = None;
+                    let mut toggle_gear: Option<usize> = None;
                     for (i, q) in self.proximity_queries.iter().enumerate() {
                         ui.horizontal(|ui| {
+                            // Color dot (dimmed if hidden)
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(8.0, 8.0),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().circle_filled(rect.center(), 4.0, q.color);
+                            let dot_color = if q.visible {
+                                q.color
+                            } else {
+                                q.color.gamma_multiply(0.3)
+                            };
+                            ui.painter().circle_filled(rect.center(), 4.0, dot_color);
 
                             let label = if q.loading {
                                 format!("\"{}\" ...", q.query)
                             } else {
-                                format!("\"{}\" ({} edges)", q.query, q.edge_count)
+                                format!("\"{}\" ({})", q.query, q.edge_count)
                             };
-                            ui.label(egui::RichText::new(label).small());
+                            let label_text = if q.visible {
+                                egui::RichText::new(label).small()
+                            } else {
+                                egui::RichText::new(label).small().weak().strikethrough()
+                            };
+                            ui.label(label_text);
+
+                            // Per-query gear icon
+                            let is_open = self.edge_popup_open == Some(EdgePopup::ProximityQuery(i));
+                            let gear = if is_open {
+                                egui::RichText::new("\u{2699}").small().strong()
+                            } else {
+                                egui::RichText::new("\u{2699}").small()
+                            };
+                            if ui.add(egui::Button::new(gear).frame(false)).clicked() {
+                                toggle_gear = Some(i);
+                            }
 
                             if ui.small_button("x").clicked() {
                                 remove_idx = Some(i);
                             }
                         });
                     }
+                    if let Some(qi) = toggle_gear {
+                        let target = EdgePopup::ProximityQuery(qi);
+                        self.edge_popup_open = if self.edge_popup_open == Some(target) {
+                            None
+                        } else {
+                            Some(target)
+                        };
+                    }
                     if let Some(idx) = remove_idx {
+                        // Close popup if removing the query whose popup is open
+                        if self.edge_popup_open == Some(EdgePopup::ProximityQuery(idx)) {
+                            self.edge_popup_open = None;
+                        }
                         self.remove_proximity_query(idx);
                     }
                 }
@@ -3226,6 +3193,47 @@ impl DashboardApp {
         }
     }
 
+    /// Render per-query popup (gear icon per proximity query)
+    fn render_proximity_query_popup(&mut self, ui: &mut egui::Ui, qi: usize) {
+        let q = match self.proximity_queries.get_mut(qi) {
+            Some(q) => q,
+            None => {
+                ui.label("Query not found.");
+                return;
+            }
+        };
+
+        // Color swatch + query name
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 6.0, q.color);
+            ui.label(egui::RichText::new(&q.query).strong());
+        });
+
+        ui.separator();
+
+        // Visible toggle
+        ui.checkbox(&mut q.visible, "Visible");
+
+        // Per-query opacity
+        ui.add(egui::Slider::new(&mut q.opacity, 0.0..=1.0)
+            .text("Opacity")
+            .fixed_decimals(2));
+
+        ui.separator();
+
+        // Stats
+        if q.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading...");
+            });
+        } else {
+            ui.label(format!("Edges: {}", q.edge_count));
+            ui.label(format!("Scored nodes: {}", q.scores.len()));
+        }
+    }
+
     /// Render floating popup windows for edge settings (called from update() at ctx level)
     fn render_edge_popups(&mut self, ctx: &egui::Context) {
         let popup = match self.edge_popup_open {
@@ -3233,44 +3241,59 @@ impl DashboardApp {
             None => return,
         };
 
-        let (title, popup_variant) = match popup {
-            EdgePopup::Physics => ("Physics Settings", EdgePopup::Physics),
-            EdgePopup::LayoutShaping => ("Layout Shaping", EdgePopup::LayoutShaping),
-            EdgePopup::TemporalClustering => ("Temporal Clustering", EdgePopup::TemporalClustering),
-            EdgePopup::ScoreProximity => ("Score-Proximity Edges", EdgePopup::ScoreProximity),
-        };
-
         let mut open = true;
-
-        // Default position: just right of sidebar
         let default_x = 240.0;
         let default_y = 100.0;
 
-        let window = egui::Window::new(title)
-            .open(&mut open)
-            .default_pos([default_x, default_y])
-            .resizable(false)
-            .collapsible(false);
-
-        // Score-Proximity gets a scroll area due to its length
-        if matches!(popup_variant, EdgePopup::ScoreProximity) {
-            window.default_size([320.0, 500.0])
-                .resizable(true)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.render_proximity_popup(ui);
+        match popup {
+            EdgePopup::ScoreProximity => {
+                egui::Window::new("Score-Proximity Edges")
+                    .open(&mut open)
+                    .default_pos([default_x, default_y])
+                    .default_size([320.0, 500.0])
+                    .resizable(true)
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.render_proximity_popup(ui);
+                        });
                     });
-                });
-        } else {
-            window.auto_sized()
-                .show(ctx, |ui| {
-                    match popup_variant {
-                        EdgePopup::Physics => self.render_physics_popup(ui),
-                        EdgePopup::LayoutShaping => self.render_layout_shaping_popup(ui),
-                        EdgePopup::TemporalClustering => self.render_temporal_popup(ui),
-                        EdgePopup::ScoreProximity => unreachable!(),
-                    }
-                });
+            }
+            EdgePopup::ProximityQuery(qi) => {
+                let title = self.proximity_queries.get(qi)
+                    .map(|q| format!("\"{}\"", q.query))
+                    .unwrap_or_else(|| "Query".to_string());
+                egui::Window::new(title)
+                    .open(&mut open)
+                    .default_pos([default_x, default_y + 40.0])
+                    .auto_sized()
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        self.render_proximity_query_popup(ui, qi);
+                    });
+            }
+            other => {
+                let title = match other {
+                    EdgePopup::Physics => "Physics Settings",
+                    EdgePopup::LayoutShaping => "Layout Shaping",
+                    EdgePopup::TemporalClustering => "Temporal Clustering",
+                    _ => unreachable!(),
+                };
+                egui::Window::new(title)
+                    .open(&mut open)
+                    .default_pos([default_x, default_y])
+                    .auto_sized()
+                    .resizable(false)
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        match other {
+                            EdgePopup::Physics => self.render_physics_popup(ui),
+                            EdgePopup::LayoutShaping => self.render_layout_shaping_popup(ui),
+                            EdgePopup::TemporalClustering => self.render_temporal_popup(ui),
+                            _ => unreachable!(),
+                        }
+                    });
+            }
         }
 
         if !open {
@@ -3311,7 +3334,6 @@ impl DashboardApp {
                     }
                     if mode_changed {
                         self.recompute_bypass_edges();
-                        self.semantic_filter_cache = None;
                         self.effective_visible_dirty = true;
                         self.mark_settings_dirty();
                     }
@@ -3391,7 +3413,6 @@ impl DashboardApp {
                     }
                     if mode_changed {
                         self.recompute_bypass_edges();
-                        self.semantic_filter_cache = None;
                         self.effective_visible_dirty = true;
                         self.mark_settings_dirty();
                     }
@@ -3439,7 +3460,6 @@ impl DashboardApp {
                     }
                     if mode_changed {
                         self.recompute_bypass_edges();
-                        self.semantic_filter_cache = None;
                         self.effective_visible_dirty = true;
                         self.mark_settings_dirty();
                     }
@@ -3523,8 +3543,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Off);
-                                self.semantic_filter_cache = None;
-                                self.effective_visible_dirty = true;
+                                self.request_semantic_filter_compute();
                             }
 
                             // Exclude button (-)
@@ -3534,8 +3553,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Exclude);
-                                self.semantic_filter_cache = None;
-                                self.effective_visible_dirty = true;
+                                self.request_semantic_filter_compute();
                             }
 
                             // Include button (+)
@@ -3544,9 +3562,8 @@ impl DashboardApp {
                                 .on_hover_text("Include - only show matching nodes")
                                 .clicked()
                             {
-                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
-                                self.semantic_filter_cache = None;
-                                self.effective_visible_dirty = true;
+                                                self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::Include);
+                                self.request_semantic_filter_compute();
                             }
 
                             // Include +1 button (show matching + direct neighbors)
@@ -3556,8 +3573,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus1);
-                                self.semantic_filter_cache = None;
-                                self.effective_visible_dirty = true;
+                                self.request_semantic_filter_compute();
                             }
 
                             // Include +2 button (show matching + neighbors up to depth 2)
@@ -3567,8 +3583,7 @@ impl DashboardApp {
                                 .clicked()
                             {
                                 self.semantic_filter_modes.insert(filter.id, SemanticFilterMode::IncludePlus2);
-                                self.semantic_filter_cache = None;
-                                self.effective_visible_dirty = true;
+                                self.request_semantic_filter_compute();
                             }
 
                             // Type badge for rule filters
@@ -3633,25 +3648,12 @@ impl DashboardApp {
                                     let match_count = filter.matches;
                                     let exclude_count = total_nodes.saturating_sub(match_count);
 
-                                    // Compute +1 and +2 neighbor expansions
-                                    let matching_ids: HashSet<String> = self.graph.data.nodes.iter()
-                                        .filter(|n| n.semantic_filter_matches.contains(&filter.id))
-                                        .map(|n| n.id.clone())
-                                        .collect();
-                                    let adj = self.build_adjacency_list(true);
-                                    let plus1_set = expand_to_neighbors(&matching_ids, 1, &adj);
-                                    let plus2_set = expand_to_neighbors(&matching_ids, 2, &adj);
-
                                     ui.horizontal(|ui| {
                                         ui.label(egui::RichText::new("Visibility by mode:").weak());
                                     });
                                     ui.horizontal(|ui| {
                                         ui.add_space(8.0);
                                         ui.label(egui::RichText::new(format!("+ {}", match_count)).color(theme::filter::INCLUDE));
-                                        ui.label(egui::RichText::new("|").weak());
-                                        ui.label(egui::RichText::new(format!("+1 {}", plus1_set.len())).color(theme::filter::INCLUDE_PLUS1));
-                                        ui.label(egui::RichText::new("|").weak());
-                                        ui.label(egui::RichText::new(format!("+2 {}", plus2_set.len())).color(theme::filter::INCLUDE_PLUS2));
                                         ui.label(egui::RichText::new("|").weak());
                                         ui.label(egui::RichText::new(format!("- {}", exclude_count)).color(theme::filter::EXCLUDE));
                                     });
@@ -3733,6 +3735,7 @@ impl DashboardApp {
                         ui.label(egui::RichText::new("Presets:").weak().small());
                         preset_btn(ui, "User", "role:user", self);
                         preset_btn(ui, "Assistant", "role:assistant", self);
+                        preset_btn(ui, "Agent", "role:agent", self);
                         preset_btn(ui, "Has Tools", "has_tools", self);
                         preset_btn(ui, "Long", "long", self);
                         preset_btn(ui, "Short", "short", self);
@@ -4151,7 +4154,17 @@ impl DashboardApp {
             let base_opacity = if edge.is_temporal {
                 self.temporal_edge_opacity
             } else if edge.is_similarity {
-                self.proximity_edge_opacity
+                // Per-query opacity and visibility
+                if let Some(qi) = edge.query_index {
+                    if let Some(pq) = self.proximity_queries.get(qi) {
+                        if !pq.visible { continue; }
+                        pq.opacity
+                    } else {
+                        self.proximity_edge_opacity
+                    }
+                } else {
+                    self.proximity_edge_opacity
+                }
             } else {
                 0.5
             };
@@ -5540,17 +5553,32 @@ impl eframe::App for DashboardApp {
             self.load_graph();
         }
 
-        // Refresh semantic filter cache once per frame if needed
-        if self.semantic_filter_cache.is_none() && self.has_active_semantic_filters() {
-            self.semantic_filter_cache = self.compute_semantic_filter_visible_set();
+        // Poll for semantic filter backend result
+        if let Some(ref rx) = self.semantic_filter_rx {
+            match rx.try_recv() {
+                Ok(Ok(maybe_ids)) => {
+                    self.semantic_visible_ids = maybe_ids.map(|ids| ids.into_iter().collect::<HashSet<i64>>());
+                    self.semantic_filter_pending = false;
+                    self.semantic_filter_rx = None;
+                    self.effective_visible_dirty = true;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Semantic filter compute failed: {}", e);
+                    self.semantic_filter_pending = false;
+                    self.semantic_filter_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.semantic_filter_pending = false;
+                    self.semantic_filter_rx = None;
+                }
+            }
         }
 
         // Rebuild effective visible set when any filter changed
         if self.effective_visible_dirty {
-            eprintln!("[rebuild] effective_visible_dirty=true, cache={}, has_active={}, modes={:?}",
-                if self.semantic_filter_cache.is_some() { "Some" } else { "None" },
-                self.has_active_semantic_filters(),
-                self.semantic_filter_modes.iter().map(|(id, m)| (*id, *m)).collect::<Vec<_>>());
             self.rebuild_effective_visible_set();
             self.temporal_edges_dirty = true; // visible set changed → edges need rebuild
         }
@@ -5678,8 +5706,13 @@ impl eframe::App for DashboardApp {
                     self.categorization_progress = None;
                     self.categorization_done_flag = None;
                     self.load_semantic_filters();
-                    // Also reload graph to get updated semantic_filter_matches
-                    self.load_graph();
+                    // Re-compute visible set via backend now that categorization is done
+                    if self.has_active_semantic_filters() {
+                        self.request_semantic_filter_compute();
+                    } else {
+                        self.semantic_visible_ids = None;
+                        self.effective_visible_dirty = true;
+                    }
                 }
                 Ok(Err(e)) => {
                     eprintln!("Categorization failed: {}", e);

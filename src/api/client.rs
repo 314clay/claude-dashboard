@@ -540,7 +540,7 @@ impl ApiClient {
         let resp = self
             .client
             .post(&url)
-            .timeout(Duration::from_secs(60)) // Longer timeout for AI categorization
+            .timeout(Duration::from_secs(300)) // Longer timeout for AI categorization
             .send()
             .map_err(|e| format!("Request failed: {}", e))?;
 
@@ -703,6 +703,41 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(response)
+    }
+
+    /// Compute the visible set of message IDs based on semantic filter modes.
+    /// Returns Ok(None) when no filters are active (all nodes visible).
+    /// Returns Ok(Some(Vec<i64>)) with the visible message IDs when filters are active.
+    pub fn compute_visible_set(&self, filter_modes: &HashMap<i32, String>, hours: f32) -> Result<Option<Vec<i64>>, String> {
+        let url = format!("{}/filter/compute-visible", self.base_url);
+
+        let body = serde_json::json!({
+            "filter_modes": filter_modes,
+            "hours": hours
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("API error: {}", resp.status()));
+        }
+
+        #[derive(Deserialize)]
+        struct ComputeVisibleResponse {
+            visible_message_ids: Option<Vec<i64>>,
+        }
+
+        let response: ComputeVisibleResponse = resp
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        Ok(response.visible_message_ids)
     }
 }
 

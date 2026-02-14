@@ -45,7 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_status     ON sessions (status);
 CREATE TABLE IF NOT EXISTS messages (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id            TEXT    NOT NULL,
-    role                  TEXT    NOT NULL,   -- 'user' or 'assistant'
+    role                  TEXT    NOT NULL,   -- 'user', 'assistant', or agent type: 'polecat', 'witness', 'mayor', 'crew', 'refinery'
     content               TEXT    NOT NULL,
     sequence_num          INTEGER NOT NULL,
     timestamp             TEXT    DEFAULT (datetime('now')),

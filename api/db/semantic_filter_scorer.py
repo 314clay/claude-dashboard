@@ -124,19 +124,24 @@ IMPORTANT:
         conn = get_connection()
         cur = conn.cursor()
 
-        placeholders = ",".join("?" * len(message_ids))
-        cur.execute(f"""
-            SELECT m.id, m.role, m.content
-            FROM messages m
-            WHERE m.id IN ({placeholders})
-            AND NOT EXISTS (
-                SELECT 1 FROM semantic_filter_results sfr
-                WHERE sfr.message_id = m.id AND sfr.filter_id = ?
-            )
-            ORDER BY m.timestamp DESC
-        """, (*message_ids, filter_id))
+        # SQLite has a variable limit (~999), batch large queries
+        messages = []
+        batch_size = 900
+        for i in range(0, len(message_ids), batch_size):
+            batch = message_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            cur.execute(f"""
+                SELECT m.id, m.role, m.content
+                FROM messages m
+                WHERE m.id IN ({placeholders})
+                AND NOT EXISTS (
+                    SELECT 1 FROM semantic_filter_results sfr
+                    WHERE sfr.message_id = m.id AND sfr.filter_id = ?
+                )
+                ORDER BY m.timestamp DESC
+            """, (*batch, filter_id))
+            messages.extend(dict(row) for row in cur.fetchall())
 
-        messages = [dict(row) for row in cur.fetchall()]
         cur.close()
         conn.close()
         return messages
@@ -170,7 +175,7 @@ IMPORTANT:
             content = msg['content'] or ""
             if len(content) > 1500:
                 content = content[:1500] + "...[truncated]"
-            role = "USER" if msg['role'] == 'user' else "CLAUDE"
+            role = "USER" if msg['role'] == 'user' else ("CLAUDE" if msg['role'] == 'assistant' else f"AGENT({msg['role']})")
             formatted.append(f"[{msg['id']}] {role}: {content}")
 
         messages_text = "\n\n".join(formatted)
@@ -294,12 +299,14 @@ def _score_batches_parallel(
         max_concurrent: Max parallel LLM calls
 
     Returns:
-        dict with scored, matches, batches_processed, errors
+        dict with scored (messages processed), matches (for trigger filter_id),
+        total_results_saved (rows across all filters), batches_processed, errors
     """
     results = {
         "filter_id": filter_id,
         "scored": 0,
         "matches": 0,
+        "total_results_saved": 0,
         "batches_processed": 0,
         "errors": []
     }
@@ -342,13 +349,14 @@ def _score_batches_parallel(
 
             # Save results and update counters under lock (sequential saves)
             with lock:
-                scorer.save_results(batch_results, all_filter_ids)
+                rows_saved = scorer.save_results(batch_results, all_filter_ids)
 
                 for msg_id, matching_filters in batch_results.items():
                     if filter_id in matching_filters:
                         results["matches"] += 1
 
                 results["scored"] += len(batch_results)
+                results["total_results_saved"] += rows_saved
                 results["batches_processed"] += 1
 
     return results

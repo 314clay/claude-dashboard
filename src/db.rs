@@ -61,13 +61,6 @@ struct SummaryRow {
     generated_at: Option<String>,
 }
 
-/// Row returned from semantic filter matches query
-#[derive(Debug, FromRow)]
-struct FilterMatchRow {
-    message_id: i64,
-    filter_id: i32,
-}
-
 /// Importance scoring statistics
 #[derive(Debug, Clone)]
 pub struct ImportanceStats {
@@ -223,6 +216,7 @@ impl DbClient {
                 let role = match row.role.as_str() {
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
+                    "polecat" | "witness" | "mayor" | "crew" | "refinery" => Role::Agent,
                     _ => Role::User,
                 };
 
@@ -257,7 +251,6 @@ impl DbClient {
                     input_tokens: row.input_tokens,
                     cache_read_tokens: row.cache_read_tokens,
                     cache_creation_tokens: row.cache_creation_tokens,
-                    semantic_filter_matches: Vec::new(), // Populated below
                     has_tool_usage: false, // Populated below
                 });
 
@@ -278,64 +271,6 @@ impl DbClient {
                 }
 
                 prev_msg.insert(session_id, msg_id);
-            }
-
-            // Fetch semantic filter matches for all message IDs
-            // Batched to stay under SQLite's 999 bind parameter limit
-            if !nodes.is_empty() {
-                let message_ids: Vec<i32> = nodes.iter()
-                    .filter_map(|n| n.id.parse::<i32>().ok())
-                    .collect();
-
-                if !message_ids.is_empty() {
-                    let mut matches_map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
-                    const BATCH_SIZE: usize = 900;
-
-                    for batch in message_ids.chunks(BATCH_SIZE) {
-                        let placeholders: Vec<String> = (1..=batch.len())
-                            .map(|i| format!("?{}", i))
-                            .collect();
-                        let in_clause = placeholders.join(", ");
-                        let sql = format!(
-                            r#"
-                            SELECT
-                                r.message_id,
-                                r.filter_id
-                            FROM semantic_filter_results r
-                            JOIN semantic_filters f ON r.filter_id = f.id
-                            WHERE r.message_id IN ({})
-                              AND r.matches = 1
-                              AND f.is_active = 1
-                            "#,
-                            in_clause
-                        );
-
-                        let mut query = sqlx::query_as::<_, FilterMatchRow>(&sql);
-                        for id in batch {
-                            query = query.bind(id);
-                        }
-
-                        let filter_matches: Vec<FilterMatchRow> = query
-                            .fetch_all(&self.pool)
-                            .await
-                            .unwrap_or_default();
-
-                        for row in filter_matches {
-                            if let Ok(msg_id) = i32::try_from(row.message_id) {
-                                matches_map.entry(msg_id).or_default().push(row.filter_id);
-                            }
-                        }
-                    }
-
-                    // Update nodes with their filter matches
-                    for node in &mut nodes {
-                        if let Ok(msg_id) = node.id.parse::<i32>() {
-                            if let Some(filter_ids) = matches_map.get(&msg_id) {
-                                node.semantic_filter_matches = filter_ids.clone();
-                            }
-                        }
-                    }
-                }
             }
 
             // Identify messages with tool usages (batched for SQLite limit)
@@ -463,6 +398,7 @@ impl DbClient {
             })
         })
     }
+
 }
 
 impl Default for DbClient {

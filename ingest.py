@@ -33,6 +33,25 @@ DEFAULT_DB_PATH = (
 SCHEMA_FILE = Path(__file__).parent / "schema.sqlite.sql"
 
 
+AGENT_PATH_KEYWORDS = {"polecats", "crew", "witness", "refinery", "mayor"}
+
+
+def detect_agent_type(project_path: str) -> str | None:
+    """Detect if a session path indicates an agent session.
+
+    Returns the agent type string (e.g. 'polecat', 'witness') or None for human sessions.
+    """
+    if not project_path:
+        return None
+    parts = project_path.lower().replace("\\", "/").split("/")
+    for part in parts:
+        if part == "polecats":
+            return "polecat"
+        if part in AGENT_PATH_KEYWORDS:
+            return part
+    return None
+
+
 def parse_since(since_str: str) -> datetime:
     """Parse a --since string like '7d', '24h', '30d' into a cutoff datetime."""
     match = re.match(r"^(\d+)([dhm])$", since_str)
@@ -178,8 +197,14 @@ def discover_sessions(claude_dir: Path, since: datetime | None = None) -> list[d
     return sessions
 
 
-def parse_transcript(jsonl_path: Path) -> dict:
+def parse_transcript(jsonl_path: Path, agent_type: str | None = None) -> dict:
     """Parse a session JSONL transcript into messages and tool usages.
+
+    Args:
+        jsonl_path: Path to the JSONL transcript file.
+        agent_type: If set, remap "user" roles to this agent type
+                    (e.g. "polecat", "witness") so they are distinguishable
+                    from human user messages.
 
     Returns:
         {
@@ -210,6 +235,11 @@ def parse_transcript(jsonl_path: Path) -> dict:
 
             msg_data = entry.get("message", {})
             role = msg_data.get("role", entry_type)
+
+            # Remap "user" role to agent type for agent sessions
+            if agent_type and role == "user":
+                role = agent_type
+
             timestamp = entry.get("timestamp", "")
             content_raw = msg_data.get("content", "")
 
@@ -307,8 +337,11 @@ def import_session(conn: sqlite3.Connection, session_info: dict, claude_dir: Pat
         ),
     )
 
+    # Detect agent sessions and remap user roles accordingly
+    agent_type = detect_agent_type(project_path)
+
     # Parse transcript
-    transcript = parse_transcript(jsonl_path)
+    transcript = parse_transcript(jsonl_path, agent_type=agent_type)
     messages = transcript["messages"]
     tool_usages = transcript["tool_usages"]
 
@@ -325,6 +358,7 @@ def import_session(conn: sqlite3.Connection, session_info: dict, claude_dir: Pat
                     model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (session_id, sequence_num) DO UPDATE SET
+                   role = excluded.role,
                    content = excluded.content,
                    model = COALESCE(excluded.model, messages.model),
                    input_tokens = COALESCE(excluded.input_tokens, messages.input_tokens),
